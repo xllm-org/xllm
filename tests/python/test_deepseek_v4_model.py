@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import deepseek_v4, deepseek_v32
 from xllm.python.models.deepseek_v4 import (
     DeepseekV4Config,
@@ -326,7 +327,11 @@ def test_dense_mlp_uses_native_aware_tp_reduce(monkeypatch) -> None:
     mlp = DeepseekV3MLP(cfg, cfg.moe_intermediate_size, torch.float32, torch.device("cpu"))
     mlp.gate_up_proj.forward = MagicMock(return_value=torch.ones(1, 2 * mlp.gate_up_proj.out_features))
     mlp.down_proj.forward = MagicMock(return_value=torch.ones(1, cfg.hidden_size))
-    monkeypatch.setattr(deepseek_v32.kernels, "silu_and_mul", lambda tensor: tensor[..., : tensor.shape[-1] // 2])
+    monkeypatch.setattr(
+        deepseek_v32,
+        "_swiglu_with_clamp",
+        lambda tensor, limit: tensor[..., : tensor.shape[-1] // 2],
+    )
     tp_reduce = MagicMock()
     monkeypatch.setattr(deepseek_v32.distributed, "tp_all_reduce", tp_reduce, raising=False)
 
@@ -335,15 +340,15 @@ def test_dense_mlp_uses_native_aware_tp_reduce(monkeypatch) -> None:
     tp_reduce.assert_called_once()
 
 
-def test_model_rejects_cp_until_cp_context_is_available() -> None:
+def test_model_accepts_cp_config() -> None:
     cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "cp_size": 2})
-    with pytest.raises(NotImplementedError, match="CP context PR"):
-        DeepseekV4Model(cfg, torch.float32, torch.device("cpu"))
+    model = DeepseekV4Model(cfg, torch.float32, torch.device("cpu"))
+    assert model.cfg.cp_size == 2
 
 
-def test_causal_lm_rejects_data_parallelism_before_building_model() -> None:
-    with pytest.raises(NotImplementedError, match="dp_size > 1"):
-        DeepseekV4ForCausalLM({**_DSV4_CONFIG, "dp_size": 2})
+def test_causal_lm_accepts_data_parallelism_config() -> None:
+    model = DeepseekV4ForCausalLM({**_DSV4_CONFIG, "dp_size": 2})
+    assert model.cfg.dp_size == 2
 
 
 def test_dense_mlp_loader_maps_dsv4_weight_names() -> None:
@@ -487,3 +492,40 @@ def test_moe_tp_only_combines_before_one_reduce(
 
     assert calls == ["moe_tp"]
     assert torch.equal(output, torch.full((1,), 10.0))
+
+
+def test_v4_o_b_row_parallel_keeps_checkpoint_layout() -> None:
+    """Native o_b consumes [N, K] through F.linear for BF16 parity."""
+    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
+    layer = DeepseekV4DecoderLayer(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu"))
+
+    assert layer.self_attn.o_b_proj._use_checkpoint_layout is True
+    layer.self_attn.o_b_proj.process_weights_after_loading()
+    assert layer.self_attn.o_b_proj._weight_is_transposed is False
+
+
+def test_moe_dp_rejects_metadata_token_count_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DP slicing must never silently consume padding or drop real rows."""
+
+    class FakeDistributed:
+        @staticmethod
+        def all_gather(tensor: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            return tensor.repeat(2, *([1] * (tensor.dim() - 1)))
+
+    monkeypatch.setattr(deepseek_v4, "distributed", FakeDistributed)
+    moe = SimpleNamespace(
+        dp_size=2,
+        dp_rank=0,
+        gate=MagicMock(side_effect=AssertionError("gate should not run")),
+        input_ids=None,
+    )
+    metadata = SimpleNamespace(dp_execution_token_counts=[3, 4])
+    ctx = ForwardContext(
+        attention_backend=MagicMock(),
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[],
+    )
+
+    with forward_context(ctx), pytest.raises(RuntimeError, match="local token count"):
+        DeepseekV4MoE.forward(moe, torch.randn(4, 8))

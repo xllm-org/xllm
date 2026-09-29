@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from scripts.logger import logger
 from xllm.python.attention.backend import (
     AttentionBackend,
     CsaIndexContext,
@@ -154,9 +155,9 @@ class DsaAttentionBackend(AttentionBackend):
         *,
         graph_mode: bool = False,
     ) -> None:
-        if graph_mode:
-            raise NotImplementedError("DeepSeek-V4 ACL graph support is not part of the eager CSA/HCA backend")
         self._metadata = metadata
+        if graph_mode:
+            metadata.dsa_graph_mode = True
 
     def reset_forward(self, metadata: AttentionMetadata | None = None) -> None:
         """Drop request-owned DSA state before attaching the next request.
@@ -192,21 +193,38 @@ class DsaAttentionBackend(AttentionBackend):
         """Build compressed-attention metadata in the current model forward."""
         metadata = self._metadata if metadata is None else metadata
         assert metadata is not None
+        compressed_metadata = self._build_dsa_metadata_for_forward(metadata)
+        metadata.dsa_metadata = compressed_metadata
+
+    def _build_dsa_metadata_for_forward(
+        self,
+        metadata: AttentionMetadata,
+    ) -> DsaMetadata:
+        """Build one request's complete DSA metadata without publishing it."""
         multi_block_tables = list(metadata.multi_block_tables)
-        kv_seq_lens_host = metadata.kv_seq_lens_host
-        kv_seq_lens = (
-            kv_seq_lens_host.cpu().tolist() if kv_seq_lens_host is not None and kv_seq_lens_host.numel() > 0 else []
-        )
+        kv_seq_lens_host = getattr(metadata, "kv_seq_lens_host", None)
+        if kv_seq_lens_host is not None and kv_seq_lens_host.numel() > 0:
+            kv_seq_lens = kv_seq_lens_host.cpu().tolist()
+        else:
+            kv_seq_lens = list(getattr(metadata, "kv_seq_lens_host_values", None) or [])
         q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
-        q_seq_lens = (
-            q_seq_lens_host.cpu().tolist() if q_seq_lens_host is not None and q_seq_lens_host.numel() > 0 else None
-        )
+        if q_seq_lens_host is not None and q_seq_lens_host.numel() > 0:
+            q_seq_lens = q_seq_lens_host.cpu().tolist()
+        else:
+            q_seq_lens_tensor = getattr(metadata, "q_seq_lens", None)
+            q_seq_lens = (
+                q_seq_lens_tensor.cpu().tolist()
+                if q_seq_lens_tensor is not None and q_seq_lens_tensor.numel() > 0
+                else None
+            )
         # The dsa_* fields are legacy C++/pybind contract names. Their tensors
         # are model-owned and scoped to the current forward.
         positions = getattr(metadata, "dsa_positions", None)
         if positions is None:
             positions = torch.empty(0, dtype=torch.int64)
         base_cos_sin = getattr(metadata, "dsa_cos_sin", None)
+        enable_graph = bool(getattr(metadata, "dsa_graph_mode", False))
+        graph_capacity_cols = int(getattr(metadata, "dsa_graph_block_table_cols", 0))
         compressed_metadata = self._builder.build(
             multi_block_tables=multi_block_tables,
             kv_seq_lens=kv_seq_lens,
@@ -215,12 +233,248 @@ class DsaAttentionBackend(AttentionBackend):
             dsa_cos_sin=base_cos_sin,
             is_prefill=metadata.is_prefill,
             is_chunked_prefill=metadata.is_chunked_prefill,
-            enable_graph=False,
+            enable_graph=enable_graph,
+            graph_block_table_capacity_cols=graph_capacity_cols,
         )
         self._populate_compressed_attention_rope(compressed_metadata, metadata)
+        # Only build the per-ratio map when rotary caches were attached. The
+        # C++ model returns early from build_dsa_rope_metadata when its rotary
+        # embedding is null, so synthetic protocol-level metadata without
+        # caches must still be buildable.
+        if getattr(metadata, "dsa_cos_sin", None) is not None and metadata.dsa_cos_sin.numel() > 0:
+            compressed_metadata.input_rope_by_ratio = self._build_dsa_rope_metadata(compressed_metadata, metadata)
         self._move_metadata_to_device(compressed_metadata)
         self._build_precomputed_metadata(compressed_metadata, metadata)
-        metadata.dsa_metadata = compressed_metadata
+        return compressed_metadata
+
+    def refresh_dsa_metadata_for_graph_replay(
+        self,
+        metadata: AttentionMetadata | None = None,
+    ) -> None:
+        """Refresh dynamic DSA values while preserving graph-captured storage."""
+        metadata = self._metadata if metadata is None else metadata
+        if metadata is None or metadata.dsa_metadata is None:
+            raise RuntimeError("ACL graph DSA metadata must be captured before replay")
+        persistent = metadata.dsa_metadata
+        refreshed = self._build_dsa_metadata_for_forward(metadata)
+        self._copy_graph_dsa_metadata(persistent, refreshed)
+
+    @classmethod
+    def _copy_graph_dsa_metadata(
+        cls,
+        persistent: DsaMetadata,
+        refreshed: DsaMetadata,
+    ) -> None:
+        """Copy replay values into the tensors retained by ACL graph capture."""
+        tensor_fields = (
+            "seq_lens",
+            "seq_lens_q",
+            "actual_seq_lengths_kv",
+            "actual_seq_lengths_query",
+            "kv_cu_seq_lens",
+            "max_seqlen_kv",
+            "max_seqlen_q",
+            "input_positions",
+            "c4_pad_positions",
+            "c128_pad_positions",
+            "start_pos",
+            "c4_cos",
+            "c4_sin",
+            "c128_cos",
+            "c128_sin",
+            "c4_input_cos",
+            "c4_input_sin",
+            "c128_input_cos",
+            "c128_input_sin",
+            "c1_metadata",
+            "c4_metadata",
+            "c128_metadata",
+            "qli_metadata",
+        )
+        for field_name in tensor_fields:
+            cls._copy_graph_tensor(
+                getattr(persistent, field_name, None),
+                getattr(refreshed, field_name, None),
+                field_name,
+            )
+
+        if len(persistent.block_tables) != len(refreshed.block_tables):
+            raise RuntimeError("ACL graph DSA block-table layer count changed")
+        if len(persistent.slot_mappings) != len(refreshed.slot_mappings):
+            raise RuntimeError("ACL graph DSA slot-mapping layer count changed")
+        for layer_id, (persistent_layer, refreshed_layer) in enumerate(
+            zip(persistent.block_tables, refreshed.block_tables, strict=True)
+        ):
+            cls._copy_graph_tensor_list(
+                persistent_layer,
+                refreshed_layer,
+                f"block_tables[{layer_id}]",
+                pad_value=-1,
+            )
+        for layer_id, (persistent_layer, refreshed_layer) in enumerate(
+            zip(persistent.slot_mappings, refreshed.slot_mappings, strict=True)
+        ):
+            cls._copy_graph_tensor_list(
+                persistent_layer,
+                refreshed_layer,
+                f"slot_mappings[{layer_id}]",
+                pad_value=-1,
+            )
+
+        if persistent.input_rope_by_ratio.keys() != refreshed.input_rope_by_ratio.keys():
+            raise RuntimeError("ACL graph DSA RoPE ratio set changed")
+        for ratio, persistent_pair in persistent.input_rope_by_ratio.items():
+            refreshed_pair = refreshed.input_rope_by_ratio[ratio]
+            cls._copy_graph_tensor(persistent_pair[0], refreshed_pair[0], f"input_rope[{ratio}].cos")
+            cls._copy_graph_tensor(persistent_pair[1], refreshed_pair[1], f"input_rope[{ratio}].sin")
+
+        persistent.max_query_len = refreshed.max_query_len
+        persistent.max_seq_len = refreshed.max_seq_len
+        persistent.is_acl_graph = refreshed.is_acl_graph
+        persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
+
+    @classmethod
+    def _copy_graph_tensor_list(
+        cls,
+        persistent: list[torch.Tensor],
+        refreshed: list[torch.Tensor],
+        name: str,
+        *,
+        pad_value: int = 0,
+    ) -> None:
+        if len(persistent) != len(refreshed):
+            raise RuntimeError(f"ACL graph DSA {name} count changed")
+        for index, (persistent_tensor, refreshed_tensor) in enumerate(zip(persistent, refreshed, strict=True)):
+            cls._copy_graph_tensor(
+                persistent_tensor,
+                refreshed_tensor,
+                f"{name}[{index}]",
+                pad_value=pad_value,
+            )
+
+    @staticmethod
+    def _copy_graph_tensor(
+        persistent: torch.Tensor | None,
+        refreshed: torch.Tensor | None,
+        name: str,
+        *,
+        pad_value: int = 0,
+    ) -> None:
+        if persistent is None and refreshed is None:
+            return
+        if persistent is None or refreshed is None:
+            raise RuntimeError(f"ACL graph DSA tensor availability changed for {name}")
+        if persistent.dtype != refreshed.dtype or persistent.device != refreshed.device:
+            raise RuntimeError(f"ACL graph DSA tensor type changed for {name}")
+        if persistent.shape == refreshed.shape:
+            if persistent.data_ptr() != refreshed.data_ptr():
+                persistent.copy_(refreshed, non_blocking=True)
+            return
+        prefix_compatible = (
+            persistent.dim() == refreshed.dim()
+            and refreshed.dim() > 0
+            and refreshed.shape[0] <= persistent.shape[0]
+            and persistent.shape[1:] == refreshed.shape[1:]
+        )
+        if not prefix_compatible:
+            raise RuntimeError(
+                f"ACL graph DSA tensor shape changed for {name}: {tuple(persistent.shape)} != {tuple(refreshed.shape)}"
+            )
+        persistent.fill_(pad_value)
+        persistent[: refreshed.shape[0]].copy_(refreshed, non_blocking=True)
+
+    def localize_dsa_metadata_for_cp(
+        self,
+        cp_context: object,
+        metadata: AttentionMetadata | None = None,
+    ) -> None:
+        """Localize the query axis of prepared DSA metadata for prefill CP.
+
+        Faithful Python port of
+        ``DeepseekV4ModelImpl::rebuild_cp_local_query_metadata``. The KV axis
+        seen by the attention / indexer kernels is shortened to where this
+        rank's contiguous query rows end, while every cache write path
+        (``block_tables`` / ``slot_mappings`` / ``start_pos`` and the CP-gathered
+        global rows) keeps its global view. The derived sparse and QLI metadata
+        are rebuilt once here so the layer loop does not re-derive them.
+        """
+        metadata = self._metadata if metadata is None else metadata
+        if metadata is None or metadata.dsa_metadata is None:
+            raise RuntimeError("compressed-attention metadata must be prepared before CP localization")
+        dsa = metadata.dsa_metadata
+
+        # The C++ model gate skips CP for an empty-DP rank: its scheduler image
+        # has all-zero DP execution counts and the engine did not publish a global
+        # token set for this replica. A live rank with an empty *CP* segment is
+        # a different case: it must still join every global KV/collective write,
+        # but its local seeded tokens make its DP execution count non-zero. Warn on
+        # that divergence before mutating any length fields so the half-localized
+        # state is not silently kept.
+        if cp_context.enabled() and cp_context.local_token_count == 0:
+            dp_token_counts = getattr(metadata, "dp_execution_token_counts", None)
+            if dp_token_counts is not None and any(int(count) > 0 for count in dp_token_counts):
+                logger.warning(
+                    "DeepSeek-V4 prefill CP is localized to an empty query "
+                    "segment on a non-empty DP rank; chunked prefill may need "
+                    "to mark this rank empty before CP begins"
+                )
+
+        dsa.v4_cp_context = cp_context
+
+        local_q = cp_context.local_q_seq_lens
+        local_kv = cp_context.local_kv_seq_lens
+        device = dsa.seq_lens_q.device if dsa.seq_lens_q.numel() > 0 else self.device
+
+        q_lens = torch.tensor(local_q, dtype=torch.int32, device=device)
+        dsa.seq_lens_q = q_lens
+        actual_q = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(q_lens, 0, dtype=torch.int32),
+            )
+        )
+        dsa.actual_seq_lengths_query = actual_q
+        local_q_max = int(max(local_q, default=0))
+        dsa.max_query_len = local_q_max
+        dsa.max_seqlen_q = (
+            torch.max(q_lens).to(torch.int32).reshape(1)
+            if q_lens.numel() > 0
+            else torch.zeros(1, dtype=torch.int32, device=device)
+        )
+
+        kv_lens = torch.tensor(local_kv, dtype=torch.int32, device=device)
+        dsa.actual_seq_lengths_kv = kv_lens
+        dsa.seq_lens = kv_lens
+        dsa.kv_cu_seq_lens = cp_context.local_kv_cu_seq_lens.to(device)
+        local_kv_max = int(max(local_kv, default=0))
+        dsa.max_seq_len = local_kv_max
+        dsa.max_seqlen_kv = (
+            torch.max(kv_lens).to(torch.int32).reshape(1)
+            if kv_lens.numel() > 0
+            else torch.zeros(1, dtype=torch.int32, device=device)
+        )
+        # Query RoPE and its indexer mirror follow the local rows only; the
+        # global KV/compressor/index-cache write path owns no table here, so
+        # only the query-facing positions shrink. start_pos and all cache
+        # paging tensors deliberately keep their global values.
+        if cp_context.local_positions is not None and cp_context.local_positions.numel() > 0:
+            dsa.input_positions = cp_context.local_positions.to(device)
+
+        # The global map must stay global: the C++ model saves
+        # ``cp_ctx.global_rope_by_ratio = input_rope_by_ratio`` *before* this
+        # rebuild, then clears and rebuilds the layer-facing map against the
+        # local position rows. The model therefore registers the global pairs
+        # on ``cp_context`` before calling this method; do not overwrite them
+        # with the localized tables produced below.
+        dsa.input_rope_by_ratio = self._build_dsa_rope_metadata(dsa, metadata)
+
+        self._build_precomputed_metadata(
+            dsa,
+            metadata,
+            cu_seqlens_ori_kv_override=cp_context.local_kv_cu_seq_lens.to(device),
+            max_query_len_override=local_q_max,
+            max_seq_len_override=local_kv_max,
+        )
 
     def prepare_csa_metadata_for_forward(
         self,
@@ -235,21 +489,34 @@ class DsaAttentionBackend(AttentionBackend):
         cos_sin_cache: torch.Tensor,
         metadata: AttentionMetadata | None = None,
     ) -> None:
-        """Select the main q/kv RoPE group for the current DSV4 layer.
+        """Select the request-shaped main q/kv RoPE pair for this DSV4 layer.
 
         C++ updates ``DSAMetadata::layer_id/cos/sin`` in the model layer loop
-        from ``input_rope_by_ratio``. Python keeps the full cache here because
-        the model and indexer gather it with the current input positions, but
-        the selected group and lifetime are otherwise identical.
+        from its per-forward ``input_rope_by_ratio`` map, preferring this
+        layer's compression ratio and falling back to ratio 1. Undefined /
+        empty-ratio selections are represented as empty tensors so attention
+        never reuses a stale table from a previous layer.
         """
         metadata = self._metadata if metadata is None else metadata
         if metadata is None or metadata.dsa_metadata is None:
             raise RuntimeError("compressed-attention metadata must be prepared before selecting layer RoPE")
         compressed_metadata = metadata.dsa_metadata
-        chunks = cos_sin_cache.chunk(2, dim=-1)
+        try:
+            compress_ratio = self._layer_compress_ratio(layer_id)
+        except ValueError:
+            compress_ratio = 1
+        rope_by_ratio = compressed_metadata.input_rope_by_ratio
+        pair = (None, None)
+        if compress_ratio in rope_by_ratio:
+            pair = rope_by_ratio[compress_ratio]
+        elif 1 in rope_by_ratio:
+            pair = rope_by_ratio[1]
+        if pair[0] is None or pair[1] is None:
+            cos, sin = self._slice_cos_sin_cache(cos_sin_cache)
+            pair = (cos, sin)
         compressed_metadata.layer_id = layer_id
-        compressed_metadata.cos_table = chunks[0].contiguous()
-        compressed_metadata.sin_table = chunks[1].contiguous()
+        compressed_metadata.cos_table = pair[0].contiguous()
+        compressed_metadata.sin_table = pair[1].contiguous()
 
     def select_compressed_attention_layer_rope(
         self,
@@ -284,6 +551,106 @@ class DsaAttentionBackend(AttentionBackend):
             compressed_metadata.c128_cos, compressed_metadata.c128_sin = (
                 tensor.contiguous() for tensor in hca_cos_sin.index_select(0, hca_indices).chunk(2, dim=-1)
             )
+
+    @staticmethod
+    def _slice_cos_sin_cache(
+        cos_sin_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the half-width cos/sin pair stored in a full cache.
+
+        This is the fallback only. The canonical path is
+        :meth:`_build_dsa_rope_metadata`, which mirrors C++
+        ``DeepseekV4RotaryEmbedding::build`` by expanding each requested
+        position and splitting the interleaved cache into the same two
+        half-width tables the C++ attention kernels consume.
+        """
+        if cos_sin_cache is None or cos_sin_cache.numel() == 0:
+            empty = torch.empty(0)
+            return empty, empty
+        chunks = cos_sin_cache.chunk(2, dim=-1)
+        return chunks[0].contiguous(), chunks[1].contiguous()
+
+    def _build_dsa_rope_metadata(
+        self,
+        compressed_metadata: DsaMetadata,
+        metadata: AttentionMetadata | None = None,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Build request-shaped RoPE tables, mirroring C++.
+
+        Faithful Python port of
+        ``DeepseekV4ModelImpl::build_dsa_rope_metadata`` in
+        ``xllm/models/llm/deepseek_v4.h``:
+
+        * default group indexes ``dsa.input_positions`` into the ratio-1 cache;
+        * c4 / c128 groups index ``dsa.c4_pad_positions`` /
+          ``dsa.c128_pad_positions`` into the compressed-theta caches;
+        * the main q/kv path for C4 / C128 layers indexes
+          ``dsa.input_positions`` into the compressed-theta caches, producing
+          ``c4_input_*`` / ``c128_input_*``, and is keyed into
+          ``input_rope_by_ratio`` under ratio 4 / 128.
+
+        Every returned tensor is a per-position, already-split half-width
+        cos/sin table matching ``DeepseekV4RotaryEmbedding::build``'s
+        ``CosSinPair`` contract. Compressed-row tables are stored on the DSA
+        metadata object; main q/kv tables are returned for the layer loop to
+        select.
+        """
+        metadata = self._metadata if metadata is None else metadata
+        positions = compressed_metadata.input_positions
+
+        def validate_cache(name: str, cache: torch.Tensor | None) -> torch.Tensor:
+            if cache is None or cache.numel() == 0 or cache.dim() != 2:
+                raise RuntimeError(f"DeepSeek-V4 {name} RoPE cache must be a 2-D cache")
+            return cache
+
+        default_cache = validate_cache("default", getattr(metadata, "dsa_cos_sin", None))
+        c4_cache = validate_cache("c4", getattr(metadata, "dsa_c4_cos_sin", None))
+        c128_cache = validate_cache("c128", getattr(metadata, "dsa_c128_cos_sin", None))
+
+        def build_pair(cache: torch.Tensor, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if pos is None or pos.numel() == 0:
+                return torch.empty(0), torch.empty(0)
+            indexed = cache.index_select(
+                0,
+                pos.reshape(-1).to(device=cache.device, dtype=torch.int64),
+            )
+            half = indexed.size(-1) // 2
+            cos = indexed[..., :half].contiguous()
+            sin = indexed[..., half:].contiguous()
+            return cos, sin
+
+        rope_by_ratio: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        compressed_metadata.cos_table = torch.empty(0)
+        compressed_metadata.sin_table = torch.empty(0)
+        compressed_metadata.c4_cos = torch.empty(0)
+        compressed_metadata.c4_sin = torch.empty(0)
+        compressed_metadata.c128_cos = torch.empty(0)
+        compressed_metadata.c128_sin = torch.empty(0)
+        compressed_metadata.c4_input_cos = torch.empty(0)
+        compressed_metadata.c4_input_sin = torch.empty(0)
+        compressed_metadata.c128_input_cos = torch.empty(0)
+        compressed_metadata.c128_input_sin = torch.empty(0)
+
+        default_pair = build_pair(default_cache, positions)
+        rope_by_ratio[1] = default_pair
+
+        c4_pair = build_pair(c4_cache, compressed_metadata.c4_pad_positions)
+        compressed_metadata.c4_cos, compressed_metadata.c4_sin = c4_pair
+
+        c128_pair = build_pair(c128_cache, compressed_metadata.c128_pad_positions)
+        compressed_metadata.c128_cos, compressed_metadata.c128_sin = c128_pair
+
+        if positions is not None and positions.numel() > 0:
+            c4_input = build_pair(c4_cache, positions)
+            compressed_metadata.c4_input_cos, compressed_metadata.c4_input_sin = c4_input
+            rope_by_ratio[4] = c4_input
+
+            c128_input = build_pair(c128_cache, positions)
+            compressed_metadata.c128_input_cos, compressed_metadata.c128_input_sin = c128_input
+            rope_by_ratio[128] = c128_input
+
+        return rope_by_ratio
 
     def execute(
         self,
@@ -331,14 +698,17 @@ class DsaAttentionBackend(AttentionBackend):
         ori_kv = layer_cache.swa
         ori_slot = _get_layer_cache_tensor(compressed_metadata.slot_mappings, layer_id, mapping.ori_cache_idx)
         ori_block_table = _get_layer_cache_tensor(compressed_metadata.block_tables, layer_id, mapping.ori_cache_idx)
+        cp_ctx = getattr(compressed_metadata, "v4_cp_context", None)
+        cp_enabled = cp_ctx is not None and cp_ctx.enabled()
         if use_temporary_prefill_kv:
             # Prefill: build temporary PA_ND cache from kv (mirrors C++
             # build_prefill_pa_nd_kv, deepseek_sparse_attention.cpp:272-368).
             ori_kv_for_attn, ori_block_table_for_attn = _build_prefill_pa_nd_kv(
                 k,
-                compressed_metadata.actual_seq_lengths_query,
+                cp_ctx.global_q_cu_seq_lens if cp_enabled else compressed_metadata.actual_seq_lengths_query,
                 ori_block_table,
                 self.window_size,
+                cp_ctx.local_kv_cu_seq_lens if cp_enabled else None,
             )
         else:
             if ori_kv is not None and ori_slot is not None:
@@ -403,7 +773,13 @@ class DsaAttentionBackend(AttentionBackend):
         # cu_seqlens_ori_kv as std::nullopt. A defined empty tensor selects a
         # different ACL optional-input path and causes small decode drift.
         use_prefill_attn = is_prefill or is_chunked_prefill
-        cu_seqlens_ori_kv_for_attn = seq_q if use_prefill_attn else None
+        if use_prefill_attn:
+            # C++ uses the local KV window cumsum under prefill CP, and the
+            # query cumsum otherwise. This must match the value baked into the
+            # precomputed sparse metadata by build_precomputed_metadata.
+            cu_seqlens_ori_kv_for_attn = cp_ctx.local_kv_cu_seq_lens if cp_enabled else seq_q
+        else:
+            cu_seqlens_ori_kv_for_attn = None
         sinks = getattr(layer, "attn_sink", None) if getattr(layer, "attn_sink_loaded", False) else None
         if sinks is not None:
             sinks = sinks.to(q.device, dtype=torch.float32).contiguous()
@@ -561,6 +937,9 @@ class DsaAttentionBackend(AttentionBackend):
         self,
         compressed_metadata: DsaMetadata,
         metadata: AttentionMetadata,
+        cu_seqlens_ori_kv_override: torch.Tensor | None = None,
+        max_query_len_override: int | None = None,
+        max_seq_len_override: int | None = None,
     ) -> None:
         """Build the AICPU tiling metadata for each compress ratio present.
 
@@ -574,11 +953,13 @@ class DsaAttentionBackend(AttentionBackend):
         seq_kv = compressed_metadata.actual_seq_lengths_kv
         batch_size = int(max(compressed_metadata.actual_seq_lengths_kv.numel(), 1))
         forward_meta = _build_compressed_attention_forward_meta(compressed_metadata, metadata)
-        max_q = forward_meta.q_max_seq_len
-        max_kv = forward_meta.kv_max_seq_len
+        max_q = forward_meta.q_max_seq_len if max_query_len_override is None else max_query_len_override
+        max_kv = forward_meta.kv_max_seq_len if max_seq_len_override is None else max_seq_len_override
         is_prefill = max_q > 1
         empty_int32 = torch.empty(0, dtype=torch.int32, device=self.device)
-        cu_seqlens_ori_kv = seq_q if is_prefill else empty_int32
+        cu_seqlens_ori_kv = empty_int32
+        if is_prefill:
+            cu_seqlens_ori_kv = cu_seqlens_ori_kv_override if cu_seqlens_ori_kv_override is not None else seq_q
         cu_seqlens_cmp_kv = empty_int32
         seqused_q = empty_int32
         seqused_kv = seq_kv
@@ -650,6 +1031,14 @@ class DsaAttentionBackend(AttentionBackend):
             "c128_pad_positions",
             "start_pos",
             "hadamard",
+            "c4_cos",
+            "c4_sin",
+            "c128_cos",
+            "c128_sin",
+            "c4_input_cos",
+            "c4_input_sin",
+            "c128_input_cos",
+            "c128_input_sin",
         )
         for name in tensor_fields:
             tensor = getattr(compressed_metadata, name, None)

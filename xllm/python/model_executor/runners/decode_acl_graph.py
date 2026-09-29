@@ -38,6 +38,7 @@ import torch.nn as nn
 from scripts.logger import logger
 from xllm.python import kernels
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
+from xllm.python.attention.dsa_metadata import DSA_CACHE_TOKEN
 from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
@@ -744,6 +745,10 @@ class DecodeAclGraphRunner(AclGraphRunner):
         )
 
         self._prepare_attention(entry, entry.static_metadata)
+        if not first_capture:
+            refresh_dsa = getattr(self.attention_backend, "refresh_dsa_metadata_for_graph_replay", None)
+            if refresh_dsa is not None:
+                refresh_dsa(entry.static_metadata)
 
         if first_capture:
             self._capture(entry, self._stream)
@@ -892,7 +897,53 @@ class DecodeAclGraphRunner(AclGraphRunner):
                     else None
                 ),
             )
+        if getattr(self.attention_backend, "group_infos", None) is not None:
+            entry.static_metadata.multi_block_tables = self._build_static_multi_block_tables(
+                padded_batch_size,
+                device,
+            )
+            entry.static_metadata.dsa_graph_block_table_cols = self._max_blocks_per_sequence
+            entry.static_metadata.dsa_graph_mode = True
         return entry
+
+    def _build_static_multi_block_tables(
+        self,
+        padded_batch_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, ...]:
+        """Build stable SWA/C4/C128 manager block tables for graph capture.
+
+        Keep every manager's dimensions (and therefore its packed DSA metadata
+        views) fixed across decodes of the same bucket. The first manager uses
+        the runner-wide maximum block column count; compressed managers use the
+        ``max_model_len``-derived upper bound. Unused entries stay at -1.
+        """
+        max_swa_cols = self._max_blocks_per_sequence
+        group_infos = getattr(self.attention_backend, "group_infos", None)
+        if group_infos is None:
+            return ()
+        manager_infos = list(group_infos)
+        tables: list[torch.Tensor] = []
+        for group_info in manager_infos:
+            if group_info is not None and getattr(group_info, "cache_type", None) == DSA_CACHE_TOKEN:
+                ratio = max(int(getattr(group_info, "ratio", 1)), 1)
+                block_size = max(int(getattr(group_info, "block_size", 1)), 1)
+                compressed_block_size = ratio * block_size
+                max_cols = max(
+                    1,
+                    (self.max_model_len + compressed_block_size - 1) // compressed_block_size,
+                )
+            else:
+                max_cols = max_swa_cols
+            tables.append(
+                torch.full(
+                    (padded_batch_size, max_cols),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            )
+        return tuple(tables)
 
     def _fill_entry(
         self,
@@ -914,6 +965,8 @@ class DecodeAclGraphRunner(AclGraphRunner):
             paged_kv_indices,
             paged_kv_last_page_len,
         ) = self._decode_metadata(metadata)
+        if static_metadata.dsa_graph_mode:
+            self._fill_graph_dsa_positions(entry, positions)
         if batch_size != block_table.shape[0]:
             raise RuntimeError("ACL graph decode batch size must match metadata sequences")
         self._validate_decode_token_layout(
@@ -1022,11 +1075,73 @@ class DecodeAclGraphRunner(AclGraphRunner):
             if padded_batch_size > batch_size:
                 static_metadata.block_table[batch_size:].zero_()
 
+        self._fill_dsa_block_tables(static_metadata, metadata, block_table, batch_size)
+
         # Padded lanes must remain valid inputs for sparse MLA tiling.  Their
         # token and slot mapping are dummy values, so one KV token is safe.
         if padded_batch_size > batch_size:
             static_metadata.slot_mapping[batch_size:].fill_(-1)
             entry.kv_seq_lens_delta[batch_size:].fill_(1)
+
+    def _fill_dsa_block_tables(
+        self,
+        static_metadata: StaticGraphAttentionMetadata,
+        metadata: AttentionMetadata,
+        block_table: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Refresh every stable DSA manager table for the current decode."""
+        static_tables = list(static_metadata.multi_block_tables)
+        if not static_tables:
+            return
+        source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
+        if not source_tables:
+            if getattr(self.attention_backend, "group_infos", None) is not None:
+                raise RuntimeError("DeepSeek-V4 ACL graph requires all DSA manager block tables")
+            source_tables = [block_table]
+        if len(source_tables) != len(static_tables):
+            raise RuntimeError(f"ACL graph DSA manager count changed: {len(source_tables)} != {len(static_tables)}")
+
+        for manager_id, (target, source) in enumerate(zip(static_tables, source_tables, strict=True)):
+            target.fill_(-1)
+            if source is None:
+                continue
+            if source.dim() != 2:
+                raise RuntimeError(f"ACL graph DSA manager {manager_id} block table must be two-dimensional")
+            source_rows = int(source.shape[0])
+            if source_rows != batch_size:
+                if source_rows <= 0 or batch_size % source_rows != 0:
+                    raise RuntimeError(
+                        f"ACL graph DSA manager {manager_id} row count "
+                        f"{source_rows} does not match batch size {batch_size}"
+                    )
+                source = source.repeat_interleave(batch_size // source_rows, dim=0)
+            if source.shape[1] > target.shape[1]:
+                raise RuntimeError(
+                    f"ACL graph DSA manager {manager_id} requires {source.shape[1]} "
+                    f"columns, capacity is {target.shape[1]}"
+                )
+            target[:batch_size, : source.shape[1]].copy_(source[:batch_size])
+
+    def _fill_graph_dsa_positions(
+        self,
+        entry: AclGraphEntry,
+        positions: torch.Tensor,
+    ) -> None:
+        """Keep a stable DSA position tensor synced with the static bucket."""
+        static_metadata = entry.static_metadata
+        padded_batch_size = entry.batch_size
+        if static_metadata.dsa_positions is None:
+            static_metadata.dsa_positions = torch.zeros(
+                padded_batch_size,
+                dtype=torch.int64,
+                device=entry.static_positions.device,
+            )
+        graph_positions = positions.to(device=entry.static_positions.device, dtype=torch.int64)
+        copy_count = min(int(graph_positions.numel()), padded_batch_size)
+        static_metadata.dsa_positions[:copy_count].copy_(graph_positions[:copy_count])
+        if padded_batch_size > copy_count:
+            static_metadata.dsa_positions[copy_count:].zero_()
 
     def _fill_host_metadata(
         self,
@@ -1052,4 +1167,5 @@ class DecodeAclGraphRunner(AclGraphRunner):
             raise RuntimeError("decode ACL graph host KV buffer is missing")
         static_kv_seq_lens[:batch_size] = kv_seq_lens
         if padded_batch_size > batch_size:
-            static_kv_seq_lens[batch_size:] = [1] * (padded_batch_size - batch_size)
+            padding_kv_len = 0 if getattr(self.attention_backend, "group_infos", None) is not None else 1
+            static_kv_seq_lens[batch_size:] = [padding_kv_len] * (padded_batch_size - batch_size)

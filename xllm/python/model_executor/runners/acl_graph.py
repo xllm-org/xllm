@@ -65,6 +65,14 @@ class StaticGraphAttentionMetadata:
     kv_split_rank: int = 0
     has_kv_shard: bool = False
     prepared_attention_state: object | None = None
+    multi_block_tables: tuple[torch.Tensor | None, ...] = ()
+    dsa_metadata: object | None = None
+    dsa_positions: torch.Tensor | None = None
+    dsa_cos_sin: torch.Tensor | None = None
+    dsa_c4_cos_sin: torch.Tensor | None = None
+    dsa_c128_cos_sin: torch.Tensor | None = None
+    dsa_graph_mode: bool = False
+    dsa_graph_block_table_cols: int = 0
 
 
 class AclGraphEntry:

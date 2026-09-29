@@ -97,6 +97,25 @@ class DsaMetadata:
     c4_sin: torch.Tensor | None = None
     c128_cos: torch.Tensor | None = None
     c128_sin: torch.Tensor | None = None
+    # Main q/kv RoPE for C4/C128 layers, built from input_positions against the
+    # compressed-theta caches. Mirrors DSAMetadata::c4_input_cos/c4_input_sin
+    # and DSAMetadata::c128_input_cos/c128_input_sin. These are independent of
+    # the per-compressed-row tables above (c4_cos/c4_sin etc.).
+    c4_input_cos: torch.Tensor | None = None
+    c4_input_sin: torch.Tensor | None = None
+    c128_input_cos: torch.Tensor | None = None
+    c128_input_sin: torch.Tensor | None = None
+    # Main q/kv RoPE pairs keyed by compression ratio. Keeping the complete map
+    # on the request-owned metadata makes every ACL graph entry retain the
+    # stable tensor addresses captured by each layer.
+    input_rope_by_ratio: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    # Global-position RoPE for the KV / compressor / index-cache writes under
+    # prefill CP. ``cos_table`` / ``sin_table`` are localized to this rank's
+    # query rows, but the projected-attention KV path runs on the full
+    # CP-gathered token set and must use the global table of this layer's ratio.
+    # Mirrors DSAMetadata::kv_cos/kv_sin; undefined when CP is off.
+    kv_cos: torch.Tensor | None = None
+    kv_sin: torch.Tensor | None = None
 
     # block_tables / slot_mappings: [n_layers][n_caches_per_layer]; caches in the
     # same group share the same underlying tensor (no copy).

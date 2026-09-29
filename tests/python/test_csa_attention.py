@@ -35,6 +35,9 @@ from xllm.python.attention.csa_attention import (
     _scatter_by_slot,
 )
 from xllm.python.attention.dsa_metadata import build_cache_specs
+from xllm.python.model_executor.v4_cp_context import (
+    build_deepseek_v4_cp_context,
+)
 
 
 def _make_backend() -> CsaAttentionBackend:
@@ -243,10 +246,11 @@ def test_dsa_api_aliases_are_equivalent(monkeypatch) -> None:
     assert metadata.dsa_metadata is not canonical
 
 
-def test_graph_mode_is_explicitly_deferred() -> None:
+def test_graph_mode_is_recorded_on_metadata() -> None:
     backend = _make_backend()
-    with pytest.raises(NotImplementedError, match="ACL graph"):
-        backend.prepare(SimpleNamespace(), graph_mode=True)
+    metadata = SimpleNamespace()
+    backend.prepare(metadata, graph_mode=True)
+    assert metadata.dsa_graph_mode is True
 
 
 def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
@@ -396,6 +400,139 @@ def test_forward_rope_state_is_owned_by_each_metadata(monkeypatch) -> None:
     assert prefill.dsa_metadata.input_positions.numel() == 84
     assert decode.dsa_positions.numel() == 1
     assert prefill.dsa_positions.data_ptr() != decode.dsa_positions.data_ptr()
+
+
+def test_cp_localization_keeps_runtime_metadata_read_only(monkeypatch) -> None:
+    backend = _make_backend()
+    dsa = backend._builder.build(
+        multi_block_tables=[],
+        kv_seq_lens=[4],
+        q_seq_lens=[4],
+        positions=torch.arange(4, dtype=torch.int64),
+        dsa_cos_sin=None,
+        is_prefill=True,
+        is_chunked_prefill=False,
+    )
+
+    class _ReadOnlyMetadata:
+        def __init__(self) -> None:
+            self.dsa_metadata = dsa
+            self.dp_execution_token_counts = (4,)
+
+        @property
+        def q_seq_lens_host(self) -> torch.Tensor:
+            return torch.tensor([4], dtype=torch.int32)
+
+        @property
+        def kv_seq_lens_host(self) -> torch.Tensor:
+            return torch.tensor([4], dtype=torch.int32)
+
+        @property
+        def max_query_len(self) -> int:
+            return 4
+
+        @property
+        def max_seq_len(self) -> int:
+            return 4
+
+    captured: dict[str, int] = {}
+
+    def capture_precomputed(
+        _dsa,
+        _metadata,
+        *,
+        cu_seqlens_ori_kv_override=None,
+        max_query_len_override=None,
+        max_seq_len_override=None,
+    ) -> None:
+        del cu_seqlens_ori_kv_override
+        captured["max_query_len"] = max_query_len_override
+        captured["max_seq_len"] = max_seq_len_override
+
+    monkeypatch.setattr(
+        backend,
+        "_build_dsa_rope_metadata",
+        lambda *_args: {1: (torch.zeros(2, 1), torch.zeros(2, 1))},
+    )
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", capture_precomputed)
+    metadata = _ReadOnlyMetadata()
+    cp_context = build_deepseek_v4_cp_context(
+        2,
+        0,
+        [4],
+        [4],
+        torch.arange(4, dtype=torch.int64),
+    )
+
+    backend.localize_dsa_metadata_for_cp(cp_context, metadata)
+
+    assert dsa.seq_lens_q.tolist() == [2]
+    assert dsa.seq_lens.tolist() == [2]
+    assert captured == {"max_query_len": 2, "max_seq_len": 2}
+    assert metadata.q_seq_lens_host.tolist() == [4]
+    assert metadata.kv_seq_lens_host.tolist() == [4]
+
+
+def test_graph_dsa_refresh_preserves_tensor_addresses() -> None:
+    def make_metadata(value: int, seq_rows: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            seq_lens=torch.full((seq_rows,), value, dtype=torch.int32),
+            block_tables=[[torch.full((seq_rows, 2), value, dtype=torch.int32)]],
+            slot_mappings=[[torch.full((seq_rows,), value, dtype=torch.int32)]],
+            input_rope_by_ratio={
+                1: (
+                    torch.full((2, 2), value, dtype=torch.float32),
+                    torch.full((2, 2), value, dtype=torch.float32),
+                )
+            },
+            max_query_len=value,
+            max_seq_len=value,
+            is_acl_graph=True,
+            precomputed_metadata_inputs=(),
+        )
+
+    persistent = make_metadata(1, 4)
+    refreshed = make_metadata(7, 2)
+    seq_lens_ptr = persistent.seq_lens.data_ptr()
+    block_table_ptr = persistent.block_tables[0][0].data_ptr()
+    rope_ptr = persistent.input_rope_by_ratio[1][0].data_ptr()
+
+    CsaAttentionBackend._copy_graph_dsa_metadata(persistent, refreshed)
+
+    assert persistent.seq_lens.data_ptr() == seq_lens_ptr
+    assert persistent.seq_lens.tolist() == [7, 7, 0, 0]
+    assert persistent.block_tables[0][0].data_ptr() == block_table_ptr
+    assert persistent.block_tables[0][0].tolist() == [[7, 7], [7, 7], [-1, -1], [-1, -1]]
+    assert persistent.slot_mappings[0][0].tolist() == [7, 7, -1, -1]
+    assert persistent.input_rope_by_ratio[1][0].data_ptr() == rope_ptr
+    assert persistent.input_rope_by_ratio[1][0].tolist() == [[7.0, 7.0], [7.0, 7.0]]
+    assert persistent.max_query_len == 7
+    assert persistent.max_seq_len == 7
+
+
+def test_graph_dsa_build_uses_stable_host_length_values(monkeypatch) -> None:
+    backend = _make_backend()
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    metadata = SimpleNamespace(
+        multi_block_tables=[],
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=[9, 1],
+        q_seq_lens_host=None,
+        q_seq_lens=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+        dsa_positions=torch.tensor([8, 0], dtype=torch.int64),
+        dsa_cos_sin=None,
+        dsa_graph_mode=True,
+        dsa_graph_block_table_cols=4,
+    )
+
+    dsa = backend._build_dsa_metadata_for_forward(metadata)
+
+    assert dsa.seq_lens.tolist() == [9, 1]
+    assert dsa.seq_lens_q.tolist() == [1, 1]
+    assert dsa.start_pos.tolist() == [8, 0]
 
 
 def test_prefill_persists_swa_for_decode_and_omits_ori_kv_cu_seqlens(
