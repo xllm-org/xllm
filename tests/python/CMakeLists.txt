@@ -25,14 +25,25 @@ foreach(test_source IN LISTS test_sources)
   add_dependencies(python_tests ${test_target})
   add_dependencies(${test_target} xllm_export)
 
+  if(test_name MATCHES "^test_(all_gather|bitwise|matmul)_nz_bytes$")
+    # These tests initialize HCCL in two processes and skip normal pytest collection.
+    set(test_command "${Python3_EXECUTABLE}" -m torch.distributed.run
+      --standalone --nnodes=1 --nproc_per_node=2 "${test_source}")
+  else()
+    set(test_command "${Python3_EXECUTABLE}" -m pytest -q "${test_source}")
+  endif()
+
   add_test(NAME ${test_target}
     COMMAND "${CMAKE_COMMAND}" -E env
       "PYTHONPATH=${PROJECT_SOURCE_DIR}:$ENV{PYTHONPATH}"
       "XLLM_EXPORT_PATH=$<TARGET_FILE:xllm_export>"
-      "${Python3_EXECUTABLE}" -m pytest -q "${test_source}")
+      ${test_command})
   set_tests_properties(${test_target} PROPERTIES
     WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
     LABELS python_tests
     # Preserve serial device use within the former single pytest process.
     RESOURCE_LOCK python_tests)
+  if(test_name MATCHES "^test_(all_gather|bitwise|matmul)_nz_bytes$")
+    set_tests_properties(${test_target} PROPERTIES RUN_SERIAL TRUE)
+  endif()
 endforeach()

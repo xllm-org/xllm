@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import importlib
+from typing import Any
+
 from xllm.python.distributed.collectives import (
     all_gather,
     all_gather_variable,
@@ -53,3 +56,24 @@ __all__ = [
     "all_gather_variable",
     "gather_dp_execution_tokens",
 ]
+
+_NZ_EXPORTS = frozenset(
+    (
+        "all_gather_nz_bytes",
+        "empty_nz",
+        "shard_nz",
+    )
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Load NZ AllGather helpers only when requested (avoids importing torch_npu).
+
+    Not listed in ``__all__`` so ``from xllm.python.distributed import *`` does
+    not pull in torch_npu. Import explicitly, e.g.
+    ``from xllm.python.distributed import all_gather_nz_bytes``.
+    """
+    if name not in _NZ_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    mod = importlib.import_module("xllm.python.distributed.all_gather_nz_bytes")
+    return getattr(mod, name)
