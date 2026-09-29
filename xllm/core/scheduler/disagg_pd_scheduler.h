@@ -89,6 +89,10 @@ class DisaggPDScheduler : public ContinuousScheduler {
       torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
       int32_t num_cached_tokens = 0);
 
+  // Only consumes a matching waiting reservation, never a running request.
+  bool release_reservation(const std::string& req_id,
+                           const std::string& reservation_id);
+
   // decode allocate blocks with prefix cache.
   bool try_allocate(Sequence* sequence);
 
@@ -117,10 +121,14 @@ class DisaggPDScheduler : public ContinuousScheduler {
                        const int32_t src_kv_split_size);
 
  protected:
-  // Skips dispatch and RPC startup. Unit tests construct through this so they
-  // do not block in initialize_rpc_server.
+  // Skips dispatch and RPC startup for unit tests.
   struct SkipRuntimeStart {};
   DisaggPDScheduler(Engine* engine, const Options& options, SkipRuntimeStart);
+
+  void release_failed_request(const std::shared_ptr<Request>& request) override;
+
+  // Caller holds received_request_map_mutex_. Deallocation stays outside it.
+  std::shared_ptr<Request> take_waiting_request(const std::string& req_id);
 
   void do_permanent_rejection(const std::shared_ptr<Request>& request);
 
@@ -185,7 +193,13 @@ class DisaggPDScheduler : public ContinuousScheduler {
                                  /*cpu_binding=*/false,
                                  /*pool_name=*/"DisaggPDScheduler.prefill"};
 
-  // related decode instance name(ID) list
+  // Release retries must not delay FirstGeneration or local KV reclamation.
+  ThreadPool reservation_release_threadpool_{
+      /*num_threads=*/1,
+      /*cpu_binding=*/false,
+      /*pool_name=*/"DisaggPDScheduler.reservation_release"};
+
+  // related decode instance name(ID) list (used by PDOOCScheduler override)
   std::vector<std::string> decode_inst_names_;
   // TODO later
   // std::vector<std::string> updated_decode_inst_names;

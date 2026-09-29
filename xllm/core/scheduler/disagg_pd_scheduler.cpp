@@ -18,6 +18,7 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <brpc/server.h>
+#include <butil/endpoint.h>
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -48,6 +49,7 @@ limitations under the License.
 #include "util/env_var.h"
 #include "util/timer.h"
 #include "util/utils.h"
+#include "util/uuid.h"
 
 namespace xllm {
 
@@ -91,6 +93,52 @@ void drain_dispatch_queue(
     }
     pending->push(std::move(incoming));
   }
+}
+
+void send_reservation_release(const std::string& req_id,
+                              const std::string& reservation_id,
+                              const std::string& address) {
+  constexpr int32_t kMaxAttempts = 3;
+  constexpr int32_t kTimeoutMs = 1000;
+  constexpr int32_t kBackoffMs = 50;
+  brpc::Channel channel;
+  brpc::ChannelOptions options;
+  options.timeout_ms = kTimeoutMs;
+  options.connect_timeout_ms = kTimeoutMs;
+  options.max_retry = 0;
+  if (channel.Init(address.c_str(), nullptr, &options) != 0) {
+    LOG(ERROR) << "Decode reservation release failed, request_id=" << req_id
+               << ", peer=" << address << ", channel initialization failed; "
+               << "reservation may remain allocated";
+    return;
+  }
+  proto::DisaggPDService_Stub stub(&channel);
+  proto::ReleaseReservationRequest req;
+  req.set_req_id(req_id);
+  req.set_reservation_id(reservation_id);
+  for (int32_t attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+    brpc::Controller cntl;
+    proto::ReleaseReservationResponse resp;
+    stub.ReleaseReservation(&cntl, &req, &resp, nullptr);
+    if (!cntl.Failed() &&
+        (resp.result() == proto::ReleaseReservationResponse::RELEASED ||
+         resp.result() == proto::ReleaseReservationResponse::NOT_WAITING)) {
+      LOG(INFO) << "Decode reservation release, request_id=" << req_id
+                << ", peer=" << address << ", result=" << resp.result()
+                << ", attempt=" << attempt;
+      return;
+    }
+    LOG(WARNING) << "Decode reservation release retry, request_id=" << req_id
+                 << ", peer=" << address << ", attempt=" << attempt
+                 << ", result=" << resp.result()
+                 << ", rpc_error=" << cntl.ErrorText();
+    if (attempt < kMaxAttempts) {
+      absl::SleepFor(absl::Milliseconds(kBackoffMs));
+    }
+  }
+  LOG(ERROR) << "Decode reservation release exhausted retries, request_id="
+             << req_id << ", peer=" << address
+             << "; reservation may remain allocated";
 }
 
 }  // namespace
@@ -462,6 +510,11 @@ void DisaggPDScheduler::dispatch_requests() {
           request, {StatusCode::UNKNOWN, "Fail to create rpc channel"});
       continue;
     }
+
+    if (request->state().pd_reservation_id.empty()) {
+      request->state().pd_reservation_id = ShortUUID().random();
+    }
+
     // NOTE: TODO: maybe we need to support batch disatch
     // later, this maybe decrease the communication cost.
     // currently we only support one request per dispatch.
@@ -488,6 +541,7 @@ void DisaggPDScheduler::dispatch_requests() {
       // proto::DisaggRequest req;
       auto req = reqs.mutable_reqs()->Add();
       req->set_req_id(requests[i]->request_id());
+      req->set_reservation_id(requests[i]->state().pd_reservation_id);
       req->set_service_req_id(requests[i]->service_request_id());
       req->set_source_xservice_addr(requests[i]->source_xservice_addr());
       req->set_tokens_num(requests[i]->state().prompt_tokens.size());
@@ -669,6 +723,10 @@ void DisaggPDScheduler::dispatch_requests() {
           }
         }
 
+        // Retain the peer that actually accepted this RPC, even if discovery
+        // changes before the asynchronous release task runs.
+        requests[i]->state().decode_rpc_address =
+            butil::endpoint2str(cntl.remote_side()).c_str();
         // Push to request_queue_; it will be executed by the engine.
         request_queue_.write(requests[i]);
       }
@@ -698,6 +756,7 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       if (!options_.disable_log_stats()) {
         request->log_statistic(request->elapsed_seconds());
       }
+      request->state().decode_rpc_address.clear();
       requests.emplace_back(request);
       if (!request->state().stream) {
         non_stream_requests.emplace_back(request);
@@ -882,6 +941,77 @@ void DisaggPDScheduler::prefill_send_first_generation() {
   });
 }
 
+void DisaggPDScheduler::release_failed_request(
+    const std::shared_ptr<Request>& request) {
+  {
+    std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
+    req_to_channel_map_.erase(request->request_id());
+  }
+  std::string address = std::move(request->state().decode_rpc_address);
+  request->state().decode_rpc_address.clear();
+  if (address.empty()) {
+    return;
+  }
+  const std::string req_id = request->request_id();
+  const std::string reservation_id = request->state().pd_reservation_id;
+  if (reservation_id.empty()) {
+    LOG(ERROR)
+        << "Cannot release Decode reservation without identity, request_id="
+        << req_id << ", peer=" << address;
+    return;
+  }
+
+  // This request has been removed from the scheduling queue. LLMEngine::step
+  // waits for every worker, whose step_internal waits for all PUSH futures
+  // (also in overlap mode). Thus prior chunks cannot still write remote KV,
+  // and this failed request cannot enter a later batch or FirstGeneration.
+  // Capture values only: neither Request nor the scheduler's cached raw stub
+  // is needed by retries. The pool drains these tasks during destruction.
+  reservation_release_threadpool_.schedule([req_id, reservation_id, address] {
+    send_reservation_release(req_id, reservation_id, address);
+  });
+}
+
+std::shared_ptr<Request> DisaggPDScheduler::take_waiting_request(
+    const std::string& req_id) {
+  auto it = received_request_map_.find(req_id);
+  if (it == received_request_map_.end()) {
+    return nullptr;
+  }
+  auto request = std::move(it->second);
+  received_request_map_.erase(it);
+  auto inst_it = request_to_instance_map_.find(req_id);
+  if (inst_it != request_to_instance_map_.end()) {
+    auto reverse_it = instance_to_received_requests_map_.find(inst_it->second);
+    if (reverse_it != instance_to_received_requests_map_.end()) {
+      reverse_it->second.erase(req_id);
+      if (reverse_it->second.empty()) {
+        instance_to_received_requests_map_.erase(reverse_it);
+      }
+    }
+    request_to_instance_map_.erase(inst_it);
+  }
+  return request;
+}
+
+bool DisaggPDScheduler::release_reservation(const std::string& req_id,
+                                            const std::string& reservation_id) {
+  std::shared_ptr<Request> request;
+  {
+    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    auto it = received_request_map_.find(req_id);
+    if (it == received_request_map_.end() || reservation_id.empty() ||
+        it->second->state().pd_reservation_id != reservation_id) {
+      return false;
+    }
+    request = take_waiting_request(req_id);
+  }
+  for (const auto& sequence : request->sequences()) {
+    engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
+  }
+  return true;
+}
+
 // request is received from prefill
 bool DisaggPDScheduler::decode_schedule(
     std::shared_ptr<Request>& request,
@@ -890,12 +1020,15 @@ bool DisaggPDScheduler::decode_schedule(
   CHECK(!request->sequences().empty());
 
   {
-    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    std::unique_lock<std::mutex> lock(received_request_map_mutex_);
     if (received_request_map_.find(request->request_id()) !=
         received_request_map_.end()) {
       LOG(ERROR) << "Decode receive duplicate request_id from prefill: "
                  << request->request_id();
-      kv_cache_manager_->deallocate(request.get());
+      lock.unlock();
+      for (const auto& sequence : request->sequences()) {
+        engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
+      }
       return false;
     }
     received_request_map_[request->request_id()] = request;
@@ -934,14 +1067,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
       LOG(ERROR) << "Failed to find request, request id: " << req_id;
       return false;
     }
-    request = it->second;
-    received_request_map_.erase(it);
-
-    auto inst_it = request_to_instance_map_.find(req_id);
-    if (inst_it != request_to_instance_map_.end()) {
-      instance_to_received_requests_map_[inst_it->second].erase(req_id);
-      request_to_instance_map_.erase(inst_it);
-    }
+    request = take_waiting_request(req_id);
   }
   auto& sequences = request->sequences();
   if (sequences.empty() || sequences[0] == nullptr) {

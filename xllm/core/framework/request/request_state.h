@@ -169,6 +169,10 @@ class RequestState final {
 
   // decode address.
   std::string decode_address;
+  // Survives Sequence::reset() on local allocation failure. The RPC address is
+  // populated only after Decode explicitly accepts the reservation.
+  std::string pd_reservation_id;
+  std::string decode_rpc_address;
 
   torch::Tensor input_embedding;
 

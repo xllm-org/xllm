@@ -165,6 +165,7 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
     req_state.json_reasoning_enabled = req.json_reasoning_enabled();
   }
 
+  req_state.pd_reservation_id = req.reservation_id();
   auto new_request = std::make_shared<Request>(req.req_id(),
                                                req.x_request_id(),
                                                req.x_request_time(),
@@ -174,6 +175,16 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
 
   // add one sequence, rest will be added by scheduler
   return new_request;
+}
+
+void DisaggPDServiceImpl::release_reservation(
+    const proto::ReleaseReservationRequest* request,
+    proto::ReleaseReservationResponse* response) {
+  const bool released = scheduler_->release_reservation(
+      request->req_id(), request->reservation_id());
+  response->set_result(released
+                           ? proto::ReleaseReservationResponse::RELEASED
+                           : proto::ReleaseReservationResponse::NOT_WAITING);
 }
 
 void DisaggPDServiceImpl::decode_recv_new_requests(
