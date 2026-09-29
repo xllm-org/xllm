@@ -634,6 +634,44 @@ class DecodeAclGraphRunner(AclGraphRunner):
             topk = topk[:batch_size].clone()
         return hidden, aux_hidden, topk
 
+    def _capture(self, entry: AclGraphEntry, stream: torch.npu.Stream) -> None:
+        # Graph warmup and capture execute the model before the first replay.
+        # KDA advances recurrent cache and speculative state on each forward,
+        # so restore the touched slots before serving the decode step.
+        idx = entry.static_metadata.linear_state_indices
+        linear_snapshot = []
+        v2_snapshot = None
+        v3_snapshot = None
+        if idx is not None:
+            for cache in self.layer_caches:
+                conv = getattr(cache, "conv", None)
+                ssm = getattr(cache, "ssm", None)
+                if conv is not None and ssm is not None:
+                    linear_snapshot.append(
+                        (conv, ssm, conv.index_select(0, idx).clone(), ssm.index_select(0, idx).clone())
+                    )
+            v2_snapshot_fn = getattr(self.attention_backend, "snapshot_kda_v2_state", None)
+            if v2_snapshot_fn is not None:
+                v2_snapshot = v2_snapshot_fn(idx)
+            v3_snapshot_fn = getattr(self.attention_backend, "snapshot_kda_v3_state", None)
+            if v3_snapshot_fn is not None:
+                v3_snapshot = v3_snapshot_fn(idx)
+
+        try:
+            super()._capture(entry, stream)
+        finally:
+            # Snapshot reads precede capture via the parent stream wait; wait
+            # for capture writes before restoring on the caller's stream.
+            torch.npu.current_stream().wait_stream(stream)
+            if idx is not None:
+                for conv, ssm, conv_rows, ssm_rows in linear_snapshot:
+                    conv.index_copy_(0, idx, conv_rows)
+                    ssm.index_copy_(0, idx, ssm_rows)
+            if v2_snapshot is not None:
+                self.attention_backend.restore_kda_v2_state(v2_snapshot)
+            if v3_snapshot is not None:
+                self.attention_backend.restore_kda_v3_state(v3_snapshot)
+
     def _prepare_graph_entry(
         self,
         input_ids: torch.Tensor,
