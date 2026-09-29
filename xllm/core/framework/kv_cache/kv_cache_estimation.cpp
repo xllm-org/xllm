@@ -591,7 +591,7 @@ void init_standard_counts(const ModelArgs& model_args,
   const int64_t full_cache_block_size_in_bytes =
       standard_full_cache_block_size_in_bytes(*kv_cache_cap) +
       options.embedding_context_bytes_per_block;
-  kv_cache_cap->num_linear_state_blocks(
+  int64_t num_linear_state_blocks =
       calculate_linear_state_blocks(kv_cache_cap->cache_size_in_bytes(),
                                     kv_cache_cap->num_linear_attention_layers(),
                                     kv_cache_cap->linear_slot_size(),
@@ -599,7 +599,21 @@ void init_standard_counts(const ModelArgs& model_args,
                                     options.max_seqs_per_batch,
                                     options.max_concurrent_requests,
                                     options.max_linear_state_cache_slots,
-                                    options.enable_prefix_cache));
+                                    options.enable_prefix_cache);
+#if defined(USE_NPU)
+  if (is_qwen3_5_target_model_type(model_args.model_type()) &&
+      kv_cache_cap->num_linear_attention_layers() > 0) {
+    constexpr int64_t kMegaGdnMaxLinearStateBlocks = 1024;
+    CHECK_LE(options.max_linear_state_cache_slots + kPaddingLinearStateBlocks,
+             kMegaGdnMaxLinearStateBlocks)
+        << "Qwen3.5 MegaGdn supports at most " << kMegaGdnMaxLinearStateBlocks
+        << " physical linear-state slots, "
+        << "including " << kPaddingLinearStateBlocks << " padding slots.";
+    num_linear_state_blocks =
+        std::min(num_linear_state_blocks, kMegaGdnMaxLinearStateBlocks);
+  }
+#endif
+  kv_cache_cap->num_linear_state_blocks(num_linear_state_blocks);
   kv_cache_cap->linear_cache_size_in_bytes(
       kv_cache_cap->num_linear_attention_layers() *
       kv_cache_cap->num_linear_state_blocks() *

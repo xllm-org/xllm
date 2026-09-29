@@ -285,6 +285,32 @@ TEST(KVCacheEstimationTest, LinearStateCapacityVariants) {
   }
 }
 
+#if defined(USE_NPU)
+TEST(KVCacheEstimationTest, CapsQwen35PhysicalLinearStateSlotsForMegaGdn) {
+  ModelArgs model_args = make_linear_attention_args(/*head_dim=*/1);
+  model_args.model_type("qwen3_5");
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.cache_size_in_bytes = 64LL << 30;
+  options.enable_prefix_cache = true;
+
+  KVCacheCapacity capacity = estimate_kv_cache_capacity(model_args, options);
+
+  EXPECT_EQ(capacity.num_linear_state_blocks(), 1024);
+}
+
+TEST(KVCacheEstimationTest, RejectsQwen35ExplicitSlotsBeyondMegaGdnLimit) {
+  ModelArgs model_args = make_linear_attention_args(/*head_dim=*/1);
+  model_args.model_type("qwen3_5");
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.cache_size_in_bytes = 64LL << 30;
+  options.enable_prefix_cache = true;
+  options.max_linear_state_cache_slots = 1023;
+
+  EXPECT_DEATH((void)estimate_kv_cache_capacity(model_args, options),
+               "MegaGdn supports at most 1024 physical linear-state slots");
+}
+#endif
+
 TEST(KVCacheEstimationTest, Qwen35MtpExpandsConvStateLen) {
   ModelArgs model_args = make_standard_args();
   model_args.model_type("qwen3_5")
