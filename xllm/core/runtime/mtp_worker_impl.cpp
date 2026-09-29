@@ -26,6 +26,7 @@ limitations under the License.
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -470,9 +471,12 @@ ParallelArgs mtp_draft_parallel_args(const ParallelArgs& parallel_args,
   return draft_args;
 }
 
-bool is_qwen3_5_draft_model_type(const std::string& model_type) {
-  return mtp_async::classify_combined_draft_execution_path(model_type) ==
-         mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
+// The GLM-5.3-Flash python MTP draft checkpoint carries its own embed_tokens /
+// lm_head copies (the exporter materializes them), so it needs no
+// target->draft weight sharing (the python CausalLM set_lm_head path is not
+// implemented for PyCausalLM).
+bool is_glm5_next_mtp_draft_model_type(const std::string& model_type) {
+  return model_type == "glm5_next_mtp";
 }
 
 }  // namespace
@@ -862,16 +866,19 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
 
   if (draft_impl_ != nullptr &&
       draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
+    const std::string& draft_model_type =
+        draft_impl_->context_.get_model_args().model_type();
     combined_draft_execution_path_ =
-        mtp_async::classify_combined_draft_execution_path(
-            draft_impl_->context_.get_model_args().model_type());
+        mtp_async::classify_combined_draft_execution_path(draft_model_type);
     const bool draft_owns_shared_weights =
-        options_.enable_mtp_draft_body_tp1() &&
-        combined_draft_execution_path_ ==
-            mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
-    // Qwen3.5 draft checkpoints contain complete embedding and LMHead weights.
-    // Other MTP drafts retain their existing target-weight sharing contract;
-    // only their transformer body is replicated with TP1 parallel arguments.
+        (options_.enable_mtp_draft_body_tp1() &&
+         combined_draft_execution_path_ ==
+             mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION) ||
+        is_glm5_next_mtp_draft_model_type(draft_model_type);
+    // Qwen3.5 and GLM-5.3-Flash draft checkpoints contain complete embedding
+    // and LMHead weights. Other MTP drafts retain their existing target-weight
+    // sharing contract; only their transformer body is replicated with TP1
+    // parallel arguments.
     if (!draft_owns_shared_weights) {
       const bool python_weights_shared =
           draft_impl_->share_weights_from(*impl_);
@@ -1375,6 +1382,12 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
   prefill_input = input.to(device_, dtype_);
   prepare_draft_sampling(prefill_input.sampling_params);
   clear_ready_events(prefill_input);
+  // The draft model feeds on the target's hidden states (input_embedding set
+  // below), never on raw multimodal input: strip the copied mm_data so the
+  // draft executor does not drive vision encode on the text-only draft model
+  // (whose python object has no ``encode``) and skips the device copy of
+  // pixel_values it would never consume.
+  prefill_input.input_params.multimodal.mm_data = MMBatchData();
   auto& input_params = prefill_input.input_params;
   // The Qwen draft is a pure full-attention model; without this cleanup the
   // target's recurrent slot metadata makes MTP prefill enter a stateful path
@@ -1882,15 +1895,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     }
     record_current_metadata_ready_event(current_draft_input, *compute_stream_);
   }
-  const double draft_latency_ms = timer.elapsed_milliseconds();
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
-              draft_latency_ms / 1000.0);
-
+              timer.elapsed_seconds());
   if (use_adaptive_speculative_decode) {
     return run_adaptive_validate(
         input, draft_outputs, validate_input, num_speculative_tokens);
   }
-
   return run_validate(input,
                       draft_outputs,
                       validate_input,

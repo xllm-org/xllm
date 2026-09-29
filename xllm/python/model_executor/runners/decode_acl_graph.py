@@ -42,6 +42,7 @@ from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
 )
+from xllm.python.attention.kda_constants import _KDA_VERIFY_V2, _KDA_VERIFY_V3
 from xllm.python.model_executor.forward_context import (
     AclGraphExecutionState,
 )
@@ -109,6 +110,10 @@ class DecodeAclGraphRunner(AclGraphRunner):
         if input_ids.dim() != 1:
             return False
         is_expanded_spec_verify = resolve_expanded_decode_metadata(metadata) is not None
+        if is_expanded_spec_verify:
+            linear_idx = getattr(metadata, "linear_state_indices", None)
+            if linear_idx is not None and linear_idx.numel() > 0 and not (_KDA_VERIFY_V2 or _KDA_VERIFY_V3):
+                return False
         if (metadata.is_prefill or metadata.is_chunked_prefill) and not is_expanded_spec_verify:
             return False
 

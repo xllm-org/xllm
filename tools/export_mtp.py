@@ -43,7 +43,7 @@ from transformers import AutoConfig
 
 from scripts.logger import logger
 
-LEGACY_LAYER_MTP_MODEL_TYPES = {"deepseek_v3", "deepseek_v32", "glm4_moe", "glm_moe_dsa"}
+LEGACY_LAYER_MTP_MODEL_TYPES = {"deepseek_v3", "deepseek_v32", "glm4_moe", "glm_moe_dsa", "glm5_next"}
 MIMO_MTP_MODEL_TYPES = {"mimo"}
 QWEN3_5_MODEL_TYPES = {"qwen3_5", "qwen3_5_text"}
 QWEN3_5_MOE_MODEL_TYPES = {"qwen3_5_moe", "qwen3_5_moe_text"}
@@ -184,6 +184,7 @@ def get_mtp_model_type(model_type: str) -> str:
         "deepseek_v4": "deepseek_v4_mtp",
         "glm4_moe": "glm4_moe_mtp",
         "glm_moe_dsa": "glm_moe_dsa_mtp",
+        "glm5_next": "glm5_next_mtp",
         "mimo": "mimo_mtp",
         "qwen3_5": "qwen3_5_mtp",
         "qwen3_5_text": "qwen3_5_mtp",
@@ -201,6 +202,7 @@ def get_mtp_architecture(model_type: str) -> str:
         "deepseek_v4": "DeepseekV4MtpForCausalLM",
         "glm4_moe": "Glm4MoeMtpForCausalLM",
         "glm_moe_dsa": "GlmMoeDsaMtpForCausalLM",
+        "glm5_next": "Glm5NextMtpForCausalLM",
         "mimo": "MiMoMtpForCausalLM",
         "qwen3_5": "Qwen3_5MtpForCausalLM",
         "qwen3_5_text": "Qwen3_5MtpForCausalLM",
@@ -241,7 +243,7 @@ def get_mtp_layer_count(config: ConfigView, model_type: str) -> int:
 
 
 def _is_dsa_mtp_model(model_type: str) -> bool:
-    return model_type in {"deepseek_v32", "glm_moe_dsa"}
+    return model_type in {"deepseek_v32", "glm_moe_dsa", "glm5_next"}
 
 
 def _has_dsa_indexer(config: ConfigView) -> bool:
