@@ -71,6 +71,8 @@ from xllm.python.attention.backend import MlaIndexContext
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
     get_forward_context_or_none,
+    in_acl_graph,
+    use_acl_graph,
 )
 
 _has_mhc_fused = hasattr(kernels, "hc_pre") and kernels.hc_pre is not None
@@ -107,28 +109,8 @@ except ImportError:  # pragma: no cover - stub-loader path
             super().__init__()
 
 
-def _use_acl_graph(config: dict) -> bool:
-    """Whether this run captures decode ACL graphs (mirrors deepseek_v32)."""
-    graph_backend = str(config.get("python_graph_backend", "off")).lower()
-    if graph_backend == "aclgraph":
-        return True
-    return graph_backend in ("", "off", "none", "0") and bool(config.get("enable_graph", False))
-
-
-def _in_acl_graph() -> bool:
-    """Whether the current forward runs under ACL graph warmup/capture."""
-    ctx = get_forward_context_or_none()
-    return ctx is not None and (ctx.acl_graph is not None or ctx.execution_state is not None)
-
-
 # Paged pool cache: write-time incremental compression + direct pool read
 # (see glm5_next_kpool.py).
-
-
-def _capturing_acl_graph() -> bool:
-    """Whether the current forward is being recorded by NPUGraph capture."""
-    ctx = get_forward_context_or_none()
-    return ctx is not None and ctx.acl_graph is not None
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +568,7 @@ class Glm5NextConfig:
     tp_rank: int = 0
     # Load-time static flag: decode ACL graph capture is enabled, so graph
     # branches (fixed-shape indexer pooling etc.) may be taken at runtime when
-    # the forward context confirms capture/warmup (_in_acl_graph()).
+    # the forward context confirms capture/warmup (in_acl_graph()).
     use_acl_graph: bool = False
 
     @property
@@ -671,7 +653,7 @@ class Glm5NextConfig:
             index_kpool_always_select_tail=bool(pick("index_kpool_always_select_tail", default=False)),
             tp_size=int(pick("tp_size", default=1)),
             tp_rank=int(pick("tp_rank", default=0)),
-            use_acl_graph=_use_acl_graph(d),
+            use_acl_graph=use_acl_graph(d),
             # mHC fields: ModelArgs may emit a 0 default (un-plumbed); treat 0
             # /None as unset and fall back to the real 300B defaults.
             hc_mult=(int(pick("hc_mult", default=4)) or 4),
@@ -941,7 +923,7 @@ class Glm5NextIndexer(nn.Module):
             self.head_dim,
             self.index_kpool,
         )
-        if self.use_acl_graph and _in_acl_graph():
+        if self.use_acl_graph and in_acl_graph():
             # Graph branch (fixed shapes): keep ALL pools. The boolean
             # ``pool_keys[:, keep]`` filter below produces a data-dependent
             # output shape (aclnnNonzeroV2) that ACL graph capture cannot
@@ -1155,7 +1137,7 @@ class Glm5NextIndexer(nn.Module):
             and ctx.actual_seq_kv is not None
         ):
             pool_cache = self._pool_caches.get(layer.layer_id)
-            if pool_cache is None and not _in_acl_graph():
+            if pool_cache is None and not in_acl_graph():
                 # Lazy alloc on the first eager forward (before capture);
                 # never allocate inside a capture.
                 pool_cache = alloc_pool_cache(ctx.index_cache, self.index_kpool)
@@ -1215,7 +1197,7 @@ class Glm5NextIndexer(nn.Module):
             # ---- read path: direct pool read for decode ----
             if num_tokens == n_seqs:
                 max_kv_cap = getattr(backend, "graph_index_history_max_kv", None)
-                if not _in_acl_graph():
+                if not in_acl_graph():
                     max_kv = int(kv_lens_t.max().item())
                 elif max_kv_cap is not None:
                     # Same static cap the dense gather used, so the graph

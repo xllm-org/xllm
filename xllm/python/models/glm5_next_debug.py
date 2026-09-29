@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 
 from scripts.logger import logger
-from xllm.python.models.glm5_next import _capturing_acl_graph
+from xllm.python.model_executor.forward_context import capturing_acl_graph
 
 
 def install_dump_hooks(model: nn.Module, lm_head: nn.Module, outdir: str) -> list:
@@ -56,7 +56,7 @@ def install_dump_hooks(model: nn.Module, lm_head: nn.Module, outdir: str) -> lis
 
     def _cap(name: str, idx: int = 0):
         def fn(_m, _i, o):
-            if _capturing_acl_graph():
+            if capturing_acl_graph():
                 return
             t = o[idx] if isinstance(o, (tuple, list)) else o
             if t is None:
@@ -70,7 +70,7 @@ def install_dump_hooks(model: nn.Module, lm_head: nn.Module, outdir: str) -> lis
 
     def _pre_cap(name: str):
         def fn(_m, inp):
-            if _capturing_acl_graph():
+            if capturing_acl_graph():
                 return
             t = inp[0] if isinstance(inp, (tuple, list)) else inp
             store[name] = t.detach().to(torch.float32).cpu()
@@ -128,7 +128,7 @@ def install_dump_hooks(model: nn.Module, lm_head: nn.Module, outdir: str) -> lis
     handles.append(model.norm.register_forward_hook(_cap("final_norm")))
 
     def _save(_m, _i, _o):
-        if _capturing_acl_graph():
+        if capturing_acl_graph():
             # D2H dumps are illegal mid-capture; warmup forwards already
             # saved the same static-input values.
             return

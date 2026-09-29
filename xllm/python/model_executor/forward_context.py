@@ -109,6 +109,31 @@ def get_forward_context_or_none() -> ForwardContext | None:
     return _current_context.get()
 
 
+def in_acl_graph() -> bool:
+    """Whether the current forward runs under ACL graph warmup/capture.
+
+    The decode graph runner always passes an ``execution_state`` (warmup and
+    capture) and an ``acl_graph`` capture context (capture only); the eager
+    runner sets neither, so eager paths stay byte-identical.
+    """
+    ctx = _current_context.get()
+    return ctx is not None and (ctx.acl_graph is not None or ctx.execution_state is not None)
+
+
+def capturing_acl_graph() -> bool:
+    """Whether the current forward is being recorded by NPUGraph capture."""
+    ctx = _current_context.get()
+    return ctx is not None and ctx.acl_graph is not None
+
+
+def use_acl_graph(config: dict) -> bool:
+    """Whether this run captures decode ACL graphs (mirrors deepseek_v32)."""
+    graph_backend = str(config.get("python_graph_backend", "off")).lower()
+    if graph_backend == "aclgraph":
+        return True
+    return graph_backend in ("", "off", "none", "0") and bool(config.get("enable_graph", False))
+
+
 def record_layer_event(layer_id: int) -> None:
     ctx = _current_context.get()
     if ctx is not None and ctx.layer_synchronizer is not None:
