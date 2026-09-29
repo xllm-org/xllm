@@ -332,6 +332,29 @@ std::optional<std::string> validate_model_cp(const Options& options,
          "(MLU/NPU); disable CP (cp_size=1) or use MLU/NPU.";
 }
 
+std::optional<std::string> validate_qwen_dcp_topology(int32_t global_world_size,
+                                                      int32_t dp_size,
+                                                      int32_t kv_split_size) {
+  if (kv_split_size < 1) {
+    return "kv_split_size must resolve to a value greater than or equal to 1";
+  }
+  if (kv_split_size == 1) {
+    return std::nullopt;
+  }
+  if (global_world_size < 1 || dp_size < 1) {
+    return "Qwen DCP requires positive world_size and dp_size";
+  }
+  if (global_world_size % dp_size != 0) {
+    return "Qwen DCP requires world_size divisible by dp_size";
+  }
+  const int32_t tp_size = global_world_size / dp_size;
+  if (kv_split_size > tp_size || tp_size % kv_split_size != 0) {
+    return "Qwen DCP kv_split_size must divide the TP size within each DP "
+           "replica";
+  }
+  return std::nullopt;
+}
+
 namespace {
 
 void print_startup_banner(const std::filesystem::path& model_path,
@@ -465,8 +488,22 @@ Master::Master(const Options& options, EngineType type)
   const std::vector<torch::Device> devices = {visible_devices[device_idx]};
   // World size is the node count (one worker per process).
   const int32_t global_world_size = options_.nnodes();
+  const int32_t kv_split_size =
+      ParallelConfig::get_instance().kv_split_size_effective();
+  const bool native_qwen_dcp_requested =
+      Platform::is_npu() &&
+      !ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl()) &&
+      options_.cp_size() == 1 && kv_split_size > 1;
+  if (native_qwen_dcp_requested) {
+    const std::optional<std::string> dcp_topology_error =
+        validate_qwen_dcp_topology(
+            global_world_size, options_.dp_size(), kv_split_size);
+    CHECK(!dcp_topology_error.has_value()) << dcp_topology_error.value();
+  }
   std::string model_type;
-  if ((options_.cp_size() > 1 && Platform::uses_model_cp_sharding()) ||
+  if (native_qwen_dcp_requested ||
+      (options_.cp_size() > 1 && Platform::uses_model_cp_sharding()) ||
       (ModelConfig::is_python_model_impl(
            ModelConfig::get_instance().model_impl()) &&
        options_.num_speculative_tokens() > 0)) {
@@ -532,6 +569,28 @@ Master::Master(const Options& options, EngineType type)
   }
   resolve_npu_kernel_backend_for_options(&options_);
 #endif
+  if (native_qwen_dcp_requested) {
+    const bool supported_runtime =
+        options_.npu_kernel_backend() == "TORCH" && type == EngineType::LLM &&
+        options_.task_type() == "generate" && options_.ep_size() == 1 &&
+        !options_.enable_eplb().value_or(false) &&
+        options_.expert_parallel_degree().value_or(0) <= 1 &&
+        options_.is_local() && options_.rank_tablefile().value_or("").empty() &&
+        options_.host_blocks_factor() <= 1.0 &&
+        !options_.enable_kvcache_store() &&
+        !KVCacheConfig::get_instance().enable_xtensor() &&
+        !options_.enable_disagg_pd() &&
+        options_.instance_role() == InstanceRole::DEFAULT &&
+        options_.draft_model_path().value_or("").empty() &&
+        options_.num_speculative_tokens() == 0 &&
+        ExecutionConfig::get_instance().enable_fia_decode() &&
+        (model_type == "qwen3_5_text" || model_type == "qwen3_5_moe_text");
+    CHECK(supported_runtime)
+        << "Qwen3.5 DCP supports only replicated-GQA local NPU TORCH LLM "
+           "generation without CP, EP/EPLB, host/KVStore/XTensor offload, "
+           "P/D, or "
+           "speculative decoding, and requires enable_fia_decode=true";
+  }
   validate_layerwise_split_size_startup_config(
       options_, model_type, global_world_size);
   ParallelConfig::get_instance().enable_multi_stream_parallel(

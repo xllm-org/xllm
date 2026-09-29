@@ -35,6 +35,7 @@ limitations under the License.
 #endif
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kernel_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/parallel_state/context_parallel_topology.h"
 #include "core/platform/platform.h"
@@ -559,6 +560,29 @@ void CollectiveCommunicator::create_process_groups(
       parallel_args_->dcp_group_ = tp_group_.get();
     }
   }
+
+#if defined(USE_NPU)
+  const int32_t dcp_size =
+      normalized_cp_size == 1 ? parallel_args_->kv_split_size_effective() : 1;
+  if (!ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl()) &&
+      ::xllm::KernelConfig::get_instance().npu_kernel_backend() == "TORCH" &&
+      dcp_size > 1) {
+    const int32_t dcp_group_index = global_rank / dcp_size;
+    const int32_t dcp_group_start = dcp_group_index * dcp_size;
+    dcp_group_ = create_process_group(
+        global_rank,
+        world_size,
+        dcp_size,
+        port + dcp_group_index + 1,
+        /*trans=*/false,
+        get_context_parallel_group_host(dcp_group_start, host),
+        "dcp_group",
+        device);
+    parallel_args_->dcp_group_ = dcp_group_.get();
+    port += world_size / dcp_size;
+  }
+#endif
 
   if (dp_size > 1) {
     // A DP group varies dp_rank while preserving the full local model-shard

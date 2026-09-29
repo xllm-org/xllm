@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "common/flash_comm1_context.h"
 #include "core/framework/config/execution_config.h"
+#include "kernels/npu/utils.h"
 
 namespace xllm {
 namespace layer {
@@ -36,6 +37,21 @@ bool is_qwen3_5_model_type(const std::string& model_type) {
 bool should_enable_qwen3_5_fia_decode(const std::string& model_type) {
   return ExecutionConfig::get_instance().enable_fia_decode() &&
          is_qwen3_5_model_type(model_type);
+}
+
+std::optional<std::string> validate_qwen_dcp_kv_head_replicas(
+    int64_t tp_size,
+    int64_t total_num_kv_heads,
+    int64_t num_kv_head_replicas,
+    int32_t dcp_size) {
+  if (num_kv_head_replicas % dcp_size == 0) {
+    return std::nullopt;
+  }
+  return "Qwen DCP requires dcp_size to divide the replicated KV-head group "
+         "(dcp_size=" +
+         std::to_string(dcp_size) + ", tp_size=" + std::to_string(tp_size) +
+         ", total_num_kv_heads=" + std::to_string(total_num_kv_heads) +
+         ", num_kv_head_replicas=" + std::to_string(num_kv_head_replicas) + ")";
 }
 
 Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
@@ -60,6 +76,18 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
     CHECK(tp_size % total_num_kv_heads == 0);
     num_kv_heads_ = 1;
     num_kv_head_replicas_ = tp_size / total_num_kv_heads;
+  }
+  if (parallel_args.dcp_group_ != nullptr) {
+    CHECK(!kernel::npu::is_ascend950())
+        << "Qwen3.5 DCP is not supported on Ascend950 because its TND "
+           "attention fallback does not return softmax LSE";
+    const std::optional<std::string> validation_error =
+        validate_qwen_dcp_kv_head_replicas(
+            tp_size,
+            total_num_kv_heads,
+            num_kv_head_replicas_,
+            parallel_args.dcp_group_->world_size());
+    CHECK(!validation_error.has_value()) << *validation_error;
   }
 
   head_dim_ = args.head_dim();
@@ -122,7 +150,8 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
                 num_kv_heads_,
                 args.sliding_window(),
                 /*enable_fia_decode=*/
-                should_enable_qwen3_5_fia_decode(args.model_type())));
+                should_enable_qwen3_5_fia_decode(args.model_type()),
+                /*dcp_group=*/parallel_args.dcp_group_));
 
   // 7. Fused split_qkv_rmsnorm_mrope kernel setup
   rotary_dim_ = static_cast<int64_t>(head_dim_ * args.partial_rotary_factor());

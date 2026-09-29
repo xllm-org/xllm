@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,11 @@ namespace layer {
 
 bool is_qwen3_5_model_type(const std::string& model_type);
 bool should_enable_qwen3_5_fia_decode(const std::string& model_type);
+std::optional<std::string> validate_qwen_dcp_kv_head_replicas(
+    int64_t tp_size,
+    int64_t total_num_kv_heads,
+    int64_t num_kv_head_replicas,
+    int32_t dcp_size);
 
 class Qwen3NextAttentionImpl : public torch::nn::Module {
  public:

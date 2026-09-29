@@ -272,6 +272,9 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
   const char* is_local_ptr = is_local_str.c_str();
   std::string cp_size_str = std::to_string(options.cp_size());
   const char* cp_size_ptr = cp_size_str.c_str();
+  std::string kv_split_size_str =
+      std::to_string(::xllm::ParallelConfig::get_instance().kv_split_size());
+  const char* kv_split_size_ptr = kv_split_size_str.c_str();
   std::string ep_size_str = std::to_string(parallel_args.ep_size());
   const char* ep_size_ptr = ep_size_str.c_str();
   std::string instance_role_str = options.instance_role().to_string();
@@ -380,6 +383,7 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
                         enable_mtp_draft_body_tp1_ptr,
                         text_encoder_tp_size_ptr,
                         draft_sampling_mode_ptr,
+                        kv_split_size_ptr,
                         nullptr};
   static_assert(std::size(argv) == spawn_worker_protocol::kArgumentCount + 1);
   pid_t pid;

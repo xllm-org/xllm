@@ -6,6 +6,8 @@ cc_library(
   HDRS
     fused_moe.h
     attention.h
+    fused_infer_attention_utils.h
+    qwen_dcp_attention.h
     minimax_m2_decode_layer.h
     minimax_rms_norm.h
     minimax_m2_attention.h
@@ -25,6 +27,7 @@ cc_library(
   SRCS
     fused_moe.cpp
     attention.cpp
+    qwen_dcp_attention.cpp
     minimax_m2_decode_layer.cpp
     minimax_rms_norm.cpp
     minimax_m2_attention.cpp

@@ -23,6 +23,9 @@ namespace xllm::layer {
 
 torch::Tensor localize_kv_shard_slots(const torch::Tensor& logical_slots,
                                       const KVShardLayout& layout) {
+  if (!logical_slots.defined() || logical_slots.numel() == 0) {
+    return logical_slots;
+  }
   CHECK(logical_slots.scalar_type() == torch::kInt32 ||
         logical_slots.scalar_type() == torch::kInt64)
       << "cache-shard slot mapping must use int32 or int64";

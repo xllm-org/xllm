@@ -62,6 +62,7 @@ limitations under the License.
 // @enable_mtp_draft_body_tp1
 // @text_encoder_tp_size
 // @draft_sampling_mode
+// @kv_split_size
 int main(int argc, char* argv[]) {
   const std::optional<std::string> parsed_indexer_cache_dtype =
       xllm::spawn_worker_protocol::parse_indexer_cache_dtype(argc, argv);
@@ -127,13 +128,19 @@ int main(int argc, char* argv[]) {
                 atoi(argv[xllm::spawn_worker_protocol::
                               kTextEncoderTpSizeArgumentIndex]))
           : 1;
+  const int32_t kv_split_size =
+      argc > xllm::spawn_worker_protocol::kKvSplitSizeArgumentIndex
+          ? static_cast<int32_t>(atoi(
+                argv[xllm::spawn_worker_protocol::kKvSplitSizeArgumentIndex]))
+          : 1;
   if (world_size < 1 || global_rank < 0 || global_rank >= world_size ||
       cp_size < 1 || ep_size < 1 || text_encoder_tp_size < 1 ||
+      kv_split_size < 0 ||
       (instance_role_str != "DEFAULT" && instance_role_str != "PREFILL" &&
        instance_role_str != "DECODE")) {
     LOG(ERROR) << "Invalid spawn worker topology: global_rank=" << global_rank
                << ", world_size=" << world_size << ", cp_size=" << cp_size
-               << ", ep_size=" << ep_size
+               << ", ep_size=" << ep_size << ", kv_split_size=" << kv_split_size
                << ", instance_role=" << instance_role_str;
     return 1;
   }
@@ -172,7 +179,8 @@ int main(int argc, char* argv[]) {
       << ", text_encoder_tp_size = " << text_encoder_tp_size
       << ", indexer_cache_dtype = " << indexer_cache_dtype
       << ", enable_mtp_draft_body_tp1 = " << enable_mtp_draft_body_tp1
-      << ", draft_sampling_mode = " << draft_sampling_mode << "\n";
+      << ", draft_sampling_mode = " << draft_sampling_mode
+      << ", kv_split_size = " << kv_split_size << "\n";
 
   xllm::SpawnWorkerServer worker(master_node_addr,
                                  local_rank,
@@ -210,7 +218,8 @@ int main(int argc, char* argv[]) {
                                  ep_size,
                                  instance_role,
                                  enable_mtp_draft_body_tp1,
-                                 draft_sampling_mode);
+                                 draft_sampling_mode,
+                                 kv_split_size);
 
   worker.run();
 

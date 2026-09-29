@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/sampling_params.h"
@@ -107,6 +108,16 @@ constexpr double kAttentionScale = 1.0 / 16.0;
 
 constexpr torch::ScalarType kDtype = torch::kFloat16;
 
+class MirroredDcpProcessGroup final : public ProcessGroup {
+ public:
+  explicit MirroredDcpProcessGroup(const torch::Device& device)
+      : ProcessGroup(/*rank=*/1, /*world_size=*/2, device) {}
+
+  torch::Tensor allgather_base_sync(const torch::Tensor& input) override {
+    return torch::stack({input, input}, /*dim=*/0);
+  }
+};
+
 }  // namespace
 
 class HybridConv1dMockLM final : public CausalLM {
@@ -114,7 +125,8 @@ class HybridConv1dMockLM final : public CausalLM {
   HybridConv1dMockLM(const ModelArgs& args,
                      const torch::Device& device,
                      bool enable_fia_decode = true,
-                     int32_t attention_repetitions = 1)
+                     int32_t attention_repetitions = 1,
+                     ProcessGroup* dcp_group = nullptr)
       : args_(args),
         device_(device),
         attention_repetitions_(attention_repetitions) {
@@ -138,23 +150,14 @@ class HybridConv1dMockLM final : public CausalLM {
                            torch::randn({kMaxSeqLen, kHiddenSize},
                                         torch::dtype(kDtype).device(device)));
 
-    if (enable_fia_decode) {
-      attention_ =
-          register_module("attention",
-                          layer::Attention(kAttentionNumHeads,
-                                           kAttentionHeadDim,
-                                           kAttentionScale,
-                                           kAttentionNumKvHeads,
-                                           /*sliding_window=*/-1,
-                                           /*enable_fia_decode=*/true));
-    } else {
-      attention_ = register_module("attention",
-                                   layer::Attention(kAttentionNumHeads,
-                                                    kAttentionHeadDim,
-                                                    kAttentionScale,
-                                                    kAttentionNumKvHeads,
-                                                    /*sliding_window=*/-1));
-    }
+    attention_ = register_module("attention",
+                                 layer::Attention(kAttentionNumHeads,
+                                                  kAttentionHeadDim,
+                                                  kAttentionScale,
+                                                  kAttentionNumKvHeads,
+                                                  /*sliding_window=*/-1,
+                                                  enable_fia_decode,
+                                                  dcp_group));
 
     this->to(device);
   }
@@ -296,8 +299,10 @@ class HybridConv1dMockLM final : public CausalLM {
         fia_graph_task_count_ =
             graph_context->fused_infer_attention_tasks.size();
         if (!graph_context->fused_infer_attention_tasks.empty()) {
-          captured_fia_batch_size_ = static_cast<uint32_t>(
-              graph_context->fused_infer_attention_tasks.front().query.size(0));
+          const npu::FusedInferAttentionGraphTask& first_task =
+              graph_context->fused_infer_attention_tasks.front();
+          captured_fia_batch_size_ =
+              static_cast<uint32_t>(first_task.query.size(0));
         }
         all_fia_graph_tasks_share_workspace_ = fia_graph_task_count_ > 1;
         for (size_t task_index = 1; task_index < fia_graph_task_count_;
@@ -740,6 +745,14 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
   int32_t original_acl_graph_decode_batch_size_limit_ = 16;
 };
 
+TEST(FusedInferAttentionWorkspaceSignatureTest, IncludesSoftmaxLseMode) {
+  npu::FusedInferAttentionWorkspaceSignature without_lse{};
+  npu::FusedInferAttentionWorkspaceSignature with_lse{};
+  with_lse.softmax_lse_flag = true;
+
+  EXPECT_FALSE(without_lse == with_lse);
+}
+
 TEST_F(AclGraphTaskUpdateTest, CaptureReplayVsEagerDecodeBranch) {
   auto batch = create_decode_batch(/*batch_size=*/2);
   ASSERT_FALSE(batch->empty());
@@ -769,6 +782,52 @@ TEST_F(AclGraphTaskUpdateTest, CaptureReplayVsEagerDecodeBranch) {
                               /*rtol=*/1e-2,
                               /*atol=*/1e-2))
       << "Decode branch: eager vs graph mismatch";
+}
+
+TEST_F(AclGraphTaskUpdateTest, DcpReplayUpdatesZeroShardAcrossBlockBoundary) {
+  options_.world_size(2).dp_size(1).node_rank(1);
+  MirroredDcpProcessGroup dcp_group(*device_);
+  model_ = std::make_unique<HybridConv1dMockLM>(model_args_,
+                                                *device_,
+                                                /*enable_fia_decode=*/true,
+                                                /*attention_repetitions=*/1,
+                                                &dcp_group);
+  auto make_input = [&](size_t prompt_size, int32_t token_seed) {
+    auto batch = create_decode_batch_with_prompts(
+        {std::vector<int32_t>(prompt_size, token_seed)}, token_seed);
+    auto input = batch->prepare_forward_input(
+        options_.num_decoding_tokens(), 0, model_args_);
+    input = input.to(*device_, kDtype);
+    populate_query_start_loc(input.input_params);
+    return input;
+  };
+
+  auto capture_input = make_input(/*prompt_size=*/127, /*token_seed=*/200);
+  auto kv_graph = create_hybrid_kv_caches();
+  auto graph_exec = std::make_unique<npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, options_);
+  graph_exec->run(capture_input.token_ids,
+                  capture_input.positions,
+                  kv_graph,
+                  capture_input.input_params);
+
+  reset_sequences();
+  auto replay_input = make_input(/*prompt_size=*/128, /*token_seed=*/300);
+  auto kv_eager = clone_kv_caches(kv_graph);
+  const ModelOutput graph_output = graph_exec->run(replay_input.token_ids,
+                                                   replay_input.positions,
+                                                   kv_graph,
+                                                   replay_input.input_params);
+  const ModelOutput eager_output = model_->forward(replay_input.token_ids,
+                                                   replay_input.positions,
+                                                   kv_eager,
+                                                   replay_input.input_params);
+
+  EXPECT_TRUE(torch::allclose(eager_output.hidden_states.to(torch::kFloat32),
+                              graph_output.hidden_states.to(torch::kFloat32),
+                              /*rtol=*/1e-2,
+                              /*atol=*/1e-2))
+      << "DCP graph replay did not refresh rank-local KV length at 128/129";
 }
 
 TEST_F(AclGraphTaskUpdateTest,

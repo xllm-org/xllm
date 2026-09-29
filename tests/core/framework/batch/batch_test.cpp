@@ -160,32 +160,30 @@ void expect_mapping(const TransferKVInfo& info,
 
 LinearStatePrefixHash compute_linear_state_prefix_hash_for_test(
     const std::vector<int32_t>& token_ids,
-    std::vector<Block>& blocks,
+    size_t hash_stride,
     size_t boundary_tokens) {
   LinearStatePrefixHash hash{};
-  if (blocks.empty()) {
+  if (hash_stride == 0 || boundary_tokens % hash_stride != 0) {
     return hash;
   }
-  uint32_t block_size = blocks[0].size();
-  if (block_size == 0 || boundary_tokens % block_size != 0) {
-    return hash;
-  }
-  size_t boundary_blocks = boundary_tokens / block_size;
-  if (boundary_blocks == 0 || boundary_tokens > token_ids.size()) {
+  const size_t boundary_chunks = boundary_tokens / hash_stride;
+  if (boundary_chunks == 0 || boundary_tokens > token_ids.size()) {
     return hash;
   }
   const uint8_t* previous_hash = nullptr;
-  for (size_t block_idx = 0; block_idx < boundary_blocks; ++block_idx) {
-    xxh3_128bits_hash(previous_hash,
-                      Slice<int32_t>(token_ids).slice(
-                          block_idx * block_size, (block_idx + 1) * block_size),
-                      hash.data());
+  for (size_t chunk_idx = 0; chunk_idx < boundary_chunks; ++chunk_idx) {
+    xxh3_128bits_hash(
+        previous_hash,
+        Slice<int32_t>(token_ids).slice(chunk_idx * hash_stride,
+                                        (chunk_idx + 1) * hash_stride),
+        hash.data());
     previous_hash = hash.data();
   }
   return hash;
 }
 
-Sequence make_basic_sequence(const std::vector<int32_t>& prompt_token_ids) {
+Sequence make_basic_sequence(const std::vector<int32_t>& prompt_token_ids,
+                             size_t index = 0) {
   static RequestSamplingParam sampling_param;
   static StoppingChecker stopping_checker;
 
@@ -202,7 +200,7 @@ Sequence make_basic_sequence(const std::vector<int32_t>& prompt_token_ids) {
                              /*num_prompt_tokens=*/prompt_token_ids.size(),
                              /*echo=*/false,
                              /*skip_special_tokens=*/true);
-  return Sequence(/*index=*/0,
+  return Sequence(index,
                   prompt_token_ids,
                   /*input_embedding=*/torch::Tensor(),
                   /*mm_data=*/MMData(),
@@ -2413,15 +2411,12 @@ TEST(BatchTest, DecodeEmbeddingAndLinearStateIdsAreIndependentSlots) {
 }
 
 TEST(BatchTest, LinearRestoreSourceStaysPinnedForBatchLifetime) {
-  // Linear-state checkpoints are hashed per chunk-end boundary. This test's
-  // save/restore boundaries (16, 20) are multiples of the KV block_size (4),
-  // so set the chunk stride to block_size to keep them chunk-aligned and the
-  // per-chunk hash chain identical to the per-block helper below.
+  // A checkpoint is usable only when the chunk and KV block boundaries match.
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
 
   torch::Device device(Platform::type_torch(), 0);
   const uint32_t n_blocks = 22;
-  const uint32_t block_size = 4;
+  const uint32_t block_size = 8;
   BlockManager::Options options;
   options.num_blocks(n_blocks).block_size(block_size);
   BlockManagerImpl manager(options);
@@ -2517,22 +2512,17 @@ TEST(BatchTest, LinearRestoreSourceStaysPinnedForBatchLifetime) {
   // descriptor (the worker's copy-in keys off that bit + src slot).
   const LinearStatePrefixHash aligned_save_expected =
       compute_linear_state_prefix_hash_for_test(
-          aligned_tokens, aligned_blocks, /*boundary_tokens=*/16);
+          aligned_tokens, /*hash_stride=*/4, /*boundary_tokens=*/16);
   EXPECT_FALSE(is_zero_prefix_hash(aligned_save_expected));
   std::optional<XXH3Key> aligned_save = aligned_seq.take_pending_linear_save();
   ASSERT_TRUE(aligned_save.has_value());
   EXPECT_EQ(*aligned_save, XXH3Key(aligned_save_expected.data()));
 
-  // restore_seq restores at boundary 16 (the same hash aligned_seq saved) and
-  // saves at boundary 20.
+  // restore_seq restores at boundary 16, but cannot save at the non-KV
+  // boundary 20.
   EXPECT_TRUE(cache_ops[1].restore_requested);
   EXPECT_GE(cache_ops[1].restore_src_slot_id, 0);
-  const LinearStatePrefixHash restore_save_expected =
-      compute_linear_state_prefix_hash_for_test(
-          aligned_tokens, restore_blocks, /*boundary_tokens=*/20);
-  std::optional<XXH3Key> restore_save = restore_seq.take_pending_linear_save();
-  ASSERT_TRUE(restore_save.has_value());
-  EXPECT_EQ(*restore_save, XXH3Key(restore_save_expected.data()));
+  EXPECT_FALSE(restore_seq.has_pending_linear_save());
 
   // off_boundary_seq and decode_seq neither restore nor save.
   EXPECT_FALSE(cache_ops[2].restore_requested);
@@ -2592,12 +2582,12 @@ TEST(BatchTest, ThreadedBatchPinsEveryLinearRestoreSourceUntilRelease) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
 
   constexpr size_t kQueryTokensPerSequence = 32768;
-  constexpr size_t kCachedTokensPerSequence = 4;
+  constexpr size_t kCachedTokensPerSequence = 32772;
   const size_t sequence_tokens =
       kQueryTokensPerSequence + kCachedTokensPerSequence;
   BlockManager::Options options;
-  options.num_blocks(/*num_blocks=*/5)
-      .block_size(static_cast<uint32_t>(sequence_tokens));
+  options.num_blocks(/*num_blocks=*/7)
+      .block_size(static_cast<uint32_t>(kCachedTokensPerSequence));
   BlockManagerImpl manager(options);
 
   RequestSamplingParam sampling_param;
@@ -2624,8 +2614,8 @@ TEST(BatchTest, ThreadedBatchPinsEveryLinearRestoreSourceUntilRelease) {
                            /*mm_data=*/MMData(),
                            std::move(second_decoder),
                            seq_params);
-  first_sequence.add_blocks(BlockType::KV, manager.allocate(1));
-  second_sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  first_sequence.add_blocks(BlockType::KV, manager.allocate(2));
+  second_sequence.add_blocks(BlockType::KV, manager.allocate(2));
   first_sequence.kv_state().incr_kv_cache_tokens_num(
       /*size=*/kCachedTokensPerSequence);
   second_sequence.kv_state().incr_kv_cache_tokens_num(

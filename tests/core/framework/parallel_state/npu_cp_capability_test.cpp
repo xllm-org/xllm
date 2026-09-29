@@ -311,5 +311,18 @@ TEST(NpuCpCapabilityTest, PythonCpPreservesQwenAndRestrictsGlm) {
                 "positive divisor of cp_size"));
 }
 
+TEST(NpuDcpTopologyTest, AcceptsOnlyTpLocalFactors) {
+  const auto is_valid = [](int32_t kv_split_size) {
+    return !validate_qwen_dcp_topology(
+                /*global_world_size=*/8, /*dp_size=*/2, kv_split_size)
+                .has_value();
+  };
+
+  EXPECT_TRUE(is_valid(2));
+  EXPECT_TRUE(is_valid(4));
+  EXPECT_FALSE(is_valid(3));
+  EXPECT_FALSE(is_valid(8));
+}
+
 }  // namespace
 }  // namespace xllm

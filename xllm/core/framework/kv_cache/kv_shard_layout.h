@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
 namespace xllm {
@@ -38,6 +39,14 @@ class KVShardLayout final {
   bool owns(int64_t global_slot) const;
   int64_t localize(int64_t global_slot) const;
   int64_t globalize(int64_t local_slot) const;
+  int64_t local_token_count(int64_t global_token_count) const {
+    return global_token_count / logical_block_size() * physical_block_size_ +
+           std::clamp(
+               global_token_count % logical_block_size() -
+                   static_cast<int64_t>(dcp_rank_) * physical_block_size_,
+               int64_t{0},
+               static_cast<int64_t>(physical_block_size_));
+  }
 
  private:
   int32_t physical_block_size_ = 1;

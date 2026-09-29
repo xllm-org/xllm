@@ -67,7 +67,8 @@ class ParallelConfig final {
 
   PROPERTY(int32_t, layerwise_split_size) = 1;
 
-  // 0 means follow cp_size (legacy KV-split width).
+  // 0 follows cp_size. With cp_size == 1, values greater than 1 request
+  // Qwen3.5 decode-context parallelism on the supported NPU runtime.
   PROPERTY(int32_t, kv_split_size) = 1;
 
   PROPERTY(int64_t, tp_size) = 1;

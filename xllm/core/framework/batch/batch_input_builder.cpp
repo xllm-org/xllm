@@ -186,11 +186,7 @@ torch::Tensor build_pinned_int_tensor(const std::vector<int32_t>& values) {
                            .pinned_memory(true));
 }
 
-// Whether the current prefill step end should hold a linear-state checkpoint.
-// Checkpoints are saved at prefill step ends that land on a chunk-end boundary
-// (stride = max_tokens_per_chunk_for_prefill). The linear-state cache is a
-// sparse per-chunk overlay: KV may cache every block boundary while
-// linear-state saves only at chunk ends.
+// Save linear state only at a shared chunk and KV-block boundary.
 bool should_save_linear_checkpoint(Sequence* sequence,
                                    uint32_t boundary_tokens,
                                    uint32_t chunk_stride) {
@@ -200,7 +196,15 @@ bool should_save_linear_checkpoint(Sequence* sequence,
   if (boundary_tokens == 0 || chunk_stride == 0) {
     return false;
   }
-  return boundary_tokens % chunk_stride == 0;
+  if (boundary_tokens % chunk_stride != 0) {
+    return false;
+  }
+
+  const Slice<Block> kv_blocks = sequence->kv_state().blocks(BlockType::KV);
+  if (kv_blocks.empty() || !kv_blocks.front().is_valid()) {
+    return true;
+  }
+  return boundary_tokens % kv_blocks.front().size() == 0;
 }
 
 }  // namespace
@@ -904,25 +908,11 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
   LinearStateCacheOp linear_state_cache_op;
   linear_state_cache_op.linear_state_id = state.linear_state_ids.back();
   linear_state_cache_op.reset_requested = n_kv_cache_tokens == 0;
-  // Linear-state checkpoints live on chunk-end boundaries, so the prefix hash
-  // is chained per chunk (stride = max_tokens_per_chunk_for_prefill), not per
-  // KV block. The engine enforces this stride is a positive multiple of
-  // block_size when linear prefix cache is on (llm_engine.cpp); guard against
-  // an unset (<= 0) stride so a misconfigured run simply skips cache ops.
   const int32_t chunk_stride = ::xllm::SchedulerConfig::get_instance()
                                    .max_tokens_per_chunk_for_prefill();
-  // Cold-start restore: emit a restore hash only when a restore source
-  // checkpoint is mounted on this sequence -- class A at admission
-  // (allocate_shared_for_sequence) or class B at the previous step's
-  // save-rotation (allocate_for_sequence) -- AND the reused prefix lands
-  // on a chunk-end boundary, where the recurrent state lives in a checkpoint.
-  // A mounted source is present exactly on a slot that is cold and needs
-  // copy-in; continued forwards keep their live slot warm with no source
-  // mounted, so they emit no restore and are not reset to cold by the worker.
-  // The source slot id is taken from that mounted block below.
-  const bool needs_restore_hash = sequence->has_linear_restore_src_block() &&
-                                  n_kv_cache_tokens > 0 && chunk_stride > 0 &&
-                                  n_kv_cache_tokens % chunk_stride == 0;
+  const bool needs_restore_hash =
+      sequence->has_linear_restore_src_block() &&
+      should_save_linear_checkpoint(sequence, n_kv_cache_tokens, chunk_stride);
   // Exit-boundary save: persist the live state only when this prefill step
   // lands on a chunk-end boundary, so the linear-state cache stays a sparse
   // per-chunk overlay on top of the per-block KV cache.

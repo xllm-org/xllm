@@ -1066,8 +1066,10 @@ BatchMode create_batch_mode(const ContinuousScheduler::Options& options) {
     mode.enable_chunked_prefill = true;
   }
 
-  // CP/MTP: prefill cannot mix with decode in the same batch.
-  if (options.cp_size() > 1 || options.num_speculative_tokens() > 0) {
+  // CP/KV-sharded decode/MTP: prefill cannot mix with decode in one batch.
+  if (options.cp_size() > 1 ||
+      ::xllm::ParallelConfig::get_instance().kv_split_size_effective() > 1 ||
+      options.num_speculative_tokens() > 0) {
     mode.enable_mix_batch = false;
   }
 

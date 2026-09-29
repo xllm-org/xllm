@@ -39,8 +39,9 @@ DEFINE_int32(kv_split_size,
              1,
              "KV-cache split width. 0 falls back to cp_size (legacy); 1 means "
              "no KV split (each CP rank stores full KV, skips prefix "
-             "AllGather); other K (K divides cp_size) means KV is sharded "
-             "across K ranks while token-CP still uses cp_size.");
+             "AllGather); with cp_size > 1, other K must divide cp_size; with "
+             "cp_size == 1, K > 1 requests Qwen3.5 decode-context "
+             "parallelism on the supported NPU runtime.");
 
 DEFINE_int64(tp_size, 1, "Tensor parallelism size, only used for DiT model.");
 

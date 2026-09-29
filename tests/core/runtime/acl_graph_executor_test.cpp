@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +48,7 @@ limitations under the License.
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "core/layers/npu/npu_word_embedding_impl.h"
 #include "core/layers/npu_torch/qwen3_next_attention.h"
+#include "core/layers/npu_torch/qwen_dcp_attention.h"
 #include "core/layers/npu_torch/tests_utils.h"
 #include "core/runtime/acl_graph_executor_impl.h"
 #include "core/runtime/acl_graph_persistent_param.h"
@@ -194,6 +196,48 @@ TEST(Qwen35FiaRoutingTest, RequiresExplicitEnableFlag) {
   EXPECT_FALSE(layer::should_enable_qwen3_5_fia_decode("qwen3_next"));
 
   execution_config.enable_fia_decode(original_enable_fia_decode);
+}
+
+TEST(QwenDcpAttentionMergeTest, IgnoresNonFiniteLseBeforeMax) {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float infinity = std::numeric_limits<float>::infinity();
+  const torch::Tensor partial_outputs =
+      torch::tensor({nan, nan, infinity, -infinity, 3.0f, 9.0f})
+          .reshape({3, 1, 1, 2});
+  const torch::Tensor partial_lse =
+      torch::tensor({nan, infinity, 1000.0f}).reshape({3, 1, 1, 1});
+
+  const layer::detail::DcpAttentionResult result =
+      layer::detail::merge_dcp_attention_shards(partial_outputs, partial_lse);
+
+  EXPECT_TRUE(torch::equal(result.output,
+                           torch::tensor({3.0f, 9.0f}).reshape({1, 1, 2})));
+  EXPECT_TRUE(
+      torch::equal(result.lse, torch::tensor({1000.0f}).reshape({1, 1})));
+}
+
+TEST(QwenDcpKvHeadReplicaTest, AcceptsCompatibleReplicaGroup) {
+  EXPECT_FALSE(layer::validate_qwen_dcp_kv_head_replicas(
+                   /*tp_size=*/4,
+                   /*total_num_kv_heads=*/2,
+                   /*num_kv_head_replicas=*/2,
+                   /*dcp_size=*/2)
+                   .has_value());
+}
+
+TEST(QwenDcpKvHeadReplicaTest, ReportsIncompatibleTopology) {
+  const std::optional<std::string> error =
+      layer::validate_qwen_dcp_kv_head_replicas(
+          /*tp_size=*/4,
+          /*total_num_kv_heads=*/4,
+          /*num_kv_head_replicas=*/1,
+          /*dcp_size=*/2);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(*error,
+            "Qwen DCP requires dcp_size to divide the replicated KV-head "
+            "group (dcp_size=2, tp_size=4, total_num_kv_heads=4, "
+            "num_kv_head_replicas=1)");
 }
 
 namespace {

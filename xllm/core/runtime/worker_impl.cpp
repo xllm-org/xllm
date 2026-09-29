@@ -92,6 +92,7 @@ limitations under the License.
 #include "framework/state_dict/state_dict.h"
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
+#include "layers/common/kv_shard_batch_metadata.h"
 #include "models/model_registry.h"
 #include "runtime/forward_params.h"
 #if defined(USE_NPU)
@@ -1325,6 +1326,15 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     // CP prepare after global attention-meta consumers.
     processed_input.input_params.parallel.cp_plan.prepare(
         processed_input, npu_cp_plan_runtime_config());
+
+    ProcessGroup* dcp_group = parallel_args_.dcp_group_;
+    if (dcp_group != nullptr) {
+      const KVShardLayout layout(
+          options_.block_size(), dcp_group->world_size(), dcp_group->rank());
+      input_params.attention.device.new_cache_slots =
+          layer::localize_kv_shard_slots(
+              input_params.attention.device.new_cache_slots, layout);
+    }
 
     if (can_prepare_npu_graph_decode_input(input_params)) {
       model_executor_->prepare_graph_input(processed_input.token_ids,

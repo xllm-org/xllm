@@ -656,7 +656,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   kv_cache_shape.print_shapes();
 
   // initialize block manager
-  // Logical block_size *= kv_split_size.
   const int32_t kv_split_size_eff =
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
   BlockManagerPool::Options options;

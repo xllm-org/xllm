@@ -34,6 +34,7 @@ limitations under the License.
 #include <torch_npu/csrc/framework/utils/OpPreparation.h>
 #endif
 #include "core/common/metrics.h"
+#include "core/framework/kv_cache/kv_shard_layout.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
@@ -578,6 +579,14 @@ bool AclGraph::update_graph_tasks(const ModelInputParams& params,
     for (size_t index = 0; index < source_kv_seq_lens.size(); ++index) {
       actual_seq_lengths_kv[index] = source_kv_seq_lens[index];
     }
+    if (first_task.dcp_size > 1) {
+      const KVShardLayout layout(static_cast<int32_t>(first_task.block_size),
+                                 first_task.dcp_size,
+                                 first_task.dcp_rank);
+      for (int64_t& length : actual_seq_lengths_kv) {
+        length = layout.local_token_count(length);
+      }
+    }
   }
 
   auto update_causal_conv1d_task = [&](CausalConv1dGraphTask& task) {
@@ -633,7 +642,8 @@ bool AclGraph::update_graph_tasks(const ModelInputParams& params,
             task.block_size,
             task.workspace,
             task.output,
-            task.softmax_lse);
+            task.softmax_lse,
+            task.dcp_size > 1);
         c10_npu::graph_task_update_end(update_stream);
         if (task.event != nullptr) {
           task.event->record(update_stream);
@@ -875,7 +885,11 @@ ModelOutput AclGraph::replay(CausalLM* model,
 
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
-  if (graph_paged_attention_tiling_data_.defined()) {
+  const bool has_dcp_fused_infer_attention_tasks =
+      has_fused_infer_attention_graph_tasks() &&
+      graph_task_context_->fused_infer_attention_tasks.front().dcp_size > 1;
+  if (graph_paged_attention_tiling_data_.defined() ||
+      has_dcp_fused_infer_attention_tasks) {
     make_graph_wait_for_current_stream(stream);
   }
   const bool use_static_graph_tasks =

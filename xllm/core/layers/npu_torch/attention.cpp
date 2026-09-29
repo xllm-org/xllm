@@ -16,22 +16,21 @@ limitations under the License.
 #include "attention.h"
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "core/platform/npu/acl_graph_task_update_context.h"
 #include "kernels/npu/npu_ops_api.h"
 #include "kernels/ops_api.h"
+#include "layers/common/attention_metadata.h"
+#include "layers/npu_torch/fused_infer_attention_utils.h"
+#include "layers/npu_torch/qwen_dcp_attention.h"
 
 namespace {
-std::vector<int64_t> make_decode_actual_seq_lengths(int64_t num_tokens) {
-  std::vector<int64_t> actual_seq_lengths;
-  actual_seq_lengths.reserve(static_cast<size_t>(num_tokens));
-  for (int64_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
-    actual_seq_lengths.emplace_back(token_idx + 1);
-  }
-  return actual_seq_lengths;
-}
+
+using xllm::layer::detail::make_decode_actual_seq_lengths;
+using xllm::layer::detail::resolve_fia_sparse_mode;
 
 xllm::npu::FusedInferAttentionWorkspaceSignature
 make_fused_infer_attention_workspace_signature(
@@ -44,7 +43,8 @@ make_fused_infer_attention_workspace_signature(
     int64_t num_heads,
     int64_t num_key_value_heads,
     double scale,
-    int64_t block_size) {
+    int64_t block_size,
+    bool softmax_lse_flag) {
   return xllm::npu::FusedInferAttentionWorkspaceSignature{
       .query_dtype = query.scalar_type(),
       .key_dtype = key.scalar_type(),
@@ -61,10 +61,13 @@ make_fused_infer_attention_workspace_signature(
       .num_key_value_heads = num_key_value_heads,
       .block_size = block_size,
       .scale = scale,
+      .softmax_lse_flag = softmax_lse_flag,
   };
 }
 
-void run_fused_infer_attention_graph(
+}  // namespace
+
+torch::Tensor xllm::layer::detail::run_fused_infer_attention_graph(
     const std::shared_ptr<xllm::npu::AclGraphTaskUpdateContext>& graph_context,
     const torch::Tensor& query,
     const torch::Tensor& key,
@@ -75,11 +78,21 @@ void run_fused_infer_attention_graph(
     int64_t num_heads,
     int64_t num_key_value_heads,
     double scale,
-    int64_t block_size,
+    int32_t dcp_size,
+    int32_t dcp_rank,
     xllm::npu::FusedInferAttentionGraphBranch branch,
     torch::Tensor& output) {
   CHECK(graph_context != nullptr && graph_context->capturing)
       << "FIA graph update can only be registered during capture";
+  const int64_t block_size = key.size(1);
+  const bool softmax_lse_flag = dcp_size > 1;
+
+  std::vector<int64_t> workspace_kv_seq_lens = actual_seq_lengths_kv;
+  if (dcp_size > 1) {
+    const int64_t max_local_kv_seq_len = block_table.size(1) * block_size;
+    workspace_kv_seq_lens.assign(actual_seq_lengths_kv.size(),
+                                 max_local_kv_seq_len);
+  }
 
   const xllm::npu::FusedInferAttentionWorkspaceSignature workspace_signature =
       make_fused_infer_attention_workspace_signature(query,
@@ -87,11 +100,12 @@ void run_fused_infer_attention_graph(
                                                      value,
                                                      block_table,
                                                      actual_seq_lengths,
-                                                     actual_seq_lengths_kv,
+                                                     workspace_kv_seq_lens,
                                                      num_heads,
                                                      num_key_value_heads,
                                                      scale,
-                                                     block_size);
+                                                     block_size,
+                                                     softmax_lse_flag);
   torch::Tensor workspace = graph_context->fused_infer_attention_workspace;
   if (workspace.defined()) {
     CHECK(graph_context->fused_infer_attention_workspace_signature.has_value());
@@ -106,17 +120,21 @@ void run_fused_infer_attention_graph(
             value,
             block_table,
             actual_seq_lengths,
-            actual_seq_lengths_kv,
+            workspace_kv_seq_lens,
             num_heads,
             num_key_value_heads,
             scale,
-            block_size);
+            block_size,
+            softmax_lse_flag);
     CHECK(workspace.defined()) << "FIA graph workspace must be defined";
     graph_context->fused_infer_attention_workspace_signature =
         workspace_signature;
     graph_context->fused_infer_attention_workspace = workspace;
   }
-  torch::Tensor softmax_lse = torch::empty({0}, query.options());
+  torch::Tensor softmax_lse =
+      softmax_lse_flag ? torch::empty({query.size(0), num_heads, 1},
+                                      query.options().dtype(torch::kFloat32))
+                       : torch::empty({0}, query.options());
   c10_npu::NPUStream stream = c10_npu::getCurrentNPUStream();
   auto event = std::make_shared<c10_npu::NPUEvent>(ACL_EVENT_EXTERNAL);
   event->block(stream);
@@ -135,12 +153,13 @@ void run_fused_infer_attention_graph(
                                                           block_size,
                                                           workspace,
                                                           output,
-                                                          softmax_lse);
+                                                          softmax_lse,
+                                                          softmax_lse_flag);
   c10_npu::NPUTaskGroupHandle handle = c10_npu::graph_task_group_end(stream);
 
   xllm::npu::FusedInferAttentionGraphTask task;
   task.output = output;
-  task.softmax_lse = std::move(softmax_lse);
+  task.softmax_lse = softmax_lse;
   task.query = query;
   task.key = key;
   task.value = value;
@@ -151,24 +170,15 @@ void run_fused_infer_attention_graph(
   task.num_key_value_heads = num_key_value_heads;
   task.scale = scale;
   task.block_size = block_size;
+  task.dcp_size = dcp_size;
+  task.dcp_rank = dcp_rank;
   task.branch = branch;
   task.capture_order = graph_context->next_capture_order++;
   task.handle = handle;
   task.event = std::move(event);
   graph_context->fused_infer_attention_tasks.emplace_back(std::move(task));
+  return softmax_lse;
 }
-
-// FIA requires sparse mode 3 when an explicit attention mask is used or the
-// query is causal; DFlash2 supplies a band-mode override via fia_sparse_mode,
-// so the mask and causality controls stay independent of it.
-int64_t resolve_fia_sparse_mode(
-    const xllm::layer::AttentionMetadata& metadata) {
-  if (metadata.fia_sparse_mode >= 0) {
-    return metadata.fia_sparse_mode;
-  }
-  return (metadata.fia_attn_mask.defined() || metadata.is_causal) ? 3 : 0;
-}
-}  // namespace
 
 namespace xllm {
 namespace layer {
@@ -178,13 +188,15 @@ AttentionImpl::AttentionImpl(int64_t num_heads,
                              float scale,
                              int64_t num_kv_heads,
                              int64_t sliding_window,
-                             bool enable_fia_decode)
+                             bool enable_fia_decode,
+                             ProcessGroup* dcp_group)
     : num_heads_(num_heads),
       head_size_(head_size),
       num_kv_heads_(num_kv_heads),
       sliding_window_(sliding_window),
       scale_(scale),
-      enable_fia_decode_(enable_fia_decode) {
+      enable_fia_decode_(enable_fia_decode),
+      dcp_group_(dcp_group) {
   if (sliding_window_ > -1) {
     sliding_window_ = sliding_window_ - 1;
   }
@@ -241,6 +253,22 @@ void AttentionImpl::prefill_forward(torch::Tensor& query,
                                     const AttentionMetadata& attn_metadata) {
   query = query.view({-1, num_heads_, head_size_});
   output = output.view({-1, num_heads_, head_size_});
+
+  if (attn_metadata.is_chunked_prefill && dcp_group_ != nullptr) {
+    CHECK(v_cache.has_value() && v_cache->defined())
+        << "DCP chunked prefill requires a value cache";
+    qwen_dcp_chunked_prefill(query,
+                             key,
+                             value,
+                             output,
+                             k_cache,
+                             *v_cache,
+                             attn_metadata,
+                             num_kv_heads_,
+                             scale_,
+                             *dcp_group_);
+    return;
+  }
 
   if (attn_metadata.is_prefill) {
     key = key.view({-1, num_kv_heads_, head_size_});
@@ -302,6 +330,22 @@ void AttentionImpl::decoder_forward(torch::Tensor& query,
                                     const torch::Tensor& k_cache,
                                     const std::optional<torch::Tensor>& v_cache,
                                     const AttentionMetadata& attn_metadata) {
+  if (dcp_group_ != nullptr) {
+    CHECK(v_cache.has_value() && v_cache->defined())
+        << "DCP decode requires a value cache";
+    query = query.view({-1, num_heads_, head_size_});
+    output = output.view({-1, num_heads_, head_size_});
+    qwen_dcp_decode(query,
+                    output,
+                    k_cache,
+                    *v_cache,
+                    attn_metadata,
+                    num_kv_heads_,
+                    scale_,
+                    *dcp_group_);
+    return;
+  }
+
   query = query.view({-1, 1, num_heads_, head_size_});
   output = output.view({-1, 1, num_heads_, head_size_});
 
@@ -381,19 +425,21 @@ void AttentionImpl::decoder_forward(torch::Tensor& query,
         attn_metadata.expanded_decode.enabled
             ? xllm::npu::FusedInferAttentionGraphBranch::kSpecVerify
             : xllm::npu::FusedInferAttentionGraphBranch::kDecode;
-    run_fused_infer_attention_graph(attn_metadata.acl_graph_task_update_context,
-                                    query_tnd,
-                                    key_view,
-                                    value_view,
-                                    block_table,
-                                    actual_q_lens,
-                                    *kv_seq_lens_vec,
-                                    num_heads_,
-                                    num_kv_heads_,
-                                    scale_,
-                                    k_cache.size(1),
-                                    graph_branch,
-                                    output_tnd);
+    detail::run_fused_infer_attention_graph(
+        attn_metadata.acl_graph_task_update_context,
+        query_tnd,
+        key_view,
+        value_view,
+        block_table,
+        actual_q_lens,
+        *kv_seq_lens_vec,
+        num_heads_,
+        num_kv_heads_,
+        scale_,
+        /*dcp_size=*/1,
+        /*dcp_rank=*/0,
+        graph_branch,
+        output_tnd);
   } else {
     xllm::kernel::npu::npu_fused_infer_attention_decode_out_cached(
         query_tnd,

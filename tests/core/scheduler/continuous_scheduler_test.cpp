@@ -13,9 +13,12 @@
 
 #include "core/common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/parallel_config.h"
+#include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "distributed_runtime/engine.h"
 #include "scheduler_factory.h"
+#include "scheduler_policy.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -217,6 +220,19 @@ ContinuousScheduler::Options create_scheduler_options(
   opt.max_global_ttft_ms_ = max_global_ttft_ms;
   opt.max_global_tpot_ms_ = max_global_tpot_ms;
   return opt;
+}
+
+TEST(ContinuousSchedulerBatchModeTest, DcpControlsMixedBatches) {
+  ScopedConfigValue<bool> mix_batch(
+      SchedulerConfig::get_instance().enable_mix_batch(), true);
+  ScopedConfigValue<int32_t> kv_split_size(
+      ParallelConfig::get_instance().kv_split_size(), 2);
+  ContinuousScheduler::Options options = create_scheduler_options(
+      10000, 256, /*num_speculative_tokens=*/0, 1024, /*dp_size=*/1);
+  options.enable_chunked_prefill(true);
+
+  const BatchMode mode = create_batch_mode(options);
+  EXPECT_FALSE(mode.enable_mix_batch);
 }
 
 std::vector<std::shared_ptr<Request>> generate_request(

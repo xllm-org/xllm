@@ -64,7 +64,8 @@ class SpawnWorkerServer final {
                              int32_t ep_size,
                              const InstanceRole& instance_role,
                              bool enable_mtp_draft_body_tp1,
-                             const std::string& draft_sampling_mode);
+                             const std::string& draft_sampling_mode,
+                             int32_t kv_split_size);
 
   ~SpawnWorkerServer();
 
