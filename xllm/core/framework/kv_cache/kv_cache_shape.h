@@ -84,6 +84,8 @@ class KVCacheShape final {
                               int64_t world_size);
   void init_index_cache_shape(const KVCacheCapacity& kv_cache_cap,
                               const ModelArgs& model_args);
+  void init_mla_packed_c8_shape(const KVCacheCapacity& kv_cache_cap,
+                                const ModelArgs& model_args);
   void init_index_cache_scale_shape();
   void init_conv_cache_shape(const KVCacheCapacity& kv_cache_cap,
                              const ModelArgs& model_args,

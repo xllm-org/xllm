@@ -172,6 +172,11 @@ KVCacheTensors create_kv_cache_tensors(
     const KVCacheShape& kv_cache_shape,
     const KVCacheCreateOptions& create_options) {
   KVCacheTensors tensors;
+  // GLM-5.2 SFA C8 packs [int8 nope | bf16 rope | fp32 scale] into a single
+  // byte tensor. The kernels dereference the whole 656B row through a single
+  // int8 pointer, and K==V, so allocate one tensor and alias value_cache to
+  // it.
+  const bool mla_packed_c8 = create_options.mla_packed_c8();
 #if defined(USE_MLU)
   tensors.key_cache = alloc_cache_tensor(KVCacheTensorRole::KEY,
                                          kv_cache_shape.key_cache_shape(),
@@ -186,26 +191,35 @@ KVCacheTensors create_kv_cache_tensors(
 #elif defined(USE_NPU)
   const aclFormat npu_format_type =
       get_npu_kv_cache_format(create_options.model_type());
+  const torch::ScalarType key_dtype =
+      mla_packed_c8 ? torch::kChar : create_options.dtype();
   if (create_options.enable_kv_cache_huge_page_allocator()) {
-    tensors.key_cache =
-        alloc_npu_huge_page_tensor(kv_cache_shape.key_cache_shape(),
-                                   create_options.dtype(),
-                                   npu_format_type);
-    tensors.value_cache =
-        alloc_npu_huge_page_tensor(kv_cache_shape.value_cache_shape(),
-                                   create_options.dtype(),
-                                   npu_format_type);
+    tensors.key_cache = alloc_npu_huge_page_tensor(
+        kv_cache_shape.key_cache_shape(), key_dtype, npu_format_type);
+    if (!mla_packed_c8) {
+      tensors.value_cache =
+          alloc_npu_huge_page_tensor(kv_cache_shape.value_cache_shape(),
+                                     create_options.dtype(),
+                                     npu_format_type);
+    }
   } else {
     tensors.key_cache = at_npu::native::npu_format_cast(
         torch::empty(kv_cache_shape.key_cache_shape(),
-                     torch::dtype(create_options.dtype())
-                         .device(create_options.device())),
+                     torch::dtype(key_dtype).device(create_options.device())),
         npu_format_type);
-    tensors.value_cache = at_npu::native::npu_format_cast(
-        torch::empty(kv_cache_shape.value_cache_shape(),
-                     torch::dtype(create_options.dtype())
-                         .device(create_options.device())),
-        npu_format_type);
+    if (!mla_packed_c8) {
+      tensors.value_cache = at_npu::native::npu_format_cast(
+          torch::empty(kv_cache_shape.value_cache_shape(),
+                       torch::dtype(create_options.dtype())
+                           .device(create_options.device())),
+          npu_format_type);
+    }
+  }
+  // MLA SFA C8 aliases value_cache to key_cache so K == V share the packed
+  // int8 byte tensor. Set the alias once after allocation instead of
+  // re-copying it inside every huge-page / non-huge-page branch.
+  if (mla_packed_c8) {
+    tensors.value_cache = tensors.key_cache;
   }
 #else
   tensors.key_cache = alloc_cache_tensor(KVCacheTensorRole::KEY,
@@ -230,13 +244,16 @@ IndexedKVCacheTensors create_indexed_kv_cache_tensors(
   CHECK(kv_cache_shape.has_index_cache_shape())
       << "index_cache_shape must be initialized.";
   IndexedKVCacheTensors tensors;
-  if (create_options.enable_kv_cache_quant()) {
+  const bool mla_packed_c8 = create_options.mla_packed_c8();
+  if (create_options.enable_kv_cache_quant() && !mla_packed_c8) {
     QuantizedKVCacheTensors quantized_tensors =
         create_quantized_kv_cache_tensors(kv_cache_shape, create_options);
     tensors.kv_cache_tensors = quantized_tensors.kv_cache_tensors;
     tensors.key_cache_scale = quantized_tensors.key_cache_scale;
     tensors.value_cache_scale = quantized_tensors.value_cache_scale;
   } else {
+    // SFA C8 packs int8 nope + bf16 rope + fp32 scale into a single byte
+    // tensor via create_kv_cache_tensors (K==V, no per-token scale tensor).
     tensors.kv_cache_tensors =
         create_kv_cache_tensors(kv_cache_shape, create_options);
   }
@@ -312,8 +329,12 @@ QuantizedKVCacheTensors create_quantized_kv_cache_tensors(
     const KVCacheShape& kv_cache_shape,
     const KVCacheCreateOptions& create_options) {
 #if !defined(USE_MLU)
-  CHECK(!create_options.enable_kv_cache_quant())
-      << "KV cache quantization is only supported on MLU backend.";
+  // MLA SFA C8 flows through create_indexed_kv_cache_tensors + the packed
+  // shape from KVCacheShape (int8 dtype, K==V, no scale). Everything else on
+  // non-MLU stays rejected.
+  CHECK(!create_options.enable_kv_cache_quant() ||
+        create_options.mla_packed_c8())
+      << util::kNonMluKvCacheQuantRejectMsg;
 #endif
 
   QuantizedKVCacheTensors tensors;
