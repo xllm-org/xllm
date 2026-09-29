@@ -314,7 +314,17 @@ class CausalLMImpl : public CausalLM {
     if constexpr (detail::has_logits_with_hidden<Model>::value) {
       return model_->logits(hidden_states, seleted_idxes, out_hidden);
     } else {
-      return CausalLM::logits(hidden_states, seleted_idxes, out_hidden);
+      // No fused lm_head variant: surface the selected hidden via an explicit
+      // gather and project only the selected rows through the 2-arg path,
+      // mirroring the CausalVLMImpl fallback so out_hidden stays defined.
+      if (seleted_idxes.defined()) {
+        torch::Tensor idxes = seleted_idxes.to(
+            torch::dtype(torch::kLong).device(hidden_states.device()));
+        out_hidden = hidden_states.index_select(/*dim=*/0, idxes);
+      } else {
+        out_hidden = hidden_states;
+      }
+      return model_->logits(out_hidden, /*seleted_idxes=*/torch::Tensor());
     }
   }
 
