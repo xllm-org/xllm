@@ -22,25 +22,6 @@ limitations under the License.
 #include "tensor.pb.h"
 
 namespace xllm {
-class TensorProtoBuilder {
- public:
-  TensorProtoBuilder(bool use_binary_encoding);
-  ~TensorProtoBuilder() = default;
-  bool build_repeated_tensor(
-      const std::vector<torch::Tensor>& in_tensors,
-      google::protobuf::RepeatedPtrField<xllm::proto::Tensor>& out_tensors,
-      std::string& binary_payload);
-  bool build_tensor(const torch::Tensor& in_tensor,
-                    xllm::proto::Tensor& out_tensor,
-                    std::string& binary_payload);
-  bool build_tensor(const xllm::proto::Tensor& in_tensor,
-                    const std::string& binary_payload,
-                    torch::Tensor& out_tensor);
-
- private:
-  bool use_binary_encoding_;
-};
-
 class EmbeddingOutputBuilder {
  public:
   EmbeddingOutputBuilder(bool embedding_use_binary_encoding,
@@ -55,7 +36,7 @@ class EmbeddingOutputBuilder {
                               xllm::proto::Embedding& out_embedding,
                               std::string& binary_payload);
   bool build_embedding_output(const xllm::proto::Embedding& in_embedding,
-                              std::string& binary_payload,
+                              const std::string& binary_payload,
                               EmbeddingOutput& out_embedding);
 
  private:
