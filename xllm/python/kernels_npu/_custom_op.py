@@ -204,6 +204,18 @@ def _mega_gdn_decode_fake(
     return torch.empty_like(z)
 
 
+def _causal_conv1d_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    query_start_loc: list[int],
+    activation_mode: int,
+    run_mode: int,
+) -> torch.Tensor:
+    del weight, conv_state, query_start_loc, activation_mode, run_mode
+    return torch.empty_like(input)
+
+
 def _causal_conv1d_qkv_prefill_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1234,6 +1246,7 @@ register_fake("xllm_ops::split_qkv_rmsnorm_mrope", _split_qkv_rmsnorm_mrope_fake
 register_fake("xllm_ops::chunk_gated_delta_rule", _chunk_gated_delta_rule_fake)
 register_fake("xllm_ops::mega_gdn_prefill", _mega_gdn_prefill_fake)
 register_fake("xllm_ops::mega_gdn_decode", _mega_gdn_decode_fake)
+register_fake("xllm_ops::causal_conv1d", _causal_conv1d_fake)
 register_fake("xllm_ops::causal_conv1d_qkv_prefill", _causal_conv1d_qkv_prefill_fake)
 register_fake(
     "xllm_ops::fused_sigmoid_gating_delta_rule_decode",
