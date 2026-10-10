@@ -1,4 +1,4 @@
-/* Copyright 2025-2026 The xLLM Authors.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,37 +17,33 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "core/framework/model/model_args.h"
+#include "core/framework/multimodal/mm_data.h"
+#include "core/framework/multimodal/mm_input.h"
 #include "processors/prompt_processor.h"
 
 namespace xllm {
 
-class CLIPVLPromptProcessor final : public PromptProcessor {
-  enum class TokenType {
-    INVALID,
-    IMAGE,
-    VIDEO,
-  };
-
+// Expands each <|AUDIO|> placeholder to the audio's token count and
+// records the spans; with CTC enabled each entry folds in its trailing pad
+// run, and every audio carries its [hash, ctc_pad_num] encode meta in item
+// data (aggregated by MMBatchData::batch for the executor). process()/
+// find_mm_spans() validate and reject bad layouts.
+class JoyaiASRPromptProcessor final : public PromptProcessor {
  public:
-  explicit CLIPVLPromptProcessor(const ModelArgs& args);
+  explicit JoyaiASRPromptProcessor(const ModelArgs& args);
 
   bool process(std::string& prompt, const MMData& mm_data) override;
   bool find_mm_spans(const std::vector<int32_t>& token_ids,
-                     MMData& mm_data) override {
-    return true;
-  }
+                     MMData& mm_data) override;
 
  private:
-  std::pair<TokenType, size_t> find_vision_token(const std::string& prompt,
-                                                 size_t begin);
-
-  const std::string image_token_ = "<|image_pad|>";
-  const std::string video_token_ = "<|video_pad|>";
-  int32_t merge_size_ = 0;
+  const std::string audio_token_;
+  int32_t audio_token_id_ = 0;
+  int32_t ctc_pad_token_id_ = 0;
+  bool ctc_enable_ = false;
 };
 
 }  // namespace xllm

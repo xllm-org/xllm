@@ -28,6 +28,7 @@ limitations under the License.
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <optional>
@@ -833,6 +834,12 @@ bool HFModelLoader::load_args(const std::string& model_weights_path) {
     return false;
   }
 
+  if (!load_audio_preprocessor_args(model_weights_path)) {
+    LOG(ERROR) << "Failed to load audio preprocess args from "
+               << model_weights_path;
+    return false;
+  }
+
   // Some hacky logics to support loading of old models
   // always use float16 for quantization
   // TODO: support quantization for other data types
@@ -1327,6 +1334,84 @@ bool HFModelLoader::load_video_preprocessor_args(
     args_.mm_video_max_tokens() = field_int("max_image_tokens", 0);
   }
 
+  return true;
+}
+
+bool HFModelLoader::load_audio_preprocessor_args(
+    const std::string& model_weights_path) {
+  // audio preprocessor args
+  JsonReader audio_preprocess_reader;
+  const std::string flat_file_path =
+      model_weights_path + "/audio_preprocessor_config.json";
+  const std::string shared_file_path =
+      model_weights_path + "/preprocessor_config.json";
+  bool parsed = false;
+  std::string used_file_path;
+  if (audio_preprocess_reader.parse(flat_file_path)) {
+    parsed = true;
+    used_file_path = flat_file_path;
+  } else if (audio_preprocess_reader.parse(shared_file_path)) {
+    // The shared preprocessor_config.json usually belongs to the image /
+    // video frontend: accept it as an audio config only when it carries
+    // sampling_rate (mandatory in every audio feature-extractor config,
+    // never present in image/video processor configs).
+    if (audio_preprocess_reader.contains("sampling_rate")) {
+      parsed = true;
+      used_file_path = shared_file_path;
+    }
+  }
+  if (!parsed) {
+    return true;  // no audio config — text-only and image/video models
+                  // keep the defaults
+  }
+  LOG(INFO) << "Success to parse audio preprocess args file: "
+            << used_file_path;
+  args_.mm_audio_num_mel_bins() = audio_preprocess_reader.value_or<int64_t>(
+      std::vector<std::string>{"num_mel_bins", "feature_size"}, 80);
+  args_.mm_audio_max_frames() =
+      audio_preprocess_reader.value_or<int64_t>("max_length", 3000);
+  // The model-args registration runs first; an absent key must not clobber it.
+  args_.mm_audio_downsample_rate() = audio_preprocess_reader.value_or<int64_t>(
+      "downsample_rate", args_.mm_audio_downsample_rate());
+  // The frontend enforces its 16k contract at construction.
+  args_.mm_audio_sampling_rate() =
+      audio_preprocess_reader.value_or<int64_t>("sampling_rate", 16000);
+
+  const int64_t sampling_rate = args_.mm_audio_sampling_rate();
+  const double frame_length =
+      audio_preprocess_reader.value_or<double>("frame_length", 25.0);
+  const double frame_shift =
+      audio_preprocess_reader.value_or<double>("frame_shift", 10.0);
+  const bool in_samples = frame_length > 100 || frame_shift > 100;
+  const double frame_length_samples =
+      in_samples ? frame_length : frame_length * sampling_rate / 1000;
+  const double frame_shift_samples =
+      in_samples ? frame_shift : frame_shift * sampling_rate / 1000;
+  if (!std::isfinite(frame_length_samples) ||
+      !std::isfinite(frame_shift_samples) || frame_length_samples < 2 ||
+      frame_shift_samples < 1 || frame_length_samples >= std::ldexp(1.0, 63) ||
+      frame_shift_samples >= std::ldexp(1.0, 63)) {
+    LOG(ERROR) << "Invalid audio frame length or shift in preprocessor config.";
+    return false;
+  }
+  args_.mm_audio_frame_length() = static_cast<int64_t>(frame_length_samples);
+  args_.mm_audio_frame_shift() = static_cast<int64_t>(frame_shift_samples);
+
+  auto field_double_vec =
+      [&](const std::string& key) -> std::optional<std::vector<double>> {
+    const auto* ptr = audio_preprocess_reader.resolve(key);
+    if (ptr != nullptr && ptr->is_array()) {
+      return ptr->get<std::vector<double>>();
+    }
+    return std::nullopt;
+  };
+
+  if (auto v = field_double_vec("means")) {
+    args_.mm_audio_cmvn_means() = std::move(*v);
+  }
+  if (auto v = field_double_vec("inverse_std_variences")) {
+    args_.mm_audio_cmvn_inverse_std() = std::move(*v);
+  }
   return true;
 }
 

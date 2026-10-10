@@ -84,11 +84,13 @@ def load_gqa_fused_attention(
     state: ScopedWeightLoader,
     context: ParallelLoadContext,
     n_kv_heads: int,
+    qk_norm: bool = True,
 ) -> None:
     """Load a fused-QKV GQA attention block's shared weights.
 
     Backend-specific finalization (e.g. row-parallel weight prep) differs by
-    caller and stays with the caller after this returns.
+    caller and stays with the caller after this returns. ``qk_norm=False``
+    fits Qwen2-family towers, which carry no per-head q/k RMSNorm.
     """
     state.load_fused(
         module.qkv_proj.weight,
@@ -105,8 +107,9 @@ def load_gqa_fused_attention(
     # o_proj bias is replicated (added after the all-reduce), so load unsharded.
     if module.o_proj.bias is not None:
         state.load_tensor(module.o_proj.bias, "o_proj.bias")
-    state.load_tensor(module.q_norm.weight, "q_norm.weight")
-    state.load_tensor(module.k_norm.weight, "k_norm.weight")
+    if qk_norm:
+        state.load_tensor(module.q_norm.weight, "q_norm.weight")
+        state.load_tensor(module.k_norm.weight, "k_norm.weight")
 
 
 def load_causal_lm_weights(

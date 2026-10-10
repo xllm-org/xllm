@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/model/mtp_topk_state.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/multimodal/mm_visitor.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
@@ -69,51 +70,15 @@ py::object mtp_topk_indices(const ModelInputParams& params) {
 // placeholders present in this chunk. When the whole item is in the chunk
 // (start_pos=0, end_pos=length) the block is returned unchanged, so the
 // non-chunked case is a no-op.
-torch::Tensor slice_chunk_embeds(const MMBatchData& mm_data,
+torch::Tensor slice_chunk_embeds(MMBatchData& mm_data,
                                  const torch::Tensor& embeds,
                                  MMType modality) {
   if (!embeds.defined() || embeds.dim() == 0 || embeds.size(0) == 0) {
     return embeds;
   }
-  std::vector<torch::Tensor> slices;
-  int64_t off = 0;
-  for (const auto& data : mm_data.mm_data_vec()) {
-    if (!data.hold<MMItemVec>()) {
-      continue;
-    }
-    for (const auto& item : data.items<MMItemVec>()) {
-      if (item.type() != modality || item.is_embedded()) {
-        continue;
-      }
-      const auto& state = item.state();
-      const int32_t len = state.token_pos().length;
-      if (len <= 0) {
-        continue;
-      }
-      int32_t start_pos = state.schedule_data().start_pos;
-      int32_t end_pos = state.schedule_data().end_pos;
-      const auto& mask = state.mm_token_mask();
-      if (mask.defined() && mask.numel() > 0) {
-        auto mask_cpu = mask.to(torch::kCPU);
-        start_pos = mask_cpu.slice(0, 0, start_pos).sum().item<int32_t>();
-        end_pos = mask_cpu.slice(0, 0, end_pos).sum().item<int32_t>();
-      }
-      if (end_pos > start_pos) {
-        slices.push_back(embeds.slice(0, off + start_pos, off + end_pos));
-      }
-      // Advance by the item's actual encoder-output row count
-      // (mm_token_num = mask.sum()), not the full token_pos span: video
-      // spans include non-mm frame markers/timestamps, so token_pos.length
-      // > mm_token_num and `off += len` would push later items' slices past
-      // their real embeds offset. Matches EncoderEmbeddingGatherVisitor.
-      off += state.mm_token_num();
-    }
-  }
-  torch::Tensor out;
-  if (slices.empty() || !safe_concat(slices, out)) {
-    return embeds;
-  }
-  return out;
+  ChunkEmbedSliceVisitor visitor(embeds, modality);
+  CHECK(mm_data.foreach (visitor));
+  return visitor.finish();
 }
 
 void register_xllm_runtime_module(py::module_& m) {
@@ -467,13 +432,6 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   // ``model._inputs_embeds`` / ``deepstack_input_embeds`` for the runner-driven
   // ``Qwen3VLModel.forward``. Decode steps carry no mm_data, so the attributes
   // stay clear and the aclgraph embed path is used.
-  //
-  // NOTE: this scatters the FULL image/video embedding into the current
-  // forward's tokens, so it assumes every multimodal token is in this batch
-  // (i.e. enable_chunked_prefill=False). Chunked prefill — where a chunk
-  // boundary can land inside an item's token span — needs item-level scatter
-  // (reuse EncoderEmbeddingGatherVisitor + the NPU backend's paged mixed-batch
-  // attention, both tracked for a follow-up PR).
   if (params.has_multimodal() && params.multimodal().mm_data.valid()) {
     auto& mm_data = params.multimodal().mm_data;
     torch::Tensor pixel_values;
@@ -493,7 +451,19 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
       video_grid_thw = res.value();
     }
 
-    if (pixel_values.defined() || pixel_values_videos.defined()) {
+    torch::Tensor input_features;
+    if (const auto& res = mm_data.get<torch::Tensor>("input_features")) {
+      input_features = res.value();
+    }
+    torch::Tensor speech_lengths;
+    if (const auto& res = mm_data.get<torch::Tensor>("speech_lengths")) {
+      speech_lengths = res.value();
+    }
+    CHECK_EQ(input_features.defined(), speech_lengths.defined())
+        << "input_features and speech_lengths must be provided together";
+
+    if (pixel_values.defined() || pixel_values_videos.defined() ||
+        input_features.defined()) {
       py::object top_model = py_causal_lm_->python_model();
       // encode() moves the tensors onto device internally. Slice each block to
       // the chunk's in-chunk subrange (see slice_chunk_embeds) so chunked
@@ -515,9 +485,40 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         video_embeds =
             py::cast(slice_chunk_embeds(mm_data, raw, MMType::VIDEO));
       }
+      py::object audio_embeds = py::none();
+      py::object audio_mask = py::none();
+      if (input_features.defined()) {
+        torch::Tensor audio_meta;
+        if (const auto& res = mm_data.get<torch::Tensor>("audio_encode_meta")) {
+          audio_meta = res.value();
+        }
+        CHECK(audio_meta.defined() && audio_meta.dim() == 2 &&
+              audio_meta.size(0) == speech_lengths.numel() &&
+              audio_meta.size(1) == 2)
+            << "audio_encode_meta must have one [hash, ctc_pad_num] row per "
+               "speech length";
+        torch::Tensor raw =
+            top_model.attr("encode")(input_features, speech_lengths, audio_meta)
+                .cast<torch::Tensor>();
+        audio_embeds =
+            py::cast(slice_chunk_embeds(mm_data, raw, MMType::AUDIO));
+        AudioScatterMaskVisitor mask_visitor(params.attention.host.kv_seq_lens,
+                                             params.attention.host.q_seq_lens,
+                                             execution_tokens);
+        CHECK(mm_data.foreach (mask_visitor));
+        audio_mask = py::cast(mask_visitor.finish());
+      }
       // Sets top_model.model._inputs_embeds + deepstack_input_embeds.
-      top_model.attr("get_input_embeddings")(
-          execution_tokens, image_embeds, video_embeds);
+      if (audio_embeds.is_none()) {
+        top_model.attr("get_input_embeddings")(
+            execution_tokens, image_embeds, video_embeds);
+      } else {
+        top_model.attr("get_input_embeddings")(execution_tokens,
+                                               image_embeds,
+                                               video_embeds,
+                                               audio_embeds,
+                                               audio_mask);
+      }
     }
   }
 

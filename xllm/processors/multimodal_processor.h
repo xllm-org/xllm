@@ -94,11 +94,15 @@ class MultimodalProcessor final : public MultimodalProcessorBase {
   bool process_prompt(std::string& prompt,
                       MMData& mm_data,
                       std::vector<int32_t>& token_ids) override {
-    prompt_processor_->process(prompt, mm_data);
+    if (!prompt_processor_->process(prompt, mm_data)) {
+      return false;
+    }
     if (!tokenize(prompt, token_ids)) {
       return false;
     }
-    prompt_processor_->find_mm_spans(token_ids, mm_data);
+    if (!prompt_processor_->find_mm_spans(token_ids, mm_data)) {
+      return false;
+    }
     return true;
   }
 

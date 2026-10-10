@@ -22,9 +22,9 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
-#include "mm_batch_data.h"
-#include "mm_data.h"
-#include "mm_input.h"
+#include "core/framework/multimodal/mm_batch_data.h"
+#include "core/framework/multimodal/mm_data.h"
+#include "core/framework/multimodal/mm_input.h"
 
 namespace xllm {
 
@@ -122,6 +122,49 @@ class EncoderOutputScatterVisitor : public MMDataItem::IVisitor {
   int32_t image_idx = 0;
   int32_t video_idx = 0;
   int32_t audio_idx = 0;
+};
+
+// Slice a modality's concatenated encoder-output rows to the scheduled items'
+// in-chunk subranges (EncoderEmbeddingGatherVisitor's chunk mapping, for
+// callers whose embeddings are not on the items).
+class ChunkEmbedSliceVisitor final : public MMDataItem::IVisitor {
+ public:
+  ChunkEmbedSliceVisitor(const torch::Tensor& embeds, MMType modality)
+      : embeds_(embeds), modality_(modality) {}
+
+  bool visit(MMDataItem& item) override;
+
+  // Nothing sliced -> the input tensor (non-chunked steps are a no-op).
+  torch::Tensor finish();
+
+ private:
+  torch::Tensor embeds_;
+  MMType modality_;
+  std::vector<torch::Tensor> slices_;
+  int64_t off_ = 0;
+};
+
+// Host-assembled chunk replacement mask for the audio modality: true at each
+// scheduled audio item's placeholder and CTC pad rows. Item state, not
+// token-id matching — pad ids also occur as ordinary text.
+class AudioScatterMaskVisitor final : public MMDataItem::IVisitor {
+ public:
+  // Lengths follow the batch builder's per-backend layout (normalized
+  // internally); tokens is the step's flattened id vector.
+  AudioScatterMaskVisitor(const std::vector<int32_t>& seq_lens,
+                          const std::vector<int32_t>& scheduled_seq_lens,
+                          const torch::Tensor& tokens);
+
+  bool visit(MMDataItem& item) override;
+
+  torch::Tensor finish() const;
+
+ private:
+  torch::Tensor tokens_;
+  std::vector<int32_t> per_seq_total_lens_;
+  std::vector<int32_t> per_seq_scheduled_lens_;
+  std::vector<int32_t> per_seq_scheduled_offsets_;
+  torch::Tensor mask_;
 };
 
 class EncoderEmbeddingGatherVisitor : public MMDataItem::IVisitor {
