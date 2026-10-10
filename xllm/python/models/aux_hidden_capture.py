@@ -30,6 +30,9 @@ class AuxHiddenCapture:
     def enabled(self) -> bool:
         return bool(self._layers_to_capture)
 
+    def should_capture(self, layer_id: int) -> bool:
+        return layer_id in self._capture_slots
+
     def create_buffer(self, hidden: torch.Tensor) -> torch.Tensor | None:
         if not self.enabled:
             return None
