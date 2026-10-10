@@ -33,6 +33,25 @@ cc_test(
 
 cc_test(
   NAME
+    glm5_next_decoder_layer_test
+  SRCS
+    glm5_next_decoder_layer_test.cpp
+  DEPS
+    :config
+    :mlu_layers
+    :common_layers
+    :block
+    :parallel_state
+    :model
+    :model_context
+    :state_dict
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     glm5_next_kda_test
   SRCS
     glm5_next_kda_test.cpp

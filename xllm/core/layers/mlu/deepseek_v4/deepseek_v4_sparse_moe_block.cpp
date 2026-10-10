@@ -53,13 +53,16 @@ DeepseekV4SparseMoEBlockImpl::DeepseekV4SparseMoEBlockImpl(
     const torch::TensorOptions& options,
     bool use_hash,
     const std::shared_ptr<Stream>& routed_comm_stream,
-    const std::shared_ptr<Stream>& shared_compute_stream)
+    const std::shared_ptr<Stream>& shared_compute_stream,
+    const std::string& module_prefix)
     : parallel_args_(parallel_args) {
   enable_deep_ep_ =
       ::xllm::EPLBConfig::get_instance().expert_parallel_degree() == 2 &&
       parallel_args_.ep_size() > 1;
-  const FusedMoEArgs moe_args{
-      .is_gated = true, .enable_result_reduction = false, .use_hash = use_hash};
+  const FusedMoEArgs moe_args{.is_gated = true,
+                              .enable_result_reduction = false,
+                              .use_hash = use_hash,
+                              .module_prefix = module_prefix};
   moe_ = register_module("moe",
                          FusedMoE(model_args,
                                   moe_args,

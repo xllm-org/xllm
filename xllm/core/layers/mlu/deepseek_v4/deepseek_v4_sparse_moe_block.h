@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "framework/model/model_args.h"
@@ -44,7 +45,8 @@ class DeepseekV4SparseMoEBlockImpl final : public torch::nn::Module {
       const torch::TensorOptions& options,
       bool use_hash,
       const std::shared_ptr<Stream>& routed_comm_stream,
-      const std::shared_ptr<Stream>& shared_compute_stream);
+      const std::shared_ptr<Stream>& shared_compute_stream,
+      const std::string& module_prefix = "");
 
   void load_state_dict(const StateDict& state_dict);
   void verify_loaded_weights() const;

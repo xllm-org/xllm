@@ -19,7 +19,6 @@ limitations under the License.
 
 #include <string>
 #include <tuple>
-#include <unordered_map>
 #include <vector>
 
 namespace xllm {
@@ -29,30 +28,6 @@ namespace {
 StateDict get_alias_dict(const StateDict& state_dict,
                          const std::vector<std::string>& prefixes) {
   return state_dict.get_dict_with_prefix(prefixes);
-}
-
-StateDict get_hc_state(const StateDict& state_dict,
-                       const std::string& module_prefix,
-                       const std::string& legacy_prefix) {
-  StateDict module_state = state_dict.get_dict_with_prefix(module_prefix);
-  if (module_state.size() > 0) {
-    return module_state;
-  }
-
-  std::unordered_map<std::string, torch::Tensor> tensors;
-  torch::Tensor fn = state_dict.get_tensor(legacy_prefix + "fn");
-  torch::Tensor base = state_dict.get_tensor(legacy_prefix + "base");
-  torch::Tensor scale = state_dict.get_tensor(legacy_prefix + "scale");
-  if (fn.defined()) {
-    tensors.emplace("hc_fn", fn);
-  }
-  if (base.defined()) {
-    tensors.emplace("hc_base", base);
-  }
-  if (scale.defined()) {
-    tensors.emplace("hc_scale", scale);
-  }
-  return StateDict(tensors);
 }
 
 }  // namespace

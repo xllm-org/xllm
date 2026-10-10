@@ -152,6 +152,9 @@ void AddMatmulWeightTransposedImpl::load_state_dict(
     const StateDict& state_dict) {
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+  CHECK(!quant_args_.preserve_smooth())
+      << "Preserved smooth is unsupported by this projection: "
+      << state_dict.prefix();
 
   if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     std::vector<weight::LazyParameterSpec> specs;

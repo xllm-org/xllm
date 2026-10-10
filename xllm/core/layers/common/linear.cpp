@@ -278,6 +278,8 @@ struct W8A8LinearParamRefs {
   bool& weight_scale_is_loaded;
   torch::Tensor& weight_offset;
   bool& weight_offset_is_loaded;
+  torch::Tensor& smooth;
+  bool& smooth_is_loaded;
 };
 
 void ensure_w8a8_params_for_linear_load(
@@ -332,7 +334,7 @@ void ensure_w8a8_params_for_linear_load(
   const int64_t out_features = refs.weight.size(0);
   const int64_t in_features = refs.weight.size(1);
 
-  specs.reserve(4);
+  specs.reserve(5);
   if (is_w8a8_quant(resolved_weight_quant_method)) {
     push(refs.input_scale,
          refs.input_scale_is_loaded,
@@ -364,6 +366,18 @@ void ensure_w8a8_params_for_linear_load(
          refs.weight_offset_is_loaded,
          "weight_offset",
          {out_features},
+         options.dtype(torch::kFloat32));
+  }
+  if (quant_args.is_compressed_tensors_w8a8_dynamic() &&
+      quant_args.preserve_smooth()) {
+#if !defined(USE_MLU) && !defined(USE_DCU)
+    LOG(FATAL)
+        << "Preserved compressed-tensors smooth is unsupported on this backend";
+#endif
+    push(refs.smooth,
+         refs.smooth_is_loaded,
+         "smooth",
+         {in_features},
          options.dtype(torch::kFloat32));
   }
   weight::ensure_parameter_storage(module, specs);
@@ -667,13 +681,16 @@ torch::Tensor ColumnParallelLinearImpl::forward(torch::Tensor input) {
         << "weight_scale is required for w8a8_dynamic quant matmul.";
 #if defined(USE_MLU) || defined(USE_DCU)
     CHECK(weight_is_loaded_) << "Missing compressed-tensors weight";
-    output = scaled_w8a8_linear(input,
-                                weight_,
-                                weight_scale.value(),
-                                /*smooth=*/torch::Tensor(),
-                                bias,
-                                output_dtype_,
-                                linear_extra_args_);
+    CHECK(!quant_args_.preserve_smooth() || smooth_is_loaded_)
+        << "Missing compressed-tensors smooth";
+    output = scaled_w8a8_linear(
+        input,
+        weight_,
+        weight_scale.value(),
+        smooth_.defined() && smooth_is_loaded_ ? smooth_ : torch::Tensor(),
+        bias,
+        output_dtype_,
+        linear_extra_args_);
 #elif defined(USE_NPU)
     output = npu_w8a8_dynamic_linear_forward(
         input, weight_, weight_scale.value(), bias, output_dtype_);
@@ -774,7 +791,9 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                           weight_scale_,
                           weight_scale_is_loaded_,
                           weight_offset_,
-                          weight_offset_is_loaded_});
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
   // load and merge the weights on dim 0
   // If quant_args_ indicates SmoothQuant, load qweight; otherwise, load
@@ -819,6 +838,9 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_SHARDED_WEIGHT(weight, 0);
     LOAD_SHARDED_WEIGHT(weight_scale, 0);
+    if (smooth_.defined()) {
+      LOAD_WEIGHT(smooth);
+    }
     if (weight_offset_.defined()) {
       LOAD_SHARDED_WEIGHT(weight_offset, 0);
     }
@@ -861,7 +883,9 @@ void ColumnParallelLinearImpl::load_state_dict(
                           weight_scale_,
                           weight_scale_is_loaded_,
                           weight_offset_,
-                          weight_offset_is_loaded_});
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
   // load and merge the weights on dim 0
   // If quant_args_ indicates SmoothQuant, load qweight
@@ -970,6 +994,10 @@ void ColumnParallelLinearImpl::load_state_dict(
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_FUSED_WEIGHT(weight, 0);
     LOAD_FUSED_WEIGHT(weight_scale, 0);
+    if (smooth_.defined()) {
+      load_smooth_from_prefixes(
+          state_dict, prefixes, smooth_, smooth_list_, smooth_is_loaded_);
+    }
     if (weight_offset_.defined()) {
       LOAD_FUSED_WEIGHT(weight_offset, 0);
     }
@@ -1021,7 +1049,9 @@ void ColumnParallelLinearImpl::load_state_dict(
                           weight_scale_,
                           weight_scale_is_loaded_,
                           weight_offset_,
-                          weight_offset_is_loaded_});
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
   // load and merge the weights on dim 0 with variable shard sizes
   if (quant_args_.quant_method() == "smoothquant") {
@@ -1056,6 +1086,9 @@ void ColumnParallelLinearImpl::load_state_dict(
     } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
       LOAD_MERGED_WEIGHT_V2(weight, 0);
       LOAD_MERGED_WEIGHT_V2(weight_scale, 0);
+      if (smooth_.defined()) {
+        LOAD_WEIGHT(smooth);
+      }
       if (weight_offset_.defined()) {
         LOAD_MERGED_WEIGHT_V2(weight_offset, 0);
       }
@@ -1227,12 +1260,15 @@ torch::Tensor QKVParallelLinearImpl::forward(torch::Tensor input) {
         << "weight_scale is required for w8a8_dynamic quant matmul.";
 #if defined(USE_MLU) || defined(USE_DCU)
     CHECK(weight_is_loaded_) << "Missing compressed-tensors weight";
-    output = scaled_w8a8_linear(input,
-                                weight_,
-                                weight_scale.value(),
-                                /*smooth=*/torch::Tensor(),
-                                bias,
-                                output_dtype_);
+    CHECK(!quant_args_.preserve_smooth() || smooth_is_loaded_)
+        << "Missing compressed-tensors smooth";
+    output = scaled_w8a8_linear(
+        input,
+        weight_,
+        weight_scale.value(),
+        smooth_.defined() && smooth_is_loaded_ ? smooth_ : torch::Tensor(),
+        bias,
+        output_dtype_);
 #elif defined(USE_NPU)
     output = npu_w8a8_dynamic_linear_forward(
         input, weight_, weight_scale.value(), bias, output_dtype_);
@@ -1285,7 +1321,9 @@ void QKVParallelLinearImpl::load_state_dict(
                           weight_scale_,
                           weight_scale_is_loaded_,
                           weight_offset_,
-                          weight_offset_is_loaded_});
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 #if defined(USE_MUSA)
   const bool is_block_fp8 = musa::is_block_fp8_quant(quant_args_);
   if (is_block_fp8) {
@@ -1388,6 +1426,10 @@ void QKVParallelLinearImpl::load_state_dict(
     LOAD_QKV_WEIGHT(quant_bias, 0, num_kv_head_replicas_);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_QKV_WEIGHT(weight_scale, 0, num_kv_head_replicas_);
+    if (smooth_.defined()) {
+      load_smooth_from_prefixes(
+          state_dict, prefixes, smooth_, smooth_list_, smooth_is_loaded_);
+    }
     if (weight_offset_.defined()) {
       LOAD_QKV_WEIGHT(weight_offset, 0, num_kv_head_replicas_);
     }
@@ -1423,7 +1465,9 @@ void QKVParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                           weight_scale_,
                           weight_scale_is_loaded_,
                           weight_offset_,
-                          weight_offset_is_loaded_});
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 #if defined(USE_MUSA)
   const bool is_block_fp8 = musa::is_block_fp8_quant(quant_args_);
   if (is_block_fp8) {
@@ -1474,6 +1518,9 @@ void QKVParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     LOAD_SHARDED_WEIGHT(quant_bias, 0);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_SHARDED_WEIGHT(weight_scale, 0);
+    if (smooth_.defined()) {
+      LOAD_WEIGHT(smooth);
+    }
     if (weight_offset_.defined()) {
       LOAD_SHARDED_WEIGHT(weight_offset, 0);
     }
@@ -1707,13 +1754,16 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
         << "weight_scale is required for w8a8_dynamic quant matmul.";
 #if defined(USE_MLU) || defined(USE_DCU)
     CHECK(weight_is_loaded_) << "Missing compressed-tensors weight";
-    output = scaled_w8a8_linear(input,
-                                weight_,
-                                weight_scale.value(),
-                                /*smooth=*/torch::Tensor(),
-                                bias,
-                                output_dtype_,
-                                linear_extra_args_);
+    CHECK(!quant_args_.preserve_smooth() || smooth_is_loaded_)
+        << "Missing compressed-tensors smooth";
+    output = scaled_w8a8_linear(
+        input,
+        weight_,
+        weight_scale.value(),
+        smooth_.defined() && smooth_is_loaded_ ? smooth_ : torch::Tensor(),
+        bias,
+        output_dtype_,
+        linear_extra_args_);
 #elif defined(USE_NPU)
     // FC1 fused int8 MMRS: per-token quantize the (padded) activation, then let
     // torch_npu fuse matmul + reduce_scatter. Numerically equivalent to the
@@ -1917,7 +1967,9 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
                           weight_scale_,
                           weight_scale_is_loaded_,
                           weight_offset_,
-                          weight_offset_is_loaded_});
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
   // If quant_args_ indicates SmoothQuant, load qweight; otherwise, load
   // normal weight.
@@ -1961,6 +2013,9 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_SHARDED_WEIGHT(weight, 1);
     LOAD_WEIGHT(weight_scale);
+    if (smooth_.defined()) {
+      LOAD_SHARDED_WEIGHT(smooth, 0);
+    }
     if (weight_offset_.defined()) {
       LOAD_WEIGHT(weight_offset);
     }
@@ -2059,12 +2114,15 @@ torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input) {
         << "weight_scale is required for w8a8_dynamic quant matmul.";
 #if defined(USE_MLU) || defined(USE_DCU)
     CHECK(weight_is_loaded_) << "Missing compressed-tensors weight";
-    return scaled_w8a8_linear(input,
-                              weight_,
-                              weight_scale.value(),
-                              /*smooth=*/torch::Tensor(),
-                              bias,
-                              input.scalar_type());
+    CHECK(!quant_args_.preserve_smooth() || smooth_is_loaded_)
+        << "Missing compressed-tensors smooth";
+    return scaled_w8a8_linear(
+        input,
+        weight_,
+        weight_scale.value(),
+        smooth_.defined() && smooth_is_loaded_ ? smooth_ : torch::Tensor(),
+        bias,
+        input.scalar_type());
 #elif defined(USE_NPU)
     return npu_w8a8_dynamic_linear_forward(
         input, weight_, weight_scale.value(), bias, input.scalar_type());
@@ -2132,7 +2190,9 @@ void ReplicatedLinearImpl::load_state_dict(const StateDict& state_dict) {
                           weight_scale_,
                           weight_scale_is_loaded_,
                           weight_offset_,
-                          weight_offset_is_loaded_});
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
 #if defined(USE_MUSA)
   musa::check_replicated_weight_supported(state_dict);
@@ -2185,6 +2245,9 @@ void ReplicatedLinearImpl::load_state_dict(const StateDict& state_dict) {
     LOAD_WEIGHT(quant_bias);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_WEIGHT(weight_scale);
+    if (smooth_.defined()) {
+      LOAD_WEIGHT(smooth);
+    }
     if (weight_offset_.defined()) {
       LOAD_WEIGHT(weight_offset);
     }

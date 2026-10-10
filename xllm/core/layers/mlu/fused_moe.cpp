@@ -17,7 +17,9 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "common/global_flags.h"
@@ -34,6 +36,42 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+
+namespace {
+
+QuantArgs resolve_expert_args(const QuantArgs& args,
+                              const std::string& prefix,
+                              int64_t num_experts) {
+  if (args.compressed_groups().empty()) {
+    return args;
+  }
+  CHECK(!prefix.empty() ||
+        std::all_of(args.compressed_groups().begin(),
+                    args.compressed_groups().end(),
+                    [](const CompressedQuantGroup& group) {
+                      return group.targets ==
+                             std::vector<std::string>{"Linear"};
+                    }))
+      << "Compressed-tensors MoE requires a module prefix";
+  const auto resolved = args.for_module(prefix + ".experts.0.gate_proj");
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    for (const std::string& projection :
+         {"gate_proj", "up_proj", "down_proj"}) {
+      const std::string module =
+          prefix + ".experts." + std::to_string(expert) + "." + projection;
+      const auto local = args.for_module(module);
+      CHECK(local.quant_method() == resolved.quant_method() &&
+            local.bits() == resolved.bits() &&
+            local.group_size() == resolved.group_size() &&
+            local.preserve_smooth() == resolved.preserve_smooth())
+          << "Incompatible compressed-tensors schemes within fused MoE: "
+          << module;
+    }
+  }
+  return resolved;
+}
+
+}  // namespace
 
 FusedMoEImpl::FusedMoEImpl(const ModelContext& context,
                            const FusedMoEArgs& moe_args)
@@ -61,11 +99,14 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
       is_gated_(moe_args.is_gated),
       enable_result_reduction_(moe_args.enable_result_reduction),
       hidden_act_(model_args.hidden_act()),
-      swiglu_limit_(model_args.model_type() == "deepseek_v4"
+      swiglu_limit_(model_args.model_type() == "deepseek_v4" ||
+                            model_args.model_type() == "glm5_next"
                         ? std::make_optional(model_args.swiglu_limit())
                         : std::nullopt),
       use_hash_(moe_args.use_hash),
-      quant_args_(quant_args),
+      quant_args_(resolve_expert_args(quant_args,
+                                      moe_args.module_prefix,
+                                      model_args.n_routed_experts())),
       parallel_args_(parallel_args),
       options_(options),
       device_(options.device()) {
@@ -87,25 +128,20 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     tp_pg_ = parallel_args.moe_tp_group_;
   }
 
-  moe_weight_bits_ = quant_args.moe_weight_bits();
+  moe_weight_bits_ = quant_args_.moe_weight_bits();
   weight_pack_factor_ = (moe_weight_bits_ == 4 ? 2 : 1);
 
   // A8 quantization supports SmoothQuant and compressed-tensors with
   // dynamic A8 activations and expert W8/W4 weights.
-  if (!quant_args.quant_method().empty()) {
-    if ((quant_args.quant_method() != kQuantMethodSmoothquant &&
-         !quant_args.is_compressed_tensors_w8a8_dynamic()) ||
-        quant_args.bits() != 8 || !quant_args.activation_dynamic() ||
-        (moe_weight_bits_ != 8 && moe_weight_bits_ != 4)) {
-      LOG(FATAL)
-          << "FusedMoE only supports the current SmoothQuant MoE path with "
-             "non-expert bits=8, dynamic activation, and expert weight bits "
-             "in {4,8}. "
-          << "Got quant_method=" << quant_args.quant_method()
-          << ", bits=" << quant_args.bits()
-          << ", moe_weight_bits=" << moe_weight_bits_
-          << ", activation_dynamic=" << quant_args.activation_dynamic();
-    }
+  if (!quant_args_.quant_method().empty()) {
+    const bool compressed_quant =
+        quant_args_.is_compressed_tensors_w8a8_dynamic();
+    CHECK((quant_args_.quant_method() == kQuantMethodSmoothquant ||
+           compressed_quant) &&
+          (compressed_quant || quant_args_.bits() == 8) &&
+          quant_args_.activation_dynamic() &&
+          (moe_weight_bits_ == 8 || moe_weight_bits_ == 4))
+        << "FusedMoE requires dynamic A8 with W8 or W4 weights";
     use_a8_quant_ = true;
   } else {
     use_a8_quant_ = false;
@@ -262,7 +298,8 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     // Note: We do not check enable_deep_ep_ here, since smooth quantization
     // information may be needed even when deep EP mode is disabled. This allows
     // retrieving quantization parameters for any subset of experts as required.
-    if (!quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    if (!quant_args_.is_compressed_tensors_w8a8_dynamic() ||
+        quant_args_.preserve_smooth()) {
       input_smooth_ = register_parameter(
           "input_smooth",
           torch::empty({num_total_experts_, hidden_size_}, fp_option),
@@ -283,7 +320,8 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
                   fp_option)
             : torch::empty({num_experts_per_rank_, hidden_size_}, fp_option),
         false);
-    if (!quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    if (!quant_args_.is_compressed_tensors_w8a8_dynamic() ||
+        quant_args_.preserve_smooth()) {
       act_smooth_ = register_parameter(
           "act_smooth",
           torch::empty({num_experts_per_rank_, local_intermediate_size},
@@ -594,6 +632,64 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
       hidden_states, enable_all2all_communication, std::nullopt);
 }
 
+namespace {
+
+void check_ct_expert(const StateDict& projection_dict,
+                     int64_t in_features,
+                     int64_t out_features,
+                     int64_t group_size) {
+  const std::string module(projection_dict.prefix());
+  torch::Tensor weight = projection_dict.get_tensor("weight");
+  CHECK(!weight.defined() || weight.dim() == 2)
+      << "W4A8 expert packed weight must be 2D: " << module;
+  torch::Tensor scale = projection_dict.get_tensor("weight_scale");
+  if (scale.defined()) {
+    CHECK(scale.sizes() ==
+          torch::IntArrayRef({out_features, in_features / group_size}))
+        << "W4A8 expert group scale shape mismatch: " << module;
+    CHECK(scale.is_floating_point())
+        << "W4A8 scale must be floating point: " << module;
+  }
+}
+
+// Keep both projections on CPU until all shards arrive and fusion is validated.
+void load_ct_smooth(const StateDict& state_dict,
+                    torch::Tensor& smooth,
+                    std::vector<torch::Tensor>& tensors,
+                    bool& is_loaded) {
+  if (is_loaded) {
+    return;
+  }
+  const int64_t num_experts = smooth.size(0);
+  std::vector<std::string> prefixes;
+  prefixes.reserve(num_experts * 2);
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    prefixes.emplace_back(std::to_string(expert) + ".gate_proj.");
+    prefixes.emplace_back(std::to_string(expert) + ".up_proj.");
+  }
+  if (!weight::load_tensor_list(state_dict,
+                                prefixes,
+                                "smooth",
+                                /*dim=*/-1,
+                                /*rank=*/0,
+                                /*world_size=*/1,
+                                tensors)) {
+    return;
+  }
+  const auto paired =
+      torch::stack(tensors).view({num_experts, 2, smooth.size(1)});
+  const auto gate_smooth = paired.select(/*dim=*/1, /*index=*/0);
+  CHECK(torch::allclose(
+      gate_smooth.to(torch::kFloat32),
+      paired.select(/*dim=*/1, /*index=*/1).to(torch::kFloat32)))
+      << "gate_proj and up_proj smooth must match: " << state_dict.prefix();
+  smooth.copy_(gate_smooth);
+  is_loaded = true;
+  tensors.clear();
+}
+
+}  // namespace
+
 void FusedMoEImpl::load_ct_experts(const StateDict& state_dict) {
   if (state_dict.size() == 0) {
     return;
@@ -603,6 +699,9 @@ void FusedMoEImpl::load_ct_experts(const StateDict& state_dict) {
   const int64_t world_size = tp_pg_->world_size();
   const int64_t start_expert_id = start_expert_id_;
   const int64_t num_experts_per_rank = num_experts_per_rank_;
+  const bool w4 = moe_weight_bits_ == 4;
+  const int64_t intermediate_size =
+      w2_.size(2) * weight_pack_factor_ * world_size;
   std::vector<std::string> prefixes = {"gate_proj.", "up_proj."};
   for (int64_t expert = 0; expert < num_total_experts_; ++expert) {
     const std::string prefix = std::to_string(expert) + ".";
@@ -616,24 +715,39 @@ void FusedMoEImpl::load_ct_experts(const StateDict& state_dict) {
       std::string module =
           std::string(state_dict.prefix()) + prefix + projection;
       module.pop_back();
-      CHECK(!expert_dict.has(projection + "smooth"))
-          << "Compressed-tensors INT8 does not support smooth tensors: "
-          << module << ".smooth";
-      check_ct_scale(expert_dict.get_tensor(projection + "weight_scale"),
-                     module);
-      CHECK(!quant_args_.should_ignore_module(module))
-          << "MLU compressed-tensors MoE requires all experts quantized: "
-          << module;
       torch::Tensor weight = expert_dict.get_tensor(projection + "weight");
       CHECK(!weight.defined() || weight.scalar_type() == torch::kInt8)
           << "Compressed-tensors expert weight must be INT8: " << module;
+      const bool down = projection == "down_proj.";
+      if (w4) {
+        check_ct_expert(expert_dict.get_dict_with_prefix(projection),
+                        down ? intermediate_size : hidden_size_,
+                        down ? hidden_size_ : intermediate_size,
+                        quant_args_.group_size());
+      } else {
+        check_ct_scale(expert_dict.get_tensor(projection + "weight_scale"),
+                       module);
+      }
+      if (quant_args_.preserve_smooth()) {
+        const auto smooth = expert_dict.get_tensor(projection + "smooth");
+        CHECK(!smooth.defined() ||
+              (smooth.is_floating_point() && smooth.dim() == 1 &&
+               smooth.numel() == (down ? intermediate_size : hidden_size_)))
+            << "Compressed-tensors expert smooth shape or dtype mismatch: "
+            << module;
+      }
     }
   }
 
   LOAD_MOE_FUSED_WEIGHT("weight", w1, w3, w13);
   LOAD_MOE_FUSED_WEIGHT("weight_scale", w1_scale, w3_scale, w13_scale);
   LOAD_MOE_WEIGHT("down_proj.", "weight", w2, 1);
-  LOAD_MOE_WEIGHT("down_proj.", "weight_scale", w2_scale, -1);
+  LOAD_MOE_WEIGHT("down_proj.", "weight_scale", w2_scale, w4 ? 1 : -1);
+  if (quant_args_.preserve_smooth()) {
+    load_ct_smooth(
+        state_dict, input_smooth_, input_smooth_list_, input_smooth_is_loaded_);
+    LOAD_MOE_WEIGHT("down_proj.", "smooth", act_smooth, 0);
+  }
 }
 
 void FusedMoEImpl::load_experts(const StateDict& state_dict) {
@@ -678,6 +792,10 @@ void FusedMoEImpl::verify_loaded_weights() const {
   if (quant_args_.is_compressed_tensors_w8a8_dynamic()) {
     CHECK(w13_scale_is_loaded_ && w2_scale_is_loaded_)
         << "Missing compressed-tensors expert weight scales";
+    if (quant_args_.preserve_smooth()) {
+      CHECK(input_smooth_is_loaded_ && act_smooth_is_loaded_)
+          << "Missing compressed-tensors expert smooth tensors";
+    }
     CHECK(w13_is_loaded_)
         << "Compressed-tensors expert gate_proj/up_proj weight was not "
            "fully loaded.";

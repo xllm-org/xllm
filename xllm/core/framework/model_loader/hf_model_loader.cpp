@@ -31,6 +31,8 @@ limitations under the License.
 #include <filesystem>
 #include <limits>
 #include <optional>
+#include <regex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -69,20 +71,6 @@ bool is_compressed_tensors_fp8_scheme(const nlohmann::json& config) {
          num_bits_it->get<int64_t>() == 8;
 }
 
-bool is_compressed_tensors_int8_scheme(const nlohmann::json& config,
-                                       bool expected_dynamic) {
-  auto type_it = config.find("type");
-  auto num_bits_it = config.find("num_bits");
-  auto dynamic_it = config.find("dynamic");
-  const bool dynamic = dynamic_it != config.end() && !dynamic_it->is_null()
-                           ? dynamic_it->get<bool>()
-                           : false;
-  return type_it != config.end() && !type_it->is_null() &&
-         num_bits_it != config.end() && !num_bits_it->is_null() &&
-         boost::iequals(type_it->get<std::string>(), "int") &&
-         num_bits_it->get<int64_t>() == 8 && dynamic == expected_dynamic;
-}
-
 const nlohmann::json* get_compressed_tensors_config(
     const JsonReader& reader,
     const std::string& config_key) {
@@ -102,42 +90,94 @@ const nlohmann::json* get_compressed_tensors_config(
   return quant_config;
 }
 
-bool load_ct_w8a8_dynamic_config(const nlohmann::json& config,
-                                 const nlohmann::json& group,
-                                 QuantArgs& args) {
-  const auto& weights = group.at("weights");
-  const auto& activations = group.at("input_activations");
-  if (weights.value("preserve_smooth", false) ||
-      activations.value("preserve_smooth", false)) {
-    LOG(ERROR) << "Compressed-tensors INT8 does not support preserve_smooth";
-    return false;
-  }
-  // Older checkpoints omit these fields. Keep their existing symmetric,
-  // channel-weight / token-activation interpretation, but reject explicit
-  // schemes that cannot be represented by the shared W8A8 loading path.
-  if (config.value("format", "int-quantized") != "int-quantized" ||
-      config.at("config_groups").size() != 1 ||
-      !weights.value("symmetric", true) ||
-      !activations.value("symmetric", true) ||
-      weights.value("strategy", "channel") != "channel" ||
-      activations.value("strategy", "token") != "token" ||
-      group.value("targets", std::vector<std::string>{"Linear"}) !=
-          std::vector<std::string>{"Linear"} ||
-      (group.contains("output_activations") &&
-       !group.at("output_activations").is_null()) ||
-      (config.contains("kv_cache_scheme") &&
+bool is_compressed_int_scheme(const nlohmann::json& scheme,
+                              int64_t expected_bits,
+                              bool expected_dynamic) {
+  const auto type_it = scheme.find("type");
+  const auto bits_it = scheme.find("num_bits");
+  const auto dynamic_it = scheme.find("dynamic");
+  const bool dynamic = dynamic_it != scheme.end() && !dynamic_it->is_null() &&
+                       dynamic_it->get<bool>();
+  return type_it != scheme.end() && type_it->is_string() &&
+         boost::iequals(type_it->get<std::string>(), "int") &&
+         bits_it != scheme.end() && bits_it->get<int64_t>() == expected_bits &&
+         dynamic == expected_dynamic;
+}
+
+bool load_ct_int_config(const nlohmann::json& config, QuantArgs& args) {
+  if ((config.contains("kv_cache_scheme") &&
        !config.at("kv_cache_scheme").is_null()) ||
       (config.contains("transform_config") &&
        !config.at("transform_config").is_null() &&
        !config.at("transform_config").empty())) {
-    LOG(ERROR)
-        << "Compressed-tensors INT8 requires one symmetric channel/token "
-           "W8A8 Linear group without output, KV-cache or transform "
-           "quantization";
+    LOG(ERROR) << "Unsupported compressed-tensors KV-cache or transform scheme";
     return false;
   }
+  std::vector<CompressedQuantGroup> groups;
+  groups.reserve(config.at("config_groups").size());
+  for (const auto& [name, group] : config.at("config_groups").items()) {
+    if (!group.is_object() || !group.contains("weights") ||
+        !group.at("weights").is_object() ||
+        !group.contains("input_activations") ||
+        !group.at("input_activations").is_object()) {
+      LOG(ERROR) << "Invalid compressed-tensors group: " << name;
+      return false;
+    }
+    const auto& weights = group.at("weights");
+    const auto& activations = group.at("input_activations");
+    CompressedQuantGroup scheme;
+    scheme.bits = weights.value("num_bits", 0);
+    scheme.preserve_smooth = weights.value("preserve_smooth", false);
+    const bool w4 = scheme.bits == 4;
+    const std::string format =
+        group.value("format", config.value("format", "int-quantized"));
+    if ((scheme.bits != 4 && scheme.bits != 8) ||
+        !is_compressed_int_scheme(weights, scheme.bits, false) ||
+        !is_compressed_int_scheme(activations, 8, true) ||
+        format != (w4 ? "int4-le-pack-quantized" : "int-quantized") ||
+        !weights.value("symmetric", true) ||
+        !activations.value("symmetric", true) ||
+        weights.value("strategy", "channel") != (w4 ? "group" : "channel") ||
+        activations.value("strategy", "token") != "token" ||
+        activations.value("preserve_smooth", false) ||
+        (group.contains("output_activations") &&
+         !group.at("output_activations").is_null())) {
+      LOG(ERROR) << "Unsupported compressed-tensors integer scheme: " << name;
+      return false;
+    }
+    if (w4) {
+      if (!weights.contains("group_size") || weights.at("group_size") != 128) {
+        LOG(ERROR) << "Compressed-tensors W4A8 requires group_size=128: "
+                   << name;
+        return false;
+      }
+      scheme.group_size = 128;
+    }
+    scheme.targets = group.value("targets", std::vector<std::string>{"Linear"});
+    if (scheme.targets.empty()) {
+      LOG(ERROR) << "Empty compressed-tensors targets: " << name;
+      return false;
+    }
+    for (const auto& target : scheme.targets) {
+      if (target.rfind("re:", 0) != 0) {
+        continue;
+      }
+      try {
+        const std::regex pattern(target.substr(3));
+      } catch (const std::regex_error& error) {
+        LOG(ERROR) << "Invalid compressed-tensors target: " << target << ": "
+                   << error.what();
+        return false;
+      }
+    }
+    groups.emplace_back(std::move(scheme));
+  }
+  if (groups.empty()) {
+    LOG(ERROR) << "Compressed-tensors config_groups is empty";
+    return false;
+  }
+  args.compressed_groups() = std::move(groups);
   args.bits() = 8;
-  args.moe_weight_bits() = 8;
   args.is_sym() = true;
   args.activation_dynamic() = true;
   args.is_compressed_tensors_w8a8_dynamic() = true;
@@ -155,6 +195,10 @@ bool load_ct_quant_config(const nlohmann::json& config, QuantArgs& quant_args) {
     return false;
   }
 
+  if (config.value("format", "int-quantized") == "mixed-precision") {
+    return load_ct_int_config(config, quant_args);
+  }
+
   for (const auto& [group_name, group] : config_groups_it->items()) {
     if (!group.is_object()) {
       continue;
@@ -169,11 +213,10 @@ bool load_ct_quant_config(const nlohmann::json& config, QuantArgs& quant_args) {
 
     if (!is_compressed_tensors_fp8_scheme(*weights_it) ||
         !is_compressed_tensors_fp8_scheme(*input_activations_it)) {
-      if (is_compressed_tensors_int8_scheme(*weights_it,
-                                            /*expected_dynamic=*/false) &&
-          is_compressed_tensors_int8_scheme(*input_activations_it,
-                                            /*expected_dynamic=*/true)) {
-        return load_ct_w8a8_dynamic_config(config, group, quant_args);
+      if ((is_compressed_int_scheme(*weights_it, 8, false) ||
+           is_compressed_int_scheme(*weights_it, 4, false)) &&
+          is_compressed_int_scheme(*input_activations_it, 8, true)) {
+        return load_ct_int_config(config, quant_args);
       }
       continue;
     }

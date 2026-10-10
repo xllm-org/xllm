@@ -61,8 +61,18 @@ static const std::string kQuantMethodFp8 = "fp8";
 static const std::string kQuantMethodSmoothquant = "smoothquant";
 static const std::string kQuantMethodAscendInt4 = "ascend_int4";
 static const std::string kQuantMethodAscendInt8 = "ascend_int8";
+static const std::string kQuantMethodW8a8Dynamic = "w8a8_dynamic";
+static const std::string kQuantMethodW4a8Dynamic = "w4a8_dynamic";
 
-struct QuantArgs {
+struct CompressedQuantGroup {
+  std::vector<std::string> targets;
+  int64_t bits = 8;
+  int64_t group_size = 0;
+  bool preserve_smooth = false;
+};
+
+class QuantArgs final {
+ public:
   using QuantDescs = std::unordered_map<std::string, std::string>;
 
   PROPERTY(std::string, quant_method);
@@ -71,7 +81,7 @@ struct QuantArgs {
   PROPERTY(std::string, torch_dtype) = "bfloat16";
   // quantization bits
   PROPERTY(int64_t, bits) = 0;
-  // MoE routed experts weight bits for DeepSeek-style SmoothQuant mixed W4A8.
+  // Weight bits for routed MoE experts.
   PROPERTY(int64_t, moe_weight_bits) = 8;
   // Whether per-group quantization applies only to routed experts.
   PROPERTY(bool, only_expert_per_group) = false;
@@ -88,9 +98,13 @@ struct QuantArgs {
   // whether activation scheme is dynamic
   PROPERTY(bool, activation_dynamic) = true;
 
-  // whether weights use compressed-tensors W8A8 dynamic key naming convention
+  // Whether integer weights with dynamic A8 use compressed-tensors keys
   // (weight/weight_scale instead of qweight/per_channel_scale).
   PROPERTY(bool, is_compressed_tensors_w8a8_dynamic) = false;
+
+  // Smooth is a per-module checkpoint property, independent of weight bits.
+  PROPERTY(bool, preserve_smooth) = false;
+  PROPERTY(std::vector<CompressedQuantGroup>, compressed_groups) = {};
 
   // FP8 format : e4m3, e5m2
   PROPERTY(std::string, fmt) = "e4m3";
@@ -117,27 +131,91 @@ struct QuantArgs {
   // ── Module-level helpers ────────────────────────────────────────────────
 
   bool should_ignore_module(const std::string& module_name) const {
-    for (const auto& pattern : ignored_modules()) {
-      if (pattern == module_name) {
-        return true;
+    return std::any_of(ignored_modules().begin(),
+                       ignored_modules().end(),
+                       [&module_name](const std::string& target) {
+                         return matches_module_target(module_name,
+                                                      target,
+                                                      /*allow_glob=*/false);
+                       });
+  }
+
+  static bool matches_module_target(const std::string& module_name,
+                                    const std::string& target,
+                                    bool allow_glob = true) {
+    if (target == module_name) {
+      return true;
+    }
+    if (target.size() > 3 && target.rfind("re:", 0) == 0) {
+      try {
+        return std::regex_match(module_name, std::regex(target.substr(3)));
+      } catch (const std::regex_error&) {
+        return false;
       }
-      if (pattern.size() > 3 && pattern.rfind("re:", 0) == 0) {
-        try {
-          if (std::regex_match(module_name, std::regex(pattern.substr(3)))) {
-            return true;
-          }
-        } catch (const std::regex_error&) {
-        }
-      }
+    }
+    const size_t glob_pos = target.find('*');
+    if (allow_glob && glob_pos != std::string::npos) {
+      return module_name.starts_with(target.substr(0, glob_pos));
     }
     return false;
   }
 
+  static bool matches_any_target(const std::string& module_name,
+                                 const std::vector<std::string>& targets) {
+    return std::any_of(targets.begin(),
+                       targets.end(),
+                       [&module_name](const std::string& target) {
+                         return matches_module_target(module_name, target);
+                       });
+  }
+
+  std::optional<CompressedQuantGroup> module_quant_scheme(
+      const std::string& module_name) const {
+    if (should_ignore_module(module_name)) {
+      return std::nullopt;
+    }
+    std::optional<CompressedQuantGroup> resolved;
+    for (const auto& group : compressed_groups()) {
+      const bool matches =
+          std::find(group.targets.begin(), group.targets.end(), "Linear") !=
+              group.targets.end() ||
+          matches_any_target(module_name, group.targets);
+      if (!matches) {
+        continue;
+      }
+      CHECK(!resolved.has_value() ||
+            (resolved->bits == group.bits &&
+             resolved->group_size == group.group_size &&
+             resolved->preserve_smooth == group.preserve_smooth))
+          << "Conflicting compressed-tensors groups for " << module_name;
+      resolved = group;
+    }
+    return resolved;
+  }
+
+  std::optional<std::string> module_quant_method(
+      const std::string& module_name) const {
+    const auto scheme = module_quant_scheme(module_name);
+    if (!scheme.has_value()) {
+      return std::nullopt;
+    }
+    return scheme->bits == 4 ? kQuantMethodW4a8Dynamic
+                             : kQuantMethodW8a8Dynamic;
+  }
+
   QuantArgs for_module(const std::string& module_name) const {
     QuantArgs local_args = *this;
-    if (should_ignore_module(module_name)) {
+    const auto scheme = module_quant_scheme(module_name);
+    if (scheme.has_value()) {
+      local_args.bits() = scheme->bits;
+      local_args.moe_weight_bits() = scheme->bits;
+      local_args.group_size() = scheme->group_size;
+      local_args.preserve_smooth() = scheme->preserve_smooth;
+    } else if (!compressed_groups().empty() ||
+               should_ignore_module(module_name)) {
       local_args.quant_method().clear();
       local_args.is_compressed_tensors_w8a8_dynamic() = false;
+      local_args.preserve_smooth() = false;
     }
     return local_args;
   }
@@ -316,6 +394,8 @@ inline std::ostream& operator<<(std::ostream& os, const QuantArgs& args) {
   os << ", desc_act: " << args.desc_act();
   os << ", is_sym: " << args.is_sym();
   os << ", activation_dynamic: " << args.activation_dynamic();
+  os << ", preserve_smooth: " << args.preserve_smooth();
+  os << ", compressed_groups: " << args.compressed_groups().size();
   os << ", fmt: " << args.fmt();
   os << ", ignored_modules: " << args.ignored_modules().size();
   os << ", quant_version: " << args.quant_version();
