@@ -159,6 +159,7 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
   // Returns true when validation must use chunked-prefill to avoid the
   // FlashInfer batch-decode read-before-write race on the bonus token.
   bool use_chunked_prefill_spec_verify_path() const;
+  bool uses_speculative_linear_state_checkpoints() const;
   bool uses_embedded_eagle3_draft() const;
   // Multiaxis RoPE positions can include a prompt-dependent offset and do not
   // identify the corresponding KV cache length.

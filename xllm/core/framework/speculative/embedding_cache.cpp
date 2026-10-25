@@ -289,19 +289,19 @@ std::vector<EmbeddingCache::DecodeState> EmbeddingCache::read_decode_states(
 
 std::vector<int32_t> EmbeddingCache::read_accepted_prefix_lengths(
     const std::vector<int32_t>& ids,
-    const std::vector<std::string>& request_ids) const {
+    const std::vector<std::string>& request_ids,
+    int32_t max_accepted_tokens) const {
   CHECK(!ids.empty()) << "decode ids should not be empty";
   CHECK(request_ids.empty() || request_ids.size() == ids.size())
       << "embedding_id / request_id count mismatch";
+  CHECK_GT(max_accepted_tokens, 0)
+      << "speculative checkpoint capacity must be positive";
   std::vector<int32_t> accepted_prefix_lengths;
   accepted_prefix_lengths.reserve(ids.size());
   for (int32_t i = 0; i < static_cast<int32_t>(ids.size()); ++i) {
     const DecodeState& state = get_tail(ids[i]);
-    // A slot that never received target output, or one whose request_id no
-    // longer matches (embedding_id recycled by a later request), carries no
-    // usable correction offset — fall back to a single accepted token so the
-    // previous request's offset cannot leak into this sequence's spec-verify
-    // metadata. An empty request_ids skips the request_id match.
+    // A recycled or uninitialized slot must not reuse the previous request's
+    // offset.
     int32_t accepted_length = 1;
     if (state.valid &&
         (request_ids.empty() || state.request_id == request_ids[i])) {
@@ -309,6 +309,11 @@ std::vector<int32_t> EmbeddingCache::read_accepted_prefix_lengths(
           << "decode entry missing correction token id";
       accepted_length = state.correction_position_offset + 1;
     }
+    CHECK_GE(accepted_length, 1) << "accepted prefix length must be positive";
+    CHECK_LE(accepted_length, max_accepted_tokens)
+        << "accepted prefix length exceeds speculative checkpoint capacity, "
+        << "accepted_length=" << accepted_length
+        << ", checkpoint_capacity=" << max_accepted_tokens;
     accepted_prefix_lengths.emplace_back(accepted_length);
   }
   return accepted_prefix_lengths;

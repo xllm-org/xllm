@@ -1000,7 +1000,8 @@ void DFlashWorkerImpl::prepare_validate_inputs(
         !input.input_params.embedding.embedding_ids.empty()) {
       accepted_prefix_lengths = embedding_cache_->read_accepted_prefix_lengths(
           input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
+          input.input_params.embedding.request_ids,
+          options_.num_speculative_tokens() + 1);
     }
     input_params.num_accepted_tokens_host.assign(
         accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());

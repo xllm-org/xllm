@@ -1147,7 +1147,24 @@ template <typename TargetInput>
 bool MTPWorkerImpl<TargetInput>::use_chunked_prefill_spec_verify_path() const {
   return target_spec_verify_mode_ ==
              mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
-         supports_explicit_spec_verify_replay_update();
+         supports_explicit_spec_verify_replay_update() ||
+         uses_speculative_linear_state_checkpoints();
+}
+
+template <typename TargetInput>
+bool MTPWorkerImpl<TargetInput>::uses_speculative_linear_state_checkpoints()
+    const {
+#if defined(USE_NPU) || defined(USE_MLU)
+  if (impl_ == nullptr ||
+      impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
+    return false;
+  }
+  const std::string& model_type = impl_->context_.get_model_args().model_type();
+  return is_qwen3_5_target_model_type(model_type) ||
+         is_glm5_next_target_model_type(model_type);
+#else
+  return false;
+#endif
 }
 
 template <typename TargetInput>
@@ -3115,7 +3132,8 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
         !input.input_params.embedding.embedding_ids.empty()) {
       accepted_prefix_lengths = embedding_cache_->read_accepted_prefix_lengths(
           input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
+          input.input_params.embedding.request_ids,
+          options_.num_speculative_tokens() + 1);
     }
     // num_accepted_tokens must stay the true accepted count. The Qwen3.5 GDN
     // spec-verify kernel uses it to select which recurrent/conv checkpoint to
@@ -3291,10 +3309,12 @@ bool MTPWorkerImpl<TargetInput>::
       block_tables.size(0) != 1) {
     return false;
   }
+  const int64_t spec_width = options_.num_speculative_tokens() + 1;
   const std::vector<int32_t> accepted_prefix_lengths =
       embedding_cache_->read_accepted_prefix_lengths(
           input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
+          input.input_params.embedding.request_ids,
+          spec_width);
   if (accepted_prefix_lengths.size() != 1) {
     return false;
   }
@@ -3304,7 +3324,6 @@ bool MTPWorkerImpl<TargetInput>::
   if (kv_seq_lens.size() != 1) {
     return false;
   }
-  const int64_t spec_width = options_.num_speculative_tokens() + 1;
   const int64_t base_kv_seq_len = kv_seq_lens.front();
   const int64_t spec_verify_max_kv_seq_len = base_kv_seq_len + spec_width - 1;
   const SpecVerifyGraphTaskSignal signal{

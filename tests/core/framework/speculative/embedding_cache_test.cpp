@@ -193,37 +193,44 @@ TEST(EmbeddingCacheTest, RequestMismatchMaterializesMissingState) {
   EXPECT_FALSE(states[0].embedding.defined());
 }
 
-TEST(EmbeddingCacheTest, ReadAcceptedPrefixLengthsRejectsStaleRequest) {
+TEST(EmbeddingCacheTest, ReadAcceptedPrefixLengthsValidatesRequestAndCapacity) {
   EmbeddingCache cache(/*total_nums=*/2);
   std::vector<int32_t> ids = {0, 1};
   std::vector<std::string> request_ids = {"req_0", "req_1"};
   torch::Tensor accepted_tokens =
-      torch::tensor({{11, 12, 13}, {21, -1, -1}}, torch::kInt);
+      torch::tensor({{11, 12, 13}, {21, 22, -1}}, torch::kInt);
   torch::Tensor accepted_embeddings =
       torch::tensor({{{1.0f, 1.1f}, {1.2f, 1.3f}, {1.4f, 1.5f}},
                      {{2.0f, 2.1f}, {2.2f, 2.3f}, {2.4f, 2.5f}}});
 
-  // Only embedding_id 0 receives target output; id 1 stays uninitialized.
-  cache.write_target_context({0},
-                             {"req_0"},
-                             accepted_tokens.slice(/*dim=*/0, 0, 1),
-                             accepted_embeddings.slice(/*dim=*/0, 0, 1),
+  cache.write_target_context(ids,
+                             request_ids,
+                             accepted_tokens,
+                             accepted_embeddings,
                              /*num_speculative_tokens=*/2);
 
-  // Matching request_id returns correction_position_offset + 1; an
-  // uninitialized entry returns 1.
   std::vector<int32_t> lengths =
-      cache.read_accepted_prefix_lengths(ids, request_ids);
+      cache.read_accepted_prefix_lengths(ids,
+                                         request_ids,
+                                         /*max_accepted_tokens=*/3);
   ASSERT_EQ(lengths.size(), ids.size());
   EXPECT_EQ(lengths[0], 3);
-  EXPECT_EQ(lengths[1], 1);
+  EXPECT_EQ(lengths[1], 2);
 
   // A preempted-and-reused embedding_id now owned by a fresh request must not
   // leak the previous request's correction offset.
   std::vector<int32_t> reused =
-      cache.read_accepted_prefix_lengths({0}, {"new_req"});
+      cache.read_accepted_prefix_lengths({0},
+                                         {"new_req"},
+                                         /*max_accepted_tokens=*/3);
   ASSERT_EQ(reused.size(), 1u);
   EXPECT_EQ(reused[0], 1);
+
+  EXPECT_DEATH(
+      (void)cache.read_accepted_prefix_lengths({0},
+                                               {"req_0"},
+                                               /*max_accepted_tokens=*/2),
+      "accepted prefix length exceeds speculative checkpoint capacity");
 }
 
 TEST(EmbeddingCacheTest, WriteMtpBootstrapContextStoresExactDecodeState) {

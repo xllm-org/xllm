@@ -34,7 +34,9 @@ from xllm.python.attention.backend import (
     LayerCache,
     MlaIndexContext,
     MlaPreprocessContext,
+    build_speculative_ssm_state_indices,
     has_rope_dim,
+    linear_state_checkpoint_stride,
     resolve_linear_state_io_indices,
 )
 from xllm.python.attention.expanded_decode_metadata import (
@@ -256,7 +258,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._use_fia_v2 = _HAS_FIA_V2
         self._is_mla = is_mla
         self._uses_sparse_mla = False
-        self._kda_verify_width = num_decoding_tokens
+        self._kda_checkpoint_stride: int | None = None
+        self._kda_prepared_ssm_state_indices: torch.Tensor | None = None
+        self._kda_query_start_locs: dict[tuple[int, int, torch.device], torch.Tensor] = {}
 
         self._kv_caches: list[LayerCache] = []
         self._kpool_cache_triton_compatible: tuple[bool, ...] = ()
@@ -373,6 +377,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._kpool_cache_triton_compatible = tuple(_is_compact_kpool_cache_compatible(cache) for cache in kv_caches)
         self._page_size = page_sizes.pop()
         self._num_kv_blocks = num_kv_blocks.pop()
+        checkpoint_strides = {
+            linear_state_checkpoint_stride(cache.conv, cache.ssm)
+            for cache in kv_caches
+            if cache.conv is not None and cache.ssm is not None
+        }
+        if len(checkpoint_strides) > 1:
+            raise RuntimeError("linear-attention layers use inconsistent checkpoint capacities")
+        self._kda_checkpoint_stride = checkpoint_strides.pop() if checkpoint_strides else None
         has_sparse_index = any(cache.index is not None for cache in kv_caches)
         # glm5_next DSA layers are NoPE: the latent lives in the key slot and
         # the value/rope slot is a 0-dim tensor normalized to None, while the
@@ -385,6 +397,46 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if has_sparse_index or has_latent_only_cache:
             self._is_mla = True
         self._uses_sparse_mla = self._is_mla and has_sparse_index
+
+    def _prepare_kda_speculative_state_indices(
+        self,
+        metadata: AttentionMetadata,
+        *,
+        graph_mode: bool,
+    ) -> None:
+        self._kda_prepared_ssm_state_indices = None
+        accepted_tokens = getattr(metadata, "num_accepted_tokens", None)
+        checkpoint_stride = self._kda_checkpoint_stride
+        if accepted_tokens is None or checkpoint_stride is None:
+            return
+
+        state_indices = getattr(metadata, "linear_state_write_indices", None)
+        if state_indices is None:
+            state_indices = getattr(metadata, "linear_state_indices", None)
+        if state_indices is None:
+            return
+
+        num_seqs = int(accepted_tokens.numel())
+        if num_seqs <= 0 or state_indices.numel() < num_seqs or state_indices.numel() % num_seqs:
+            raise RuntimeError(
+                "KDA speculative state metadata is not grouped by logical sequence: "
+                f"slots={state_indices.numel()}, sequences={num_seqs}"
+            )
+        logical_state_indices = state_indices.reshape(num_seqs, -1)[:, 0]
+        prepared_indices = build_speculative_ssm_state_indices(
+            logical_state_indices,
+            checkpoint_stride,
+        )
+        if graph_mode:
+            static_indices = getattr(metadata, "linear_state_checkpoint_indices", None)
+            if static_indices is None:
+                static_indices = torch.empty_like(prepared_indices)
+                metadata.linear_state_checkpoint_indices = static_indices
+            elif static_indices.shape != prepared_indices.shape:
+                raise RuntimeError("KDA speculative checkpoint shape changed after graph allocation")
+            static_indices.copy_(prepared_indices)
+            prepared_indices = static_indices
+        self._kda_prepared_ssm_state_indices = prepared_indices
 
     @staticmethod
     def _query_sequence_ends(
@@ -568,6 +620,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # Slot binding stays the same. Masks are shared only within a forward.
         self._block_attention_masks.clear()
         self._kda_validated_query_shape = None
+        self._prepare_kda_speculative_state_indices(metadata, graph_mode=graph_mode)
         self._graph_metadata_updated_in_place = False
         prepared = getattr(metadata, "prepared_attention_state", None)
         if isinstance(prepared, _PreparedMlaAttention):

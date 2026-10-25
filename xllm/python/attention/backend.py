@@ -144,6 +144,7 @@ class AttentionMetadata(Protocol):
     linear_verify_graph: LinearVerifyGraphInputs | None
     linear_state_read_indices: torch.Tensor | None
     linear_state_write_indices: torch.Tensor | None
+    linear_state_checkpoint_indices: torch.Tensor | None
     num_accepted_tokens: torch.Tensor | None
     num_accepted_tokens_host_values: Sequence[int]
     kpool_query_lens: Sequence[int]
@@ -165,6 +166,28 @@ class AttentionMetadata(Protocol):
     kv_split_size: int
     kv_split_rank: int
     has_kv_shard: bool
+
+
+def linear_state_checkpoint_stride(
+    conv_cache: torch.Tensor,
+    ssm_cache: torch.Tensor,
+) -> int:
+    if conv_cache.shape[0] <= 0 or ssm_cache.shape[0] % conv_cache.shape[0] != 0:
+        raise RuntimeError("linear SSM cache does not align with state slots")
+    return ssm_cache.shape[0] // conv_cache.shape[0]
+
+
+def build_speculative_ssm_state_indices(
+    state_indices: torch.Tensor,
+    checkpoint_stride: int,
+    dtype: torch.dtype = torch.int32,
+) -> torch.Tensor:
+    checkpoint_offsets = torch.arange(
+        checkpoint_stride,
+        dtype=dtype,
+        device=state_indices.device,
+    )
+    return state_indices.to(dtype).reshape(-1, 1) * checkpoint_stride + checkpoint_offsets.view(1, -1)
 
 
 def resolve_linear_state_io_indices(
@@ -285,14 +308,6 @@ class AttentionBackend(ABC):
     def prepare_graph_replay(self, metadata: AttentionMetadata) -> None:
         """Install live metadata for an already captured graph entry."""
         self.prepare(metadata, graph_mode=True)
-
-    def snapshot_linear_state(self, indices: torch.Tensor) -> object | None:
-        """Save backend-owned state that graph warmup/capture may mutate."""
-        return None
-
-    def restore_linear_state(self, snapshot: object) -> None:
-        """Restore an opaque snapshot, including state first created by capture."""
-        del snapshot
 
     def reset_forward(self, metadata: AttentionMetadata | None = None) -> None:
         """Reset request-owned state before a model attaches current inputs."""

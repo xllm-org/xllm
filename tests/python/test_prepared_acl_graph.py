@@ -1517,39 +1517,6 @@ def test_legacy_verify_graph_uses_complete_sequence_buckets(runner: PreparedAclG
         legacy._padded_batch_size(width + 1, _metadata(width + 1))
 
 
-@pytest.mark.parametrize("width", [2, 3, 4, 9, 17])
-def test_legacy_verify_capture_restores_every_recurrent_checkpoint(runner: PreparedAclGraphRunner, width: int) -> None:
-    from xllm.python.attention.backend import LayerCache
-
-    backend = SimpleNamespace(snapshot_linear_state=Mock(return_value=None), restore_linear_state=Mock())
-    legacy = DecodeAclGraphRunner(
-        torch.nn.Identity(),
-        backend,
-        torch.device("cpu"),
-        2 * width,
-        2048,
-        num_decoding_tokens=width,
-        spec_verify_width=width,
-    )
-    conv = torch.arange(5 * (width + 2), dtype=torch.float32).view(5, width + 2, 1)
-    ssm = torch.arange(5 * width, dtype=torch.float32).view(5 * width, 1, 1, 1)
-    original_conv, original_ssm = conv.clone(), ssm.clone()
-    legacy.layer_caches = [LayerCache(None, None, conv=conv, ssm=ssm)]
-    entry = AclGraphEntry()
-    entry.static_metadata = SimpleNamespace(linear_state_indices=torch.tensor([1, 3], dtype=torch.int32))
-
-    def mutate_captured_state(_entry: AclGraphEntry, _stream: object) -> None:
-        conv[1].zero_()
-        conv[3].zero_()
-        ssm[width : 2 * width].zero_()
-        ssm[3 * width : 4 * width].zero_()
-
-    with patch.object(AclGraphRunner, "_capture", side_effect=mutate_captured_state):
-        legacy._capture(entry, Mock())
-    torch.testing.assert_close(conv, original_conv)
-    torch.testing.assert_close(ssm, original_ssm)
-
-
 @pytest.mark.parametrize("width", [1, 3, 4, 17], ids=["draft-padding", "target-k2", "target-k3", "target-k16"])
 def test_legacy_device_lengths_preserve_physical_query_rows(
     runner: PreparedAclGraphRunner, monkeypatch: pytest.MonkeyPatch, width: int

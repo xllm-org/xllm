@@ -65,6 +65,7 @@ class StaticGraphAttentionMetadata:
     kv_seq_lens: torch.Tensor | None = None
     linear_state_indices: torch.Tensor | None = None
     linear_verify_graph: LinearVerifyGraphInputs | None = None
+    linear_state_checkpoint_indices: torch.Tensor | None = None
     num_accepted_tokens: torch.Tensor | None = None
     num_accepted_tokens_host_values: tuple[int, ...] = ()
     linear_state_read_indices: torch.Tensor | None = None
