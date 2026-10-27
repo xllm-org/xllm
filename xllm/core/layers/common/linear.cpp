@@ -463,6 +463,48 @@ torch::Tensor loaded_ct_smooth(const QuantArgs& args,
 }
 #endif
 
+std::tuple<torch::Tensor, torch::Tensor> quantize_row_input(
+    const torch::Tensor& input,
+    const torch::Tensor& smooth,
+    const LinearExtraArgs& extra,
+    ProcessGroup* group) {
+  torch::Tensor values = input;
+  if (extra.act_mode != "none") {
+    // The tanh GELU path materializes the activation in the input dtype.
+    // Other fused dynamic quantizers apply activation before the FP32 smooth.
+    kernel::ActivationParams active;
+    active.input = extra.act_mode == "gelu_pytorch_tanh"
+                       ? input
+                       : input.to(torch::kFloat32);
+    std::vector<int64_t> shape = active.input.sizes().vec();
+    if (extra.is_gated) {
+      shape.back() /= 2;
+    }
+    active.output = torch::empty(shape, active.input.options());
+    active.act_mode = extra.act_mode;
+    active.is_gated = extra.is_gated;
+    kernel::active(active);
+    values = active.output;
+  }
+  values = values.to(torch::kFloat32);
+  if (smooth.defined()) {
+    values = values * smooth;
+  }
+  torch::Tensor local_scale = values.abs().amax(/*dim=*/{-1}) / 127.0;
+  // TP ranks share the same CP shard, token count and row order; only
+  // channel ranges differ. This is a fixed-shape collective over the TP group.
+  torch::Tensor scales = group->allgather_base_sync(local_scale);
+  scales = scales.reshape({group->world_size(), local_scale.numel()});
+  torch::Tensor scale = scales.amax(/*dim=*/{0});
+  const torch::Tensor divisor =
+      torch::where(scale > 0, scale, torch::ones_like(scale));
+  torch::Tensor quantized = (values / divisor.unsqueeze(-1))
+                                .round()
+                                .clamp(-127, 127)
+                                .to(torch::kInt8);
+  return std::make_tuple(std::move(quantized), std::move(scale));
+}
+
 torch::Tensor scaled_w8a8_linear(
     const torch::Tensor& input,
     const torch::Tensor& weight,
@@ -470,14 +512,23 @@ torch::Tensor scaled_w8a8_linear(
     const torch::Tensor& smooth,
     const std::optional<torch::Tensor>& bias,
     torch::ScalarType output_dtype,
-    const LinearExtraArgs& extra = LinearExtraArgs()) {
+    const LinearExtraArgs& extra = LinearExtraArgs(),
+    ProcessGroup* input_group = nullptr) {
   kernel::ScaledQuantizeParams quantize;
   const bool reshape_input = input.dim() != 2;
   quantize.x = reshape_input ? input.reshape({-1, input.size(-1)}) : input;
   quantize.smooth = smooth;
   quantize.act_mode = extra.act_mode;
   quantize.is_gated = extra.is_gated;
-  auto [quantized, token_scale] = kernel::scaled_quantize(quantize);
+  torch::Tensor quantized;
+  torch::Tensor token_scale;
+  if (input_group != nullptr && input_group->world_size() > 1 &&
+      quantize.x.size(0) > 0) {
+    std::tie(quantized, token_scale) =
+        quantize_row_input(quantize.x, smooth, extra, input_group);
+  } else {
+    std::tie(quantized, token_scale) = kernel::scaled_quantize(quantize);
+  }
   kernel::ScaledMatmulParams matmul;
   matmul.a = quantized;
   matmul.b = weight;
@@ -1524,9 +1575,11 @@ RowParallelLinearImpl::RowParallelLinearImpl(
     const QuantArgs& quant_args,
     ProcessGroup* process_group,
     const torch::TensorOptions& options,
-    const LinearExtraArgs& linear_extra_args)
+    const LinearExtraArgs& linear_extra_args,
+    bool share_token_scale)
     : input_is_parallelized_(input_is_parallelized),
       enable_result_reduction_(enable_result_reduction),
+      share_token_scale_(share_token_scale),
       quant_args_(quant_args),
       options_(options),
       process_group_(process_group),
@@ -1677,7 +1730,8 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
                                 smooth_,
                                 bias,
                                 output_dtype_,
-                                linear_extra_args_);
+                                linear_extra_args_,
+                                share_token_scale_ ? process_group_ : nullptr);
 #if defined(USE_MUSA)
   } else if (musa::is_block_fp8_quant(quant_args_)) {
     log_mmrs_quant_skip(reduce_mode, fc1_ctx, "block_fp8", input);
@@ -1737,7 +1791,8 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
                                 smooth,
                                 bias,
                                 output_dtype_,
-                                linear_extra_args_);
+                                linear_extra_args_,
+                                share_token_scale_ ? process_group_ : nullptr);
 #elif defined(USE_NPU)
     // FC1 fused int8 MMRS: per-token quantize the (padded) activation, then let
     // torch_npu fuse matmul + reduce_scatter. Numerically equivalent to the

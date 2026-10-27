@@ -18,9 +18,12 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/kv_cache_config.h"
@@ -33,11 +36,14 @@ limitations under the License.
 #include "core/kv_cache/storage/kv_cache_utils.h"
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "tests/core/kv_cache/dcp_indexer_test_fixture.h"
 #include "worker.pb.h"
 
 namespace xllm {
 
 namespace {
+
+class DcpIndexerShapeTest : public test::DcpIndexerConfigTest {};
 
 std::vector<int64_t> shape_vec(const torch::Tensor& tensor) {
   return tensor.sizes().vec();
@@ -1437,6 +1443,76 @@ TEST(KVCacheTest, KPoolShapeRoundTripKeepsRequestTailSeparateFromPages) {
 }
 
 #if defined(USE_MLU)
+TEST(KVCacheTest, SharedKPoolPlanMatchesAllocatedStateAndBudget) {
+  ModelArgs target_args;
+  target_args.n_layers(2)
+      .head_dim(16)
+      .index_n_heads(1)
+      .index_head_dim(32)
+      .index_kpool(4)
+      .index_kpool_compress(true);
+  KVCacheEstimateOptions options;
+  options.kpool_layout = KPoolCacheLayout::COMPRESSED_WITH_TAIL;
+  options.cache_size_in_bytes = 65536;
+  options.block_size = 32;
+  options.n_local_kv_heads = 1;
+  options.num_speculative_tokens = 5;
+  options.max_linear_state_cache_slots = 2;
+  const KVCacheCapacity target_cap =
+      estimate_kv_cache_capacity(target_args, options);
+
+  for (const int32_t draft_kpool : {4, 32}) {
+    for (const int64_t draft_slots : {1, 3}) {
+      SCOPED_TRACE(::testing::Message() << "draft_kpool=" << draft_kpool
+                                        << ", draft_slots=" << draft_slots);
+      ModelArgs draft_args = target_args;
+      draft_args.n_layers(1).head_dim(32).index_head_dim(64).index_kpool(
+          draft_kpool);
+      KVCacheEstimateOptions draft_options = options;
+      draft_options.is_draft_engine = true;
+      draft_options.num_speculative_tokens = 0;
+      draft_options.max_linear_state_cache_slots = draft_slots;
+      const KVCacheCapacity draft_cap =
+          estimate_kv_cache_capacity(draft_args, draft_options);
+      const SharedKPoolPlan plan =
+          plan_shared_kpool(target_cap, draft_cap, draft_args);
+
+      EXPECT_EQ(plan.target.num_linear_state_blocks(), 4);
+      EXPECT_EQ(plan.draft.num_linear_state_blocks(), 4);
+      EXPECT_EQ(plan.draft.kpool_tail_len(), draft_kpool == 4 ? 16 : 32);
+      EXPECT_EQ(plan.draft.kpool_tail_slot_size(),
+                draft_kpool == 4 ? 4096 : 8192);
+      EXPECT_EQ(plan.draft.linear_cache_size_in_bytes(),
+                draft_kpool == 4 ? 16384 : 32768);
+      EXPECT_EQ(plan.target.n_blocks(), draft_kpool == 4 ? 3 : 1);
+      EXPECT_EQ(plan.draft.n_blocks(), plan.target.n_blocks());
+
+      const KVCacheShape target_shape(
+          plan.target, target_args, /*world_size=*/1);
+      const KVCacheShape draft_shape(plan.draft, draft_args, /*world_size=*/1);
+      EXPECT_EQ(draft_shape.kpool_tail_shape(),
+                (std::vector<int64_t>{4, 2, draft_kpool == 4 ? 16 : 32, 64}));
+      KVCacheCreateOptions create_options;
+      create_options.enable_lighting_indexer(true).dtype(torch::kBFloat16);
+      int64_t allocated_bytes = 0;
+      for (int64_t layer_id = 0; layer_id < plan.target.n_layers();
+           ++layer_id) {
+        KVCache cache(target_shape, create_options, layer_id);
+        for (const KVCacheTensor& tensor : cache.get_cache_tensors()) {
+          allocated_bytes +=
+              tensor.tensor.numel() * tensor.tensor.element_size();
+        }
+      }
+      KVCache draft_cache(draft_shape, create_options, /*layer_id=*/0);
+      for (const KVCacheTensor& tensor : draft_cache.get_cache_tensors()) {
+        allocated_bytes += tensor.tensor.numel() * tensor.tensor.element_size();
+      }
+      EXPECT_EQ(allocated_bytes, draft_kpool == 4 ? 63488 : 58496);
+      EXPECT_LE(allocated_bytes, options.cache_size_in_bytes);
+    }
+  }
+}
+
 TEST(KVCacheTest, SharedKPoolBudgetCoversBothModelsWithoutDoubleCounting) {
   ModelArgs target_args;
   target_args.n_layers(2)
@@ -1470,13 +1546,11 @@ TEST(KVCacheTest, SharedKPoolBudgetCoversBothModelsWithoutDoubleCounting) {
           estimate_kv_cache_capacity(draft_args, draft_options);
       ASSERT_NE(target_cap.num_linear_state_blocks(),
                 draft_cap.num_linear_state_blocks());
-      const int64_t n_blocks =
-          estimate_shared_kpool_blocks(target_cap, draft_cap, draft_args);
-      target_cap.n_blocks(n_blocks);
-      draft_cap.n_blocks(n_blocks);
-      // Match the final draft shape's inherited request slots and window.
-      draft_cap.num_linear_state_blocks(target_cap.num_linear_state_blocks())
-          .kpool_tail_len(target_cap.kpool_tail_len());
+      SharedKPoolPlan plan = plan_shared_kpool(
+          std::move(target_cap), std::move(draft_cap), draft_args);
+      target_cap = std::move(plan.target);
+      draft_cap = std::move(plan.draft);
+      const int64_t n_blocks = target_cap.n_blocks();
       const auto allocated_bytes = [&]() -> int64_t {
         const KVCacheShape target_shape(
             target_cap, target_args, /*world_size=*/1);
@@ -1505,26 +1579,64 @@ TEST(KVCacheTest, SharedKPoolBudgetCoversBothModelsWithoutDoubleCounting) {
   }
 }
 
-TEST(KVCacheTest, SharedKPoolBudgetRejectsInsufficientMemory) {
-  ModelArgs draft_args;
-  draft_args.index_kpool(4).index_head_dim(16);
-  KVCacheCapacity capacity;
-  capacity.block_size(16)
-      .slot_size(64)
-      .index_slot_size(8)
-      .num_full_attention_layers(1)
-      .num_indexer_layers(1)
-      .num_linear_state_blocks(5)
-      .kpool_tail_len(16)
-      .kpool_tail_slot_size(1024)
-      .linear_cache_size_in_bytes(5120)
-      .cache_size_in_bytes(10240);
-  EXPECT_DEATH(estimate_shared_kpool_blocks(capacity, capacity, draft_args),
-               "target and draft KPool request state");
-  capacity.cache_size_in_bytes(10241);
-  EXPECT_DEATH(estimate_shared_kpool_blocks(capacity, capacity, draft_args),
-               "no memory for a shared KPool block");
-}
 #endif
+
+TEST_P(DcpIndexerShapeTest, MatchesCapacityBudget) {
+  ModelArgs model_args;
+  model_args.n_layers(4)
+      .n_heads(2)
+      .n_kv_heads(2)
+      .head_dim(16)
+      .index_n_heads(1)
+      .index_head_dim(16);
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kFloat16;
+  options.kv_cache_dtype = "auto";
+  options.cache_size_in_bytes = 1024 * 1024;
+  options.block_size = 16;
+  options.world_size = 1;
+  options.n_local_kv_heads = 2;
+
+  const auto element_count = [](const std::vector<int64_t>& dims) {
+    return std::accumulate(
+        dims.begin(), dims.end(), int64_t{1}, std::multiplies<int64_t>());
+  };
+  for (const bool quantized : {false, true}) {
+    SCOPED_TRACE(quantized);
+    options.indexer_cache_dtype = quantized ? "int8" : "auto";
+    const KVCacheCapacity capacity =
+        estimate_kv_cache_capacity(model_args, options);
+    const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+    ASSERT_TRUE(shape.has_index_cache_shape());
+    EXPECT_EQ(shape.key_cache_shape()[0], capacity.n_blocks());
+    EXPECT_EQ(shape.value_cache_shape()[0], capacity.n_blocks());
+    EXPECT_EQ(shape.index_cache_shape()[0],
+              capacity.n_blocks() * expected_factor());
+    EXPECT_EQ(shape.has_index_cache_scale_shape(), quantized);
+    int64_t index_bytes =
+        element_count(shape.index_cache_shape()) * (quantized ? 1 : 2);
+    if (quantized) {
+      ASSERT_TRUE(shape.has_index_cache_scale_shape());
+      EXPECT_EQ(shape.index_cache_scale_shape()[0],
+                shape.index_cache_shape()[0]);
+      index_bytes +=
+          element_count(shape.index_cache_scale_shape()) * sizeof(float);
+    }
+    EXPECT_EQ(index_bytes,
+              capacity.n_blocks() * capacity.block_size() *
+                  capacity.index_slot_size());
+  }
+
+  model_args.index_n_heads(0);
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+  EXPECT_FALSE(shape.has_index_cache_shape());
+  EXPECT_FALSE(shape.has_index_cache_scale_shape());
+}
+
+INSTANTIATE_TEST_SUITE_P(KvSplits,
+                         DcpIndexerShapeTest,
+                         ::testing::Values(1, 2, 4, 0));
 
 }  // namespace xllm

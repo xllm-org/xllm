@@ -92,8 +92,8 @@ class DeepseekV2SparseMoEBlockImpl : public torch::nn::Module {
   ForwardResult forward(torch::Tensor x,
                         bool enable_moe_all2all,
                         const CommFns& comm_fns);
-  ForwardResult forward_sp(torch::Tensor x,
-                           const v32_cp::DeepseekV32CPContext& sp_ctx,
+  ForwardResult forward_cp(torch::Tensor x,
+                           const v32_cp::DeepseekV32CPContext& cp_ctx,
                            const CommFns& comm_fns);
 
  private:

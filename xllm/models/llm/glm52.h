@@ -19,6 +19,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/layers/common/kv_shard_batch_metadata.h"
+#include "core/layers/mlu/dcp_batch_metadata.h"
 #include "core/layers/mlu/dsa_topk_relay.h"
 #include "models/llm/glm5.h"
 
@@ -35,7 +36,7 @@ struct Glm52GraphMetadataState final : ModelGraphMetadataState {
   torch::Tensor q_seq_lens;
   torch::Tensor kv_seq_lens;
   torch::Tensor local_slot_mapping;
-  torch::Tensor expanded_indexer_block_table;
+  torch::Tensor local_indexer_context_lens;
 };
 
 class Glm52ModelImpl : public Glm5ModelImpl {
@@ -93,10 +94,10 @@ class Glm52ModelImpl : public Glm5ModelImpl {
         layer::localize_kv_shard_slots(attention_metadata->slot_mapping,
                                        kv_shard_layout_.value()),
         graph_state->local_slot_mapping);
-    shard_metadata->expanded_indexer_block_table = copy_to_graph_tensor(
-        layer::expand_kv_shard_indexer_block_table(
-            attention_metadata->block_table, kv_shard_layout_.value()),
-        graph_state->expanded_indexer_block_table);
+    shard_metadata->local_indexer_context_lens = copy_to_graph_tensor(
+        layer::localize_kv_shard_context_lens(attention_metadata->kv_seq_lens,
+                                              kv_shard_layout_.value()),
+        graph_state->local_indexer_context_lens);
     attention_metadata->kv_shard_batch_metadata = std::move(shard_metadata);
     input_params.attn_metadata = std::move(attention_metadata);
   }
@@ -109,7 +110,7 @@ class Glm52ModelImpl : public Glm5ModelImpl {
       return;
     }
     attn_metadata.kv_shard_batch_metadata =
-        build_kv_shard_batch_metadata(attn_metadata, kv_shard_layout_.value());
+        build_mlu_shard_metadata(attn_metadata, kv_shard_layout_.value());
   }
 
   std::optional<KVShardLayout> cp_kv_shard_layout() const override {

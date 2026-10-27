@@ -116,6 +116,11 @@ struct Dsv4KVCacheEstimateCost {
   int64_t manager_blocks_per_unit = 1;
 };
 
+struct SharedKPoolPlan {
+  KVCacheCapacity target;
+  KVCacheCapacity draft;
+};
+
 std::vector<bool> resolve_indexer_cache_enabled_layers(
     const ModelArgs& model_args,
     int64_t num_cache_layers);
@@ -140,10 +145,10 @@ KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options);
 
-// Full-attention KPool drafts inherit the target's request-state slots/window.
-// Both capacities retain their own model's layer counts and page costs.
-int64_t estimate_shared_kpool_blocks(const KVCacheCapacity& target_cap,
-                                     const KVCacheCapacity& draft_cap,
-                                     const ModelArgs& draft_args);
+// Co-located KPool drafts inherit the target's request slots and verify window.
+// Each capacity retains its own model's layer counts and page costs.
+SharedKPoolPlan plan_shared_kpool(KVCacheCapacity target_cap,
+                                  KVCacheCapacity draft_cap,
+                                  const ModelArgs& draft_args);
 
 }  // namespace xllm

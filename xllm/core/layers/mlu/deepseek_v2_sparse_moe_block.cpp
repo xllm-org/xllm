@@ -267,23 +267,23 @@ DeepseekV2SparseMoEBlockImpl::forward(torch::Tensor x,
 }
 
 DeepseekV2SparseMoEBlockImpl::ForwardResult
-DeepseekV2SparseMoEBlockImpl::forward_sp(
+DeepseekV2SparseMoEBlockImpl::forward_cp(
     torch::Tensor x,
-    const v32_cp::DeepseekV32CPContext& sp_ctx,
+    const v32_cp::DeepseekV32CPContext& cp_ctx,
     const CommFns& comm_fns) {
-  CHECK(has_shared()) << "forward_sp requires shared experts";
+  CHECK(has_shared()) << "forward_cp requires shared experts";
   ProcessGroup* routed_group = routed_pg();
   const bool keep_local_output = comm_fns.can_keep_local(routed_group);
   if (!keep_local_output) {
-    auto gathered = v32_cp::finish_all_gather_across_ranks(
-        v32_cp::launch_all_gather_across_ranks(x, sp_ctx));
+    auto gathered = parallel_state::finish_gather(
+        v32_cp::launch_all_gather_across_ranks(x, cp_ctx));
     return forward(std::move(gathered),
                    /*enable_moe_all2all=*/false,
                    comm_fns);
   }
 
   Stream* comm_stream = moe_->shared_stream();
-  CHECK(comm_stream != nullptr) << "forward_sp requires shared stream";
+  CHECK(comm_stream != nullptr) << "forward_cp requires shared stream";
 
   Device device(x.device());
   auto current_stream = device.current_stream();
@@ -292,14 +292,13 @@ DeepseekV2SparseMoEBlockImpl::forward_sp(
   v32_cp::PaddedGatherHandle gather_handle;
   {
     torch::StreamGuard stream_guard = comm_stream->set_stream_guard();
-    gather_handle = v32_cp::launch_all_gather_across_ranks(x, sp_ctx);
+    gather_handle = v32_cp::launch_all_gather_across_ranks(x, cp_ctx);
   }
 
   torch::Tensor shared_out = moe_->forward_shared(x);
 
   current_stream->wait_stream(*comm_stream);
-  auto gathered =
-      v32_cp::finish_all_gather_across_ranks(std::move(gather_handle));
+  auto gathered = parallel_state::finish_gather(std::move(gather_handle));
   torch::Tensor routed_out =
       moe_->forward_experts(std::move(gathered),
                             /*enable_all2all_communication=*/false);

@@ -308,7 +308,8 @@ class RowParallelLinearImpl : public torch::nn::Module {
       const QuantArgs& quant_args,
       ProcessGroup* process_group,
       const torch::TensorOptions& options,
-      const LinearExtraArgs& linear_extra_args = LinearExtraArgs());
+      const LinearExtraArgs& linear_extra_args = LinearExtraArgs(),
+      bool share_token_scale = false);
 
   torch::Tensor forward(torch::Tensor input);
 
@@ -388,6 +389,7 @@ class RowParallelLinearImpl : public torch::nn::Module {
 
   // whether to reduce the results
   bool enable_result_reduction_;
+  bool share_token_scale_;
 
   // parallel process group
   ProcessGroup* process_group_;

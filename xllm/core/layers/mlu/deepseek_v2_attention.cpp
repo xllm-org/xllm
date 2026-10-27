@@ -19,7 +19,6 @@ limitations under the License.
 
 #include "core/framework/config/kv_cache_config.h"
 #include "kernels/ops_api.h"
-#include "platform/platform.h"
 
 namespace xllm {
 namespace layer {
@@ -32,7 +31,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(const ModelContext& context,
                               context.get_tensor_options(),
                               context.get_optimization_config(),
                               enable_indexer) {
-  sp_comm_stream_ =
+  cp_comm_stream_ =
       context.stream_registry()->get(ExecutionStreamRole::COMMUNICATION);
 }
 
@@ -58,10 +57,11 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
     index_topk_ += args.index_kpool() - 1;
   }
   kv_split_size_ = parallel_args.kv_split_size_effective();
+  const KVCacheConfig& cache_config = KVCacheConfig::get_instance();
   kv_split_rank_ = parallel_args.kv_split_rank();
   tp_group_ = parallel_args.tp_group_;
   tp_rank_ = tp_group_->rank();
-  block_size_ = ::xllm::KVCacheConfig::get_instance().block_size();
+  block_size_ = cache_config.block_size();
   enable_mla_cache_sharding_ = kv_split_size_ > 1;
   if (enable_mla_cache_sharding_) {
     CHECK(parallel_args.dcp_group_ != nullptr)
@@ -72,16 +72,6 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
     dcp_spans_tp_ =
         parallel_args.dcp_group_->world_size() > parallel_args.cp_size();
   }
-  // Attention weights are replicated (each rank computes all heads) only when
-  // there is no tensor-parallel dimension to shard heads across (world == cp)
-  // or when the DCP KV-split path (which assumes full heads) is active.
-  // Otherwise, when CP x TP are orthogonal (world > cp), sequence-parallel
-  // attention TP-shards the heads: each rank computes heads / tp_size on its
-  // local sequence shard and a TP all-reduce merges the head shards.
-  use_full_replicated_attention_weights_ =
-      parallel_args.cp_size() > 1 && Platform::uses_model_cp_sharding() &&
-      (parallel_args.world_size() == parallel_args.cp_size() ||
-       parallel_args.kv_split_size_effective() > 1);
   const int64_t tp_size = parallel_args.tp_group_->world_size();
   int64_t hidden_size = args.hidden_size();
   int64_t num_heads = args.n_heads();
@@ -94,12 +84,8 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
   full_heads_ = {num_heads, num_heads};
   float scaling = std::pow(qk_head_dim_, -0.5f);
 
-  ProcessGroup* weight_group =
-      use_replicated_attn_weights() &&
-              parallel_args.single_rank_group_ != nullptr
-          ? parallel_args.single_rank_group_
-          : parallel_args.tp_group_;
   const LinearExtraArgs attention_linear_extra_args("none", false);
+  // Attention precision follows the checkpoint module, not expert grouping.
 
   if (q_lora_rank_ > 0) {
     q_a_proj_ = register_module(
@@ -115,7 +101,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
                              false,
                              false,
                              quant_args,
-                             weight_group,
+                             tp_group_,
                              options,
                              attention_linear_extra_args));
   } else {
@@ -126,7 +112,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
                              false,
                              false,
                              quant_args,
-                             weight_group,
+                             tp_group_,
                              options,
                              attention_linear_extra_args));
   }
@@ -148,7 +134,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
           false,
           false,
           QuantArgs(),
-          weight_group,
+          tp_group_,
           options,
           attention_linear_extra_args));
 
@@ -215,13 +201,13 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
                        qk_rope_head_dim_ > 0 &&
                        quant_args.quant_method() == kQuantMethodSmoothquant;
   if (has_indexer_ && !use_kpool_indexer_ &&
-      ::xllm::KVCacheConfig::get_instance().indexer_cache_dtype() == "int8") {
+      cache_config.indexer_cache_dtype() == "int8") {
     CHECK(optimization_config.enable_fused_indexer_qk)
         << "Indexer cache INT8 requires fused indexer Q/K.";
   }
 
   attn_ = register_module("attn",
-                          Attention(active_heads().attn,
+                          Attention(tp_heads().attn,
                                     kv_lora_rank_ + qk_rope_head_dim_,
                                     /*num_local_heads=*/1,
                                     kv_lora_rank_,
@@ -244,17 +230,18 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
                                   args.enable_mla()));
   }
 
-  o_proj_ =
-      register_module("o_proj",
-                      RowParallelLinear(full_heads().proj_width(v_head_dim_),
-                                        hidden_size,
-                                        false,
-                                        /*input_is_parallelized=*/true,
-                                        /*reduce=*/false,
-                                        quant_args,
-                                        weight_group,
-                                        options,
-                                        attention_linear_extra_args));
+  o_proj_ = register_module(
+      "o_proj",
+      RowParallelLinear(full_heads().proj_width(v_head_dim_),
+                        hidden_size,
+                        false,
+                        /*input_is_parallelized=*/true,
+                        /*reduce=*/false,
+                        quant_args,
+                        tp_group_,
+                        options,
+                        attention_linear_extra_args,
+                        /*share_token_scale=*/parallel_args.cp_size() > 1));
 }
 
 DeepseekV2AttentionImpl::QueryPrep DeepseekV2AttentionImpl::prep_query(
@@ -316,45 +303,99 @@ void DeepseekV2AttentionImpl::decode_kv_pre_base(
   }
 }
 
-void DeepseekV2AttentionImpl::decode_qkv_pre_fused(
+void DeepseekV2AttentionImpl::prepare_mla_inputs(
     torch::Tensor& q,
     torch::Tensor& q_norm,
     torch::Tensor& q_input,
     torch::Tensor& latent_cache,
-    torch::Tensor& kv_cache,
+    const torch::Tensor& hidden_states,
+    torch::Tensor& k_cache,
     std::optional<torch::Tensor> k_cache_scale,
     const torch::Tensor& positions,
     const AttentionMetadata& attn_metadata,
+    bool enable_fused_qkv,
     bool use_prompt_rope) {
+  prepare_mla_query_side(q,
+                         q_norm,
+                         q_input,
+                         hidden_states,
+                         positions,
+                         attn_metadata,
+                         enable_fused_qkv,
+                         use_prompt_rope);
+  prepare_mla_latent_side(latent_cache,
+                          k_cache,
+                          k_cache_scale,
+                          hidden_states,
+                          positions,
+                          attn_metadata,
+                          enable_fused_qkv,
+                          use_prompt_rope);
+}
+
+void DeepseekV2AttentionImpl::prepare_mla_query_side(
+    torch::Tensor& q,
+    torch::Tensor& q_norm,
+    torch::Tensor& q_input,
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& positions,
+    const AttentionMetadata& attn_metadata,
+    bool enable_fused_qkv,
+    bool use_prompt_rope) {
+  const HeadInfo& heads = tp_heads();
+  if (!enable_fused_qkv || q_lora_rank_ <= 0) {
+    auto query_prep = prep_query(hidden_states, heads);
+    q = query_prep.q;
+    q_norm = query_prep.q_norm;
+    fill_q_input(q_input, q, positions, attn_metadata, use_prompt_rope);
+    return;
+  }
+  CHECK_GT(qk_rope_head_dim_, 0)
+      << "Fused MLA QKV does not implement the NoPE path.";
+
   // forward_decoder_fused_mla_q
   // fused_mla_q: q_a_layernorm + q_b_proj + split + bmm + rotary_emb
-  if (q_lora_rank_ > 0) {
-    q_norm = torch::empty_like(q);
-    if (q.dim() == 2) {
-      q = q.unsqueeze(1);
-    }
-    q_input = q_input.view(
-        {q.size(0), q.size(1), q_input.size(-2), q_input.size(-1)});
-    kernel::FusedMlaQParams fused_mla_q_params;
-    fused_mla_q_params.q = q;
-    fused_mla_q_params.output = q_input;
-    fused_mla_q_params.output_norm = q_norm.view(q.sizes());
-    fused_mla_q_params.gamma = q_a_layernorm_->weight();
-    fused_mla_q_params.smooth_quant_scale = q_b_proj_->smooth();
-    fused_mla_q_params.weight_b = q_b_proj_->weight();
-    fused_mla_q_params.weight_b_scale = q_b_proj_->per_channel_scale();
-    fused_mla_q_params.weight_c = weight_c_;
-    fused_mla_q_params.sin = rotary_emb_->get_sin_cache();
-    fused_mla_q_params.cos = rotary_emb_->get_cos_cache();
-    fused_mla_q_params.position_id = positions;
-    fused_mla_q_params.quant_mode = "none";
-    fused_mla_q_params.eps = eps_;
-    fused_mla_q_params.interleaved = interleaved_;
-    kernel::fused_mla_q(fused_mla_q_params);
-  } else {
-    fill_q_input(q_input, q, positions, attn_metadata, use_prompt_rope);
+  q = q_a_proj_(hidden_states);
+  q_norm = torch::empty_like(q);
+  if (q.dim() == 2) {
+    q = q.unsqueeze(1);
   }
+  q_input =
+      q_input.view({q.size(0), q.size(1), q_input.size(-2), q_input.size(-1)});
+  kernel::FusedMlaQParams fused_mla_q_params;
+  fused_mla_q_params.q = q;
+  fused_mla_q_params.output = q_input;
+  fused_mla_q_params.output_norm = q_norm.view(q.sizes());
+  fused_mla_q_params.gamma = q_a_layernorm_->weight();
+  fused_mla_q_params.smooth_quant_scale = q_b_proj_->smooth();
+  fused_mla_q_params.weight_b = q_b_proj_->weight();
+  fused_mla_q_params.weight_b_scale = q_b_proj_->per_channel_scale();
+  fused_mla_q_params.weight_c = weight_c_;
+  fused_mla_q_params.sin = rotary_emb_->get_sin_cache();
+  fused_mla_q_params.cos = rotary_emb_->get_cos_cache();
+  fused_mla_q_params.position_id = positions;
+  fused_mla_q_params.quant_mode = "none";
+  fused_mla_q_params.eps = eps_;
+  fused_mla_q_params.interleaved = interleaved_;
+  kernel::fused_mla_q(fused_mla_q_params);
+}
 
+void DeepseekV2AttentionImpl::prepare_mla_latent_side(
+    torch::Tensor& latent_cache,
+    torch::Tensor& k_cache,
+    std::optional<torch::Tensor> k_cache_scale,
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& positions,
+    const AttentionMetadata& attn_metadata,
+    bool enable_fused_qkv,
+    bool use_prompt_rope) {
+  latent_cache = kv_a_proj_with_mqa_(hidden_states);
+  if (!enable_fused_qkv) {
+    decode_kv_pre_base(latent_cache, positions, attn_metadata, use_prompt_rope);
+    return;
+  }
+  CHECK_GT(qk_rope_head_dim_, 0)
+      << "Fused MLA KV does not implement the NoPE path.";
   // forward_decoder_fused_mla_kv
   // fused_mla_kv: kv_a_layernorm + rotary_emb + reshape_paged_cache
   if (latent_cache.dim() == 2) {
@@ -371,7 +412,7 @@ void DeepseekV2AttentionImpl::decode_qkv_pre_fused(
   fused_mla_kv_params.cos = rotary_emb_->get_cos_cache();
   fused_mla_kv_params.position_id = positions;
   fused_mla_kv_params.gamma = kv_a_layernorm_->weight();
-  fused_mla_kv_params.kv_cache = kv_cache;
+  fused_mla_kv_params.kv_cache = k_cache;
   fused_mla_kv_params.kv_cache_scale = k_cache_scale;
   fused_mla_kv_params.slot_mapping =
       attn_metadata.slot_mapping.view({batch, seq});
@@ -382,44 +423,6 @@ void DeepseekV2AttentionImpl::decode_qkv_pre_fused(
   fused_mla_kv_params.eps = eps_;
   fused_mla_kv_params.interleaved = interleaved_;
   kernel::fused_mla_kv(fused_mla_kv_params);
-}
-
-void DeepseekV2AttentionImpl::prepare_mla_inputs(
-    torch::Tensor& q,
-    torch::Tensor& q_norm,
-    torch::Tensor& q_input,
-    torch::Tensor& latent_cache,
-    const torch::Tensor& hidden_states,
-    torch::Tensor& k_cache,
-    std::optional<torch::Tensor> k_cache_scale,
-    const torch::Tensor& positions,
-    const AttentionMetadata& attn_metadata,
-    bool enable_fused_qkv,
-    bool use_prompt_rope) {
-  const auto& heads = active_heads();
-  latent_cache = kv_a_proj_with_mqa_(hidden_states);
-  if (enable_fused_qkv) {
-    if (q_lora_rank_ > 0) {
-      q = q_a_proj_(hidden_states);
-    } else {
-      q = q_proj_->forward(hidden_states).view({-1, heads.proj, qk_head_dim_});
-    }
-    decode_qkv_pre_fused(q,
-                         q_norm,
-                         q_input,
-                         latent_cache,
-                         k_cache,
-                         k_cache_scale,
-                         positions,
-                         attn_metadata,
-                         use_prompt_rope);
-  } else {
-    auto query_prep = prep_query(hidden_states, heads);
-    q = query_prep.q;
-    q_norm = query_prep.q_norm;
-    fill_q_input(q_input, q, positions, attn_metadata, use_prompt_rope);
-    decode_kv_pre_base(latent_cache, positions, attn_metadata, use_prompt_rope);
-  }
 }
 
 void DeepseekV2AttentionImpl::update_mla_k_cache(
@@ -532,16 +535,16 @@ DeepseekV2AttentionImpl::ForwardResult DeepseekV2AttentionImpl::forward(
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
-    const v32_cp::DeepseekV32CPContext* sp_ctx,
+    const v32_cp::DeepseekV32CPContext* cp_ctx,
     DsaTopkTransfer* topk_transfer) {
   bool is_prefill_or_chunked_prefill =
       attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
-  if (sp_ctx != nullptr && can_use_sp(topk_transfer)) {
+  if (cp_ctx != nullptr && can_use_cp(topk_transfer)) {
     return {
-        .output = forward_sp(positions,
+        .output = forward_cp(positions,
                              hidden_states,
                              attn_metadata,
-                             *sp_ctx,
+                             *cp_ctx,
                              kv_cache,
                              is_prefill_or_chunked_prefill,
                              topk_transfer),
@@ -549,7 +552,7 @@ DeepseekV2AttentionImpl::ForwardResult DeepseekV2AttentionImpl::forward(
     };
   }
   const AttentionMetadata& local_attn_metadata =
-      sp_ctx == nullptr ? attn_metadata : sp_ctx->local_attn_metadata;
+      cp_ctx == nullptr ? attn_metadata : cp_ctx->local_attn_metadata;
   return {
       .output = forward_normal_tp(positions,
                                   hidden_states,
@@ -557,8 +560,7 @@ DeepseekV2AttentionImpl::ForwardResult DeepseekV2AttentionImpl::forward(
                                   kv_cache,
                                   is_prefill_or_chunked_prefill,
                                   topk_transfer),
-      .layout = use_replicated_attn_weights() ? PostAttnLayout::kReplicated
-                                              : PostAttnLayout::kTpShard,
+      .layout = PostAttnLayout::kTpShard,
   };
 }
 
@@ -578,7 +580,7 @@ torch::Tensor DeepseekV2AttentionImpl::forward_normal_tp(
                        topk_transfer);
   }
 
-  const HeadInfo& heads = active_heads();
+  const HeadInfo& heads = tp_heads();
   torch::Tensor q;
   torch::Tensor q_norm;
   torch::Tensor q_input = torch::empty(

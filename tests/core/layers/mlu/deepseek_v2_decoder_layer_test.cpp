@@ -743,31 +743,31 @@ class DeepseekV2DecoderLayerTest : public ::testing::Test {
     return single_rank_pg_.get();
   }
 
-  void set_sp_ctx(DecoderHolder& decoder,
+  void set_cp_ctx(DecoderHolder& decoder,
                   ProcessGroup* process_group = nullptr,
                   std::vector<int32_t> tokens_per_rank = {2, 1},
                   std::vector<int32_t> padded_tokens_per_rank = {2, 2}) {
     if (process_group == nullptr) {
-      sp_pg_ = std::make_unique<test::MockProcessGroup>(
+      cp_pg_ = std::make_unique<test::MockProcessGroup>(
           options_.device(),
           /*rank=*/0,
           static_cast<int64_t>(tokens_per_rank.size()));
-      process_group = sp_pg_.get();
+      process_group = cp_pg_.get();
     } else {
-      sp_pg_.reset();
+      cp_pg_.reset();
     }
-    sp_ctx_ = {};
-    sp_ctx_.rank = 0;
-    sp_ctx_.process_group = process_group;
-    sp_ctx_.comm_plan.tokens_per_rank = std::move(tokens_per_rank);
-    sp_ctx_.comm_plan.padded_tokens_per_rank =
+    cp_ctx_ = {};
+    cp_ctx_.rank = 0;
+    cp_ctx_.process_group = process_group;
+    cp_ctx_.comm_plan.tokens_per_rank = std::move(tokens_per_rank);
+    cp_ctx_.comm_plan.padded_tokens_per_rank =
         std::move(padded_tokens_per_rank);
     CHECK_EQ(process_group->world_size(),
-             static_cast<int64_t>(sp_ctx_.comm_plan.tokens_per_rank.size()));
-    sp_ctx_.comm_plan.token_num_offset = 0;
-    sp_ctx_.comm_plan.ffn_can_rs =
-        v32_sp::can_ffn_rs(sp_ctx_.comm_plan.tokens_per_rank);
-    decoder->set_context_parallel_context(&sp_ctx_);
+             static_cast<int64_t>(cp_ctx_.comm_plan.tokens_per_rank.size()));
+    cp_ctx_.comm_plan.token_num_offset = 0;
+    cp_ctx_.comm_plan.ffn_can_rs =
+        v32_cp::can_ffn_rs(cp_ctx_.comm_plan.tokens_per_rank);
+    decoder->set_context_parallel_context(&cp_ctx_);
   }
 
   ModelParamsView build_prefill_params(int64_t batch_size, int64_t seq_len) {
@@ -880,9 +880,9 @@ class DeepseekV2DecoderLayerTest : public ::testing::Test {
   std::unique_ptr<test::MockProcessGroup> dp_pg_;
   std::unique_ptr<test::MockProcessGroup> tp_pg_;
   std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> sp_pg_;
+  std::unique_ptr<test::MockProcessGroup> cp_pg_;
   ModelContext context_{};
-  v32_cp::DeepseekV32CPContext sp_ctx_{};
+  v32_cp::DeepseekV32CPContext cp_ctx_{};
 };
 
 namespace {
@@ -1112,7 +1112,7 @@ TEST_P(DeepseekV2DecoderCarrierTest,
 
 TEST_F(DeepseekV2DecoderLayerTest, BuildPostAttnCarrierPackedLocal) {
   auto decoder = make_loaded_decoder(/*layer_id=*/0);
-  set_sp_ctx(decoder);
+  set_cp_ctx(decoder);
 
   auto attn_out =
       torch::full({2, model_args_.hidden_size()}, 1.0f, hidden_opts());
@@ -1124,7 +1124,7 @@ TEST_F(DeepseekV2DecoderLayerTest, BuildPostAttnCarrierPackedLocal) {
       *decoder, expected_skip.clone());
   auto remote_norm =
       torch::full({2, model_args_.hidden_size()}, 5.0f, hidden_opts());
-  sp_pg_->set_allgather_outputs({expected_local_norm, remote_norm});
+  cp_pg_->set_allgather_outputs({expected_local_norm, remote_norm});
 
   ModelParamsView input_params = ModelInputSnapshot(LlmModelParams()).view();
   auto carrier = DeepseekV2DecoderLayerTestPeer::build_post_attn_carrier(
@@ -1177,7 +1177,7 @@ TEST_F(DeepseekV2DecoderLayerTest, RestoreFfnOutputReplicated) {
 
 TEST_F(DeepseekV2DecoderLayerTest, RestoreFfnOutputPackedLocal) {
   auto decoder = make_loaded_decoder(/*layer_id=*/0);
-  set_sp_ctx(decoder);
+  set_cp_ctx(decoder);
 
   auto attn_out =
       torch::full({2, model_args_.hidden_size()}, 1.0f, hidden_opts());
@@ -1189,7 +1189,7 @@ TEST_F(DeepseekV2DecoderLayerTest, RestoreFfnOutputPackedLocal) {
       *decoder, expected_skip.clone());
   auto remote_norm =
       torch::full({2, model_args_.hidden_size()}, 5.0f, hidden_opts());
-  sp_pg_->set_allgather_outputs(
+  cp_pg_->set_allgather_outputs(
       std::vector<torch::Tensor>{expected_local_norm, remote_norm});
 
   ModelParamsView input_params = ModelInputSnapshot(LlmModelParams()).view();
@@ -1229,11 +1229,11 @@ TEST_F(DeepseekV2DecoderLayerTest, CanLocalOutPackedLocalNeedsEqualTokens) {
   auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
       DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
 
-  set_sp_ctx(decoder, tp_pg_.get(), {2, 2}, {2, 2});
+  set_cp_ctx(decoder, tp_pg_.get(), {2, 2}, {2, 2});
   EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::can_keep_local_output(
       *decoder, carrier, tp_pg_.get()));
 
-  set_sp_ctx(decoder, tp_pg_.get(), {2, 1}, {2, 2});
+  set_cp_ctx(decoder, tp_pg_.get(), {2, 1}, {2, 2});
   EXPECT_FALSE(DeepseekV2DecoderLayerTestPeer::can_keep_local_output(
       *decoder, carrier, tp_pg_.get()));
 
@@ -1257,7 +1257,7 @@ TEST_F(DeepseekV2DecoderLayerTest, CanLocalOutPackedLocalAllowsGlobalAlias) {
   auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
       DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
 
-  set_sp_ctx(decoder, tp_pg_.get(), {2, 2}, {2, 2});
+  set_cp_ctx(decoder, tp_pg_.get(), {2, 2}, {2, 2});
   EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::can_keep_local_output(
       *decoder, carrier, global_pg_.get()));
 }
@@ -1277,7 +1277,7 @@ TEST_F(DeepseekV2DecoderLayerTest, CommOutPackedLocalReduceScatters) {
   refresh_ctx();
 
   auto decoder = make_decoder(/*layer_id=*/0);
-  set_sp_ctx(decoder, tp_pg_.get(), {2, 2}, {2, 2});
+  set_cp_ctx(decoder, tp_pg_.get(), {2, 2}, {2, 2});
   auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
       DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
   auto packed_out = torch::tensor(
@@ -1293,7 +1293,7 @@ TEST_F(DeepseekV2DecoderLayerTest, CommOutPackedLocalReduceScatters) {
 
 TEST_F(DeepseekV2DecoderLayerTest, CommOutPackedLocalSlicesSingleRankOutput) {
   auto decoder = make_decoder(/*layer_id=*/0);
-  set_sp_ctx(decoder, nullptr, {2, 2}, {2, 2});
+  set_cp_ctx(decoder, nullptr, {2, 2}, {2, 2});
   auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
       DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
   test::MockProcessGroup single_rank_pg(
@@ -1323,7 +1323,7 @@ TEST_F(DeepseekV2DecoderLayerTest, CommOutPackedLocalFallsBackOnPgMismatch) {
   refresh_ctx();
 
   auto decoder = make_decoder(/*layer_id=*/0);
-  set_sp_ctx(decoder, tp_pg_.get(), {2, 2}, {2, 2});
+  set_cp_ctx(decoder, tp_pg_.get(), {2, 2}, {2, 2});
   auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
       DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
   auto packed_out = torch::tensor(
