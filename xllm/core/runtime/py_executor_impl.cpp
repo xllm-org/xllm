@@ -98,6 +98,14 @@ void register_xllm_runtime_module(py::module_& m) {
     }
     return tensor;
   });
+  m.def("tp_all_to_all",
+        [](const torch::Tensor& tensor, int64_t world_size) -> py::object {
+          PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
+          if (py_causal_lm == nullptr) {
+            return py::none();
+          }
+          return py::cast(py_causal_lm->tp_all_to_all(tensor, world_size));
+        });
   m.def("dp_all_gather",
         [](torch::Tensor tensor,
            const std::vector<int32_t>& execution_token_counts) {

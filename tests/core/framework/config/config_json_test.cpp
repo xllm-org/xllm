@@ -125,6 +125,24 @@ TEST(ExecutionConfigTest, AttnDpCommandLineFlagOverridesJson) {
   EXPECT_TRUE(execution_config.enable_attn_dp_weight_sharding());
 }
 
+#if defined(USE_NPU)
+TEST(KernelConfigTest, DsaCpJsonRoundTrip) {
+  KernelConfig kernel_config;
+  EXPECT_FALSE(kernel_config.enable_dsa_cp());
+  JsonReader json_config =
+      config::parse_json_string(R"json({"enable_dsa_cp":true})json");
+  kernel_config.from_json(json_config);
+  EXPECT_TRUE(kernel_config.enable_dsa_cp());
+  nlohmann::ordered_json output = nlohmann::ordered_json::object();
+  kernel_config.append_config_json(output);
+  EXPECT_TRUE(output.at("enable_dsa_cp").get<bool>());
+  const auto& option_names = KernelConfig::option_category().option_names;
+  EXPECT_NE(
+      std::find(option_names.begin(), option_names.end(), "enable_dsa_cp"),
+      option_names.end());
+}
+#endif
+
 #if !defined(USE_NPU)
 TEST(KernelConfigTest, RejectsNpuOnlyDsparkNativeSas) {
   JsonReader json_config =
@@ -132,6 +150,13 @@ TEST(KernelConfigTest, RejectsNpuOnlyDsparkNativeSas) {
   KernelConfig kernel_config;
   EXPECT_DEATH(kernel_config.from_json(json_config),
                "enable_dspark_native_sas is only supported on NPU");
+}
+TEST(KernelConfigTest, RejectsNpuOnlyDsaCp) {
+  JsonReader json_config =
+      config::parse_json_string(R"json({"enable_dsa_cp":true})json");
+  KernelConfig kernel_config;
+  EXPECT_DEATH(kernel_config.from_json(json_config),
+               "enable_dsa_cp is only supported on NPU");
 }
 #endif
 

@@ -418,6 +418,13 @@ py::dict PyCausalLM::build_config_dict(const ModelContext& context) const {
   d["enable_mmrs_fusion"] = flash_comm1_options.enable_mmrs_fusion;
   d["mmrs_comm_mode"] = flash_comm1_options.mmrs_comm_mode;
   d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
+  // Classify the constructed model, including explicit overrides, rather than
+  // only the target name.
+  const auto& python_model_type = python_model_name_.empty()
+                                      ? model_args_.model_type()
+                                      : python_model_name_;
+  d["enable_dsa_cp"] = KernelConfig::get_instance().enable_dsa_cp() &&
+                       util::is_deepseek_v41_model_type(python_model_type);
   if (is_glm5_next_target_model_type(model_args_.model_type())) {
     d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
   }
@@ -643,6 +650,20 @@ torch::Tensor PyCausalLM::tp_all_gather(const torch::Tensor& tensor,
   auto output_shape = tensor.sizes().vec();
   output_shape[dim] *= world_size;
   return gathered.reshape(output_shape).contiguous();
+}
+
+torch::Tensor PyCausalLM::tp_all_to_all(const torch::Tensor& tensor,
+                                        int64_t world_size) {
+  CHECK(tp_group_ != nullptr)
+      << "TP all-to-all requires its native process group";
+  CHECK_EQ(world_size, tp_group_->world_size())
+      << "TP all-to-all world-size mismatch";
+  CHECK_GT(tensor.dim(), 0);
+  CHECK_EQ(tensor.size(0) % tp_group_->world_size(), 0);
+  torch::Tensor input = tensor.contiguous();
+  torch::Tensor output = torch::empty_like(input);
+  tp_group_->all_to_all_single(output, input);
+  return output;
 }
 
 torch::Tensor PyCausalLM::dp_all_gather(

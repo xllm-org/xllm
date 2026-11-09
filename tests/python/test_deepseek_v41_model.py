@@ -288,9 +288,144 @@ def test_csa2_plan_rejects_invalid_source_layouts(
         CSA2LayerPlan.build(n_layers, ratios, kv_sources, index_sources)
 
 
-# ---------------------------------------------------------------------------
-# Module layout / structure (semantics doc sections 2.6, 5, 6)
-# ---------------------------------------------------------------------------
+def test_dsa_cp_replicates_query_weights_and_keeps_output_sharded() -> None:
+    config = {**_DSV41_TINY_CONFIG, "enable_dsa_cp": True, "tp_size": 2, "tp_rank": 0, "engram_layer_ids": []}
+    cfg = DeepseekV41Config.from_dict(config)
+    model = DeepseekV41Model(cfg, torch.float32, torch.device("cpu"), config=config)
+    attn = model.layers[0].self_attn
+    assert attn.enable_dsa_cp
+    assert attn.q_b_proj.weight.shape[0] == cfg.n_heads * cfg.head_dim
+    assert attn.attn_sink.numel() == cfg.n_heads
+    assert attn.n_local_groups == cfg.o_groups // cfg.tp_size
+    assert attn.o_b_proj.weight.shape[1] == cfg.o_groups * cfg.o_lora_rank // cfg.tp_size
+
+
+def test_dsa_cp_rejects_pcp_topology() -> None:
+    config = {**_DSV41_TINY_CONFIG, "enable_dsa_cp": True, "cp_size": 2, "engram_layer_ids": []}
+    cfg = DeepseekV41Config.from_dict(config)
+    with pytest.raises(ValueError, match="enable_dsa_cp cannot be combined with cp_size"):
+        DeepseekV41Model(cfg, torch.float32, torch.device("cpu"), config=config)
+
+
+def test_dsa_cp_rejects_uneven_head_shards_at_construction() -> None:
+    config = {
+        **_DSV41_TINY_CONFIG,
+        "enable_dsa_cp": True,
+        "tp_size": 2,
+        "num_attention_heads": 3,
+        "engram_layer_ids": [],
+    }
+    cfg = DeepseekV41Config.from_dict(config)
+    with pytest.raises(ValueError, match="n_heads divisible by tp_size"):
+        DeepseekV41Model(cfg, torch.float32, torch.device("cpu"), config=config)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("batch_kind", ["prefill", "chunked_prefill", "decode", "decode_graph", "mixed", "dummy"])
+def test_dsa_cp_all_batch_types_match_original_tp(monkeypatch: pytest.MonkeyPatch, rank: int, batch_kind: str) -> None:
+    from xllm.python import distributed
+    from xllm.python.model_executor.dsa_cp import get_current_dsa_cp_runtime
+
+    config = {**_DSV41_TINY_CONFIG, "tp_size": 2, "tp_rank": rank, "engram_layer_ids": []}
+    enabled_config = {**config, "enable_dsa_cp": True}
+    enabled_model = DeepseekV41Model(
+        DeepseekV41Config.from_dict(enabled_config), torch.float32, torch.device("cpu"), config=enabled_config
+    )
+    baseline_model = DeepseekV41Model(
+        DeepseekV41Config.from_dict(config), torch.float32, torch.device("cpu"), config=config
+    )
+    enabled = enabled_model.layers[0].self_attn
+    baseline = baseline_model.layers[0].self_attn
+    torch.manual_seed(42)
+    with torch.no_grad():
+        for parameter in enabled.parameters():
+            parameter.uniform_(-0.1, 0.1)
+        baseline_state = dict(enabled.state_dict())
+        head_width = baseline.q_b_proj.weight.size(0)
+        baseline_state["q_b_proj.weight"] = enabled.q_b_proj.weight[rank * head_width : (rank + 1) * head_width]
+        heads = baseline.attn_sink.numel()
+        baseline_state["attn_sink"] = enabled.attn_sink[rank * heads : (rank + 1) * heads]
+        baseline.load_state_dict(baseline_state)
+
+    q_lens = [2, 1] if batch_kind in ("mixed", "prefill", "chunked_prefill") else [1]
+    tokens = sum(q_lens)
+    backend = object.__new__(Csa2AttentionBackend)
+    backend.window_size, backend.scale = 2, enabled.head_dim**-0.5
+    backend._kv_caches = [SimpleNamespace(swa=None)]
+    backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
+    backend._current_forward_metadata = lambda: context.metadata
+    backend._shared_runtime = CSA2SharedRuntime
+    backend._smla_fallback_reason = lambda *_: "switch off"
+    reference = None
+    exchange_calls = 0
+
+    def _execute(q: torch.Tensor, kv: torch.Tensor, layer: dq.DeepseekV41Attention) -> torch.Tensor:
+        nonlocal reference
+        runtime = get_current_dsa_cp_runtime()
+        if layer is enabled:
+            assert runtime is not None
+            assert q.shape == (runtime.plan.end - runtime.plan.start, enabled.cfg.n_heads, enabled.head_dim)
+            ctx = layer._csa2_ctx
+            full_q = layer.q_b_proj(ctx.qr).view(tokens, enabled.cfg.n_heads, enabled.head_dim)
+            full_q = apply_interleaved_rope(full_q, ctx.positions, ctx.cos_sin_cache)
+            reference = backend._csa2_attention(
+                full_q,
+                kv,
+                layer,
+                context.metadata.dsa_metadata,
+                q_lens,
+                context.metadata.dsa_metadata.seq_lens,
+                None,
+                CSA2SharedRuntime(),
+            )
+            actual = backend.execute_csa2_layer(q, kv, layer)
+            torch.testing.assert_close(actual, runtime.plan.shard(reference))
+            return actual
+        assert runtime is None
+        assert q.shape[1] == heads
+        return backend.execute_csa2_layer(q, kv, layer)
+
+    def _exchange(send: torch.Tensor, world_size: int, group_name: str) -> torch.Tensor:
+        nonlocal exchange_calls
+        exchange_calls += 1
+        runtime = get_current_dsa_cp_runtime()
+        assert world_size == 2 and group_name == "tp" and reference is not None
+        plan = runtime.plan
+        padded = reference.new_zeros((plan.tokens_per_rank, enabled.cfg.n_heads, enabled.head_dim))
+        padded[: plan.end - plan.start] = plan.shard(reference)
+        expected = padded.view(plan.tokens_per_rank, 2, heads, enabled.head_dim).permute(1, 0, 2, 3)
+        torch.testing.assert_close(send, expected.reshape(-1, heads, enabled.head_dim))
+        received = reference.new_zeros((plan.tokens_per_rank * 2, heads, enabled.head_dim))
+        received[:tokens] = reference[:, rank * heads : (rank + 1) * heads]
+        return received
+
+    monkeypatch.setattr(dq, "fp8_act_qdq", lambda x, *_: x)
+    monkeypatch.setattr(distributed, "all_to_all", _exchange, raising=False)
+    monkeypatch.setattr(distributed, "tp_all_reduce", lambda x: x)
+    metadata = SimpleNamespace(
+        is_prefill=batch_kind in ("prefill", "dummy"),
+        is_chunked_prefill=batch_kind in ("mixed", "chunked_prefill"),
+        is_mixed=batch_kind == "mixed",
+        is_dummy=batch_kind == "dummy",
+        dsa_graph_mode=batch_kind == "decode_graph",
+        dsa_metadata=SimpleNamespace(
+            seq_lens_q=torch.tensor(q_lens),
+            seq_lens_q_host=q_lens,
+            seq_lens=torch.tensor(q_lens) + 7,
+            block_tables=[],
+            slot_mappings=[],
+            is_acl_graph=batch_kind == "decode_graph",
+        ),
+    )
+    hidden, positions = torch.randn(tokens, enabled.cfg.hidden_size), torch.arange(tokens)
+    cos_sin_cache = torch.cat([torch.ones(tokens, 4), torch.zeros(tokens, 4)], dim=-1)
+    context = ForwardContext(SimpleNamespace(execute_csa2_layer=_execute), torch.device("cpu"), metadata, [])
+    with torch.no_grad(), forward_context(context):
+        expected = baseline(hidden, positions, cos_sin_cache)
+    context = ForwardContext(SimpleNamespace(execute_csa2_layer=_execute), torch.device("cpu"), metadata, [])
+    with torch.no_grad(), forward_context(context):
+        torch.testing.assert_close(enabled(hidden, positions, cos_sin_cache), expected)
+    assert exchange_calls == 1
 
 
 def _tiny_model() -> DeepseekV41Model:

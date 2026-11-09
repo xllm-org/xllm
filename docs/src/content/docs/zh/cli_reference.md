@@ -251,6 +251,12 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `npu_kernel_backend` | `string` | `"AUTO"` | NPU kernel 后端，支持 `AUTO`、`TORCH`。 |
 | `enable_fused_mc2` | `int32` | `-1` | NPU 的 Fused MC2 模式；`-1` 使用自动默认值，`0` 禁用 fused MC2，正值启用 dense matmul-allreduce，`1` 对 MoE 使用 DispatchFFNCombine，`2` 对 MoE 使用 DispatchGmmCombineDecode。 |
 | `enable_dspark_native_sas` | `bool` | `false` | 启用 NPU DSpark 原生 SparseAttnSharedkv 语义。旧版算子若不接受非空 `ori_sparse_indices`，可能在 tiling 阶段终止进程；请保持关闭以使用 q_len=1 兼容模式。 |
+| `enable_dsa_cp` | `bool` | `false` | 为 NPU 上的 Python DeepSeek-V4.1 主模型启用 DSA query 并行。Prefill、chunked-prefill、prefill/decode 混合批次和 decode 均在现有 TP 组内切分 query，保留完整 KV，并通过 all-to-all 恢复本 rank 的 TP heads。Decode DSA CP 支持 ACL 图，回放时使用实时设备 KV 长度。要求 `cp_size=1`；TP=1 时无操作。 |
+
+使用 `--enable_dsa_cp=true`，也可在配置 JSON 中设置 `"enable_dsa_cp": true`。
+该开关独立于 `cp_size`；后者继续配置另一套 PCP 拓扑。TP > 1 时，复制 Q-B 和 attention sink
+权重会增加权重显存占用。
+DeepSeek-V4.1 的另一套 PCP 路径（`cp_size>1`）目前尚未支持。
 
 ## DiTConfig
 

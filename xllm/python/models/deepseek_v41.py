@@ -285,6 +285,7 @@ class DeepseekV41Config(DeepseekV4Config):
     dspark_noise_token_id: int = 128799
     dspark_n_routed_experts: int = 128
     dspark_num_experts_per_tok: int = 3
+    enable_dsa_cp: bool = False
     # -- Vision (Phase 4); image_token_id also drives gate.bias_vl --
     # -1 = no image tokens (text-only), matching the C++ loader default.
     image_token_id: int = -1
@@ -344,6 +345,7 @@ class DeepseekV41Config(DeepseekV4Config):
             dspark_noise_token_id=int(_pick(merged, "dspark_noise_token_id", default=128799)),
             dspark_n_routed_experts=int(_pick(merged, "dspark_n_routed_experts", default=128)),
             dspark_num_experts_per_tok=int(_pick(merged, "dspark_num_experts_per_tok", default=3)),
+            enable_dsa_cp=bool(_pick(merged, "enable_dsa_cp", default=False)),
             image_token_id=int(_pick(merged, "image_token_id", default=-1)),
             engram_config=EngramConfig.from_value(merged.get("engram_config", {})),
             pp_size=int(_pick(merged, "pp_size", default=1)),
@@ -576,7 +578,10 @@ class DeepseekV41Attention(Attention):
         quant_mode: str = V41_QUANT_NONE,
     ) -> None:
         tp = cfg.tp_size
-        num_heads = cfg.n_heads // tp
+        self.enable_dsa_cp = cfg.enable_dsa_cp and tp > 1
+        if self.enable_dsa_cp and cfg.n_heads % tp:
+            raise ValueError("enable_dsa_cp requires n_heads divisible by tp_size")
+        num_heads = cfg.n_heads if self.enable_dsa_cp else cfg.n_heads // tp
         head_dim = cfg.head_dim
         super().__init__(
             num_heads=num_heads,
@@ -683,11 +688,23 @@ class DeepseekV41Attention(Attention):
         if not callable(execute_csa2):
             raise RuntimeError("DeepSeek-V4.1 requires the CSA2 attention backend")
         num_tokens = hidden.size(0)
+        cp_context = None
+        query_positions = positions
+        if self.enable_dsa_cp:
+            from xllm.python.model_executor.dsa_cp import get_dsa_cp_runtime
+
+            runtime = get_dsa_cp_runtime(num_tokens, self.cfg.tp_size, self.cfg.tp_rank)
+            cp_context = runtime.plan
+            query_positions = cp_context.shard(positions)
         # Q path: qr = q_norm(wq_a(x)); q = wq_b(qr) (no norm after wq_b);
         # RoPE on the last rope dims at token positions (model.py:770-772).
         qr = self.q_a_layernorm(self.q_a_proj(hidden))
-        q = self.q_b_proj(qr).view(num_tokens, self.num_heads_local, self.head_dim)
-        q = apply_interleaved_rope(q, positions, cos_sin_cache)
+        query_qr = cp_context.shard(qr) if cp_context is not None else qr
+        if query_qr.size(0) == 0:
+            q = hidden.new_empty((0, self.num_heads_local, self.head_dim))
+        else:
+            q = self.q_b_proj(query_qr).view(-1, self.num_heads_local, self.head_dim)
+            q = apply_interleaved_rope(q, query_positions, cos_sin_cache)
         # SWA KV path: kv_norm -> RoPE -> FP8 QDQ over the whole post-RoPE
         # vector (model.py:700-720).
         kv = self.kv_a_layernorm(self.kv_proj(hidden))
@@ -702,7 +719,10 @@ class DeepseekV41Attention(Attention):
         attn_out = execute_csa2(q, kv, self)
         # De-rotate the rope dims by the query's own rotation (conjugate)
         # BEFORE the o path (model.py:781).
-        attn_out = apply_interleaved_rope(attn_out, positions, cos_sin_cache, inverse=True)
+        if attn_out.size(0) > 0:
+            attn_out = apply_interleaved_rope(attn_out, query_positions, cos_sin_cache, inverse=True)
+        if cp_context is not None:
+            attn_out = cp_context.restore_tp_heads(attn_out)
         # O path: grouped LoRA projection (model.py:783-789).
         out = attn_out.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.o_a_proj.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -1043,6 +1063,8 @@ class DeepseekV41Model(nn.Module):
     ) -> None:
         super().__init__()
         if cfg.cp_size > 1:
+            if cfg.enable_dsa_cp:
+                raise ValueError("enable_dsa_cp cannot be combined with cp_size > 1")
             raise NotImplementedError(
                 "DeepSeek-V4.1 context parallelism is scheduled with the Phase-6 distributed work"
             )
@@ -1354,13 +1376,9 @@ class DeepseekV41ForCausalLM(PyModelBase):
             ck = f"layers.{i}."
             pm = f"model.layers.{i}."
             attn = self.model.layers[i].self_attn
-            # The five attention projections are constructed unconditionally by
-            # DeepseekV41Attention, so a missing checkpoint tensor is a broken
-            # export (not an optional module): fail instead of running with
-            # uninitialized weights.
             for ckpt_name, param_name, shard_dim in (
                 ("attn.wq_a", "self_attn.q_a_proj", None),
-                ("attn.wq_b", "self_attn.q_b_proj", 0),
+                ("attn.wq_b", "self_attn.q_b_proj", None if attn.enable_dsa_cp else 0),
                 ("attn.wkv", "self_attn.kv_proj", None),
                 ("attn.wo_a", "self_attn.o_a_proj", 0),
                 ("attn.wo_b", "self_attn.o_b_proj", 1),
@@ -1514,7 +1532,7 @@ class DeepseekV41ForCausalLM(PyModelBase):
             _w8a8(
                 ck + "attn.wq_b",
                 pm + "self_attn.q_b_proj",
-                {"weight": 0, "weight_scale": 0, "weight_offset": 0},
+                None if attn.enable_dsa_cp else {"weight": 0, "weight_scale": 0, "weight_offset": 0},
                 required=True,
             )
             _w8a8(ck + "attn.wkv", pm + "self_attn.kv_proj", required=True)
@@ -1563,16 +1581,11 @@ class DeepseekV41ForCausalLM(PyModelBase):
             sink_key = ck + "attn.attn_sink.weight"
         if loader.has(sink_key):
             sink = loader.get_tensor(sink_key)
-            if sink.dim() == 1 and sink.size(0) == cfg.n_heads and cfg.tp_size > 1:
-                # Preserve already-local sinks; shard full per-head checkpoints.
+            if sink.dim() == 1 and sink.size(0) == cfg.n_heads and cfg.tp_size > 1 and not attn.enable_dsa_cp:
                 sink = loader.shard(sink, dim=0)
             loader.copy_in(pm + "self_attn.attn_sink", sink)
             attn.attn_sink_loaded = True
         self._load_common_layer_norms(loader, ck, pm)
-        # Main-KV compressor (Full layers; no gate at ratio 1). Module
-        # construction decides which tensors are required, exactly like the
-        # five projections above: a checkpoint-presence test here would
-        # silently keep the nn.Linear default init for these weights.
         if hasattr(attn, "cmp_wkv"):
             loader.copy_in(
                 pm + "self_attn.cmp_wkv.weight",

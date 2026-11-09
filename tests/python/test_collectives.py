@@ -34,6 +34,70 @@ from xllm.python.distributed import cuda as cuda_collectives
 from xllm.python.models import glm5_2
 
 
+def test_tp_all_to_all_uses_native_group_without_python_rendezvous(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def _exchange(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+        assert world_size == 2
+        calls.append(tensor.clone())
+        return tensor.flip(0)
+
+    monkeypatch.setitem(sys.modules, "xllm_runtime", SimpleNamespace(tp_all_to_all=_exchange))
+    value = torch.arange(12).reshape(4, 3)
+    result = collectives.all_to_all(value, 2, "tp")
+    torch.testing.assert_close(result, value.flip(0))
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], value)
+
+
+@pytest.mark.parametrize("native_present", (False, True))
+def test_all_to_all_fallback_accepts_noncontiguous_input(monkeypatch: pytest.MonkeyPatch, native_present: bool) -> None:
+    group = SimpleNamespace(size=lambda: 2)
+    calls = []
+
+    def _no_native_runtime(tensor: torch.Tensor, world_size: int) -> None:
+        calls.append(world_size)
+
+    monkeypatch.setattr(collectives, "_native_runtime_op", lambda *_: _no_native_runtime if native_present else None)
+    monkeypatch.setattr(collectives, "get_process_group", lambda *_: group)
+    value = torch.arange(24).reshape(3, 8).t()
+    assert not value.is_contiguous()
+
+    def _exchange(output: torch.Tensor, input_tensor: torch.Tensor, group: object) -> None:
+        assert input_tensor.is_contiguous() and output.is_contiguous()
+        output.copy_(input_tensor.flip(0))
+
+    monkeypatch.setattr(dist, "all_to_all_single", _exchange)
+    result = collectives.all_to_all(value, 2, "tp")
+    torch.testing.assert_close(result, value.flip(0))
+    assert calls == ([2] if native_present else [])
+
+
+def test_all_to_all_fallback_rejects_world_size_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(collectives, "_native_runtime_op", lambda *_: None)
+    monkeypatch.setattr(collectives, "get_process_group", lambda *_: SimpleNamespace(size=lambda: 4))
+    with pytest.raises(RuntimeError, match="world-size mismatch"):
+        collectives.all_to_all(torch.zeros(8, 3), 2, "tp")
+
+
+@pytest.mark.parametrize("world_size", (1, 2))
+def test_all_to_all_fake_matches_real_noncontiguous_strides(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    monkeypatch.setattr(collectives, "_native_runtime_op", lambda *_: None)
+    monkeypatch.setattr(collectives, "get_process_group", lambda *_: SimpleNamespace(size=lambda: world_size))
+    monkeypatch.setattr(dist, "all_to_all_single", lambda output, input_tensor, group: output.copy_(input_tensor))
+    value = torch.arange(24).reshape(3, 8).t()
+    actual = collectives.all_to_all(value, world_size, "tp")
+    with FakeTensorMode() as mode:
+        fake = collectives.all_to_all(mode.from_tensor(value), world_size, "tp")
+    assert fake.shape == actual.shape
+    assert fake.dtype == actual.dtype
+    assert fake.device == actual.device
+    assert fake.stride() == actual.stride()
+    assert actual.is_contiguous() == (world_size > 1)
+
+
 class _FakeGroup:
     def __init__(self, rank: int, size: int) -> None:
         self._rank = rank

@@ -785,6 +785,33 @@ def _(
     return x.new_empty(shape)
 
 
+@torch.library.custom_op("xllm_ops::all_to_all", mutates_args=())
+def all_to_all(x: torch.Tensor, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    if world_size <= 0 or x.ndim == 0 or x.shape[0] % world_size:
+        raise ValueError("all_to_all requires row blocks divisible by world size")
+    if world_size == 1:
+        return x.clone()
+    input_tensor = _contiguous_gather_input(x)
+    if group_name == "tp":
+        op = _native_runtime_op("tp_all_to_all", input_tensor, group_name)
+        if op is not None:
+            output = op(input_tensor, world_size)
+            if output is not None:
+                return output
+    group = get_process_group(x.device, group_name)
+    if group.size() != world_size:
+        raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    output = torch.empty_like(input_tensor)
+    all_to_all_single_(output, input_tensor, group)
+    return output
+
+
+@all_to_all.register_fake
+def _all_to_all_fake(x: torch.Tensor, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    # TP=1 preserves strides; a multi-rank exchange returns contiguous rows.
+    return torch.empty_like(x) if world_size == 1 else x.new_empty(x.shape)
+
+
 def all_to_all_single_(
     output: torch.Tensor,
     input: torch.Tensor,
@@ -920,6 +947,7 @@ __all__ = [
     "broadcast_",
     "all_gather",
     "all_gather_variable",
+    "all_to_all",
     "all_to_all_single",
     "all_to_all_single_",
     "dp_all_gather",

@@ -124,6 +124,7 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
 
   void tp_all_reduce(torch::Tensor& tensor);
   torch::Tensor tp_all_gather(const torch::Tensor& tensor, int64_t dim);
+  torch::Tensor tp_all_to_all(const torch::Tensor& tensor, int64_t world_size);
   torch::Tensor dp_all_gather(
       const torch::Tensor& tensor,
       const std::vector<int32_t>& execution_token_counts);

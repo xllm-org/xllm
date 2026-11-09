@@ -251,6 +251,12 @@ Current support covers ordinary non-PD text inference with prefix caching enable
 | `npu_kernel_backend` | `string` | `"AUTO"` | NPU kernel backend. Supported values: `AUTO`, `TORCH`. |
 | `enable_fused_mc2` | `int32` | `-1` | Fused MC2 mode for NPU. `-1` uses the auto default, `0` disables fused MC2, positive values enable dense matmul-allreduce, `1` uses DispatchFFNCombine for MoE, `2` uses DispatchGmmCombineDecode for MoE. |
 | `enable_dspark_native_sas` | `bool` | `false` | Enable native NPU DSpark SparseAttnSharedkv semantics. Older operators that reject non-empty `ori_sparse_indices` may terminate during tiling; keep this disabled to use q_len=1 compatibility mode. |
+| `enable_dsa_cp` | `bool` | `false` | Enable DSA query parallelism for the main Python DeepSeek-V4.1 model on NPU. Prefill, chunked prefill, mixed prefill/decode batches and decode split queries across the existing TP group, retaining replicated KV and restoring local TP heads with all-to-all. Decode DSA CP supports ACL graphs with live device KV lengths. Requires `cp_size=1`; TP=1 is a no-op. |
+
+Use `--enable_dsa_cp=true` (or `"enable_dsa_cp": true` in the config JSON).
+This switch is independent of `cp_size`, which configures the separate PCP topology. Replicated Q-B and
+attention sink weights increase weight memory when TP > 1.
+DeepSeek-V4.1's separate PCP path (`cp_size>1`) is currently unsupported.
 
 ## DiTConfig
 
