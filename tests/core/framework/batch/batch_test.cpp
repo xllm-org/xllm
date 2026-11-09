@@ -204,7 +204,7 @@ void mount_linear_source_for_test(Sequence& sequence,
   std::vector<Block> output_blocks;
   output_blocks.reserve(1);
   output_blocks.emplace_back(std::move(output));
-  sequence.add_blocks(BlockType::LINEAR, std::move(output_blocks));
+  sequence.add_blocks(BlockType::LINEAR, output_blocks);
 }
 
 void release_linear_source_for_test(Sequence& sequence) {
@@ -960,7 +960,191 @@ TEST_P(HostRestoreInputTest, ConsumesRestoreRequirementWhenBuildingInput) {
 
 INSTANTIATE_TEST_SUITE_P(Builders, HostRestoreInputTest, ::testing::Bool());
 
+ModelArgs make_engram_args(int32_t max_ngram_size,
+                           std::vector<int32_t> layer_ids = {41}) {
+  ModelArgs args;
+  args.engram_layer_ids(std::move(layer_ids));
+  args.engram_max_ngram_size(max_ngram_size);
+  return args;
+}
+
 }  // namespace
+
+TEST(ForwardInputBuilderTest, EngramHistoryDecodeStepEmitsSlotTokenPairs) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  BlockManagerImpl manager(options);
+  const std::vector<int32_t> prompt = {10, 11, 12, 13, 14, 15, 16, 17};
+  Sequence sequence = make_basic_sequence(prompt);
+  sequence.add_blocks(BlockType::KV, manager.allocate(3));
+  std::vector<Block> swa_blocks = manager.allocate(3);
+  const int32_t window_block_id = swa_blocks[1].id();
+  sequence.add_blocks(BlockType::SWA, swa_blocks);
+  sequence.kv_state().incr_kv_cache_tokens_num(prompt.size());
+  sequence.append_token(Token(18));
+
+  ASSERT_FALSE(sequence.is_prefill_stage());
+  ASSERT_FALSE(sequence.is_engram_history_restored());
+
+  Batch batch({&sequence});
+  const LlmForwardInput input = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, 0, make_engram_args(/*max_ngram_size=*/3));
+
+  EXPECT_EQ(input.input_params.embedding.engram_history,
+            (std::vector<int32_t>{
+                window_block_id * 4 + 2, 16, window_block_id * 4 + 3, 17}));
+  EXPECT_TRUE(sequence.is_engram_history_restored());
+}
+
+TEST(ForwardInputBuilderTest, EngramHistoryLimitedToFinalDepthWindow) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  BlockManagerImpl manager(options);
+  const std::vector<int32_t> prompt = {
+      10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
+  Sequence sequence = make_basic_sequence(prompt);
+  sequence.add_blocks(BlockType::KV, manager.allocate(4));
+  std::vector<Block> swa_blocks = manager.allocate(3);
+  const int32_t window_block_id = swa_blocks[2].id();
+  sequence.add_blocks(BlockType::SWA, swa_blocks);
+  sequence.kv_state().incr_kv_cache_tokens_num(prompt.size());
+  sequence.append_token(Token(22));
+
+  Batch batch({&sequence});
+  const LlmForwardInput input = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, 0, make_engram_args(/*max_ngram_size=*/5));
+
+  EXPECT_EQ(input.input_params.embedding.engram_history,
+            (std::vector<int32_t>{window_block_id * 4 + 0,
+                                  18,
+                                  window_block_id * 4 + 1,
+                                  19,
+                                  window_block_id * 4 + 2,
+                                  20,
+                                  window_block_id * 4 + 3,
+                                  21}));
+  EXPECT_TRUE(sequence.is_engram_history_restored());
+}
+
+TEST(ForwardInputBuilderTest, EngramHistoryDisabledWithoutLayerIds) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  BlockManagerImpl manager(options);
+  const std::vector<int32_t> prompt = {10, 11, 12, 13, 14, 15, 16, 17};
+  Sequence sequence = make_basic_sequence(prompt);
+  sequence.add_blocks(BlockType::KV, manager.allocate(3));
+  sequence.add_blocks(BlockType::SWA, manager.allocate(3));
+  sequence.kv_state().incr_kv_cache_tokens_num(prompt.size());
+  sequence.append_token(Token(18));
+  ASSERT_FALSE(sequence.is_prefill_stage());
+
+  Batch batch({&sequence});
+  const LlmForwardInput input = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1,
+      0,
+      make_engram_args(/*max_ngram_size=*/3, /*layer_ids=*/{}));
+
+  EXPECT_TRUE(input.input_params.embedding.engram_history.empty());
+  EXPECT_FALSE(sequence.is_engram_history_restored());
+}
+
+TEST(ForwardInputBuilderTest, EngramHistoryLatchOnlySetAfterAppended) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  BlockManagerImpl manager(options);
+  const std::vector<int32_t> prompt = {10, 11, 12, 13, 14, 15, 16, 17};
+  Sequence sequence = make_basic_sequence(prompt);
+  sequence.add_blocks(BlockType::KV, manager.allocate(3));
+  std::vector<Block> swa_blocks = manager.allocate(3);
+  const int32_t window_block_id = swa_blocks[1].id();
+  const int32_t next_window_block_id = swa_blocks[2].id();
+  sequence.add_blocks(BlockType::SWA, swa_blocks);
+  sequence.kv_state().incr_kv_cache_tokens_num(prompt.size());
+  sequence.append_token(Token(18));
+
+  Batch batch({&sequence});
+  const LlmForwardInput first = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, 0, make_engram_args(/*max_ngram_size=*/1));
+  EXPECT_TRUE(first.input_params.embedding.engram_history.empty());
+  EXPECT_FALSE(sequence.is_engram_history_restored());
+
+  sequence.append_token(Token(19));
+  batch.refresh_forward_type();
+  const LlmForwardInput second = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, 0, make_engram_args(/*max_ngram_size=*/3));
+  EXPECT_EQ(second.input_params.embedding.engram_history,
+            (std::vector<int32_t>{
+                window_block_id * 4 + 3, 17, next_window_block_id * 4, 18}));
+  EXPECT_TRUE(sequence.is_engram_history_restored());
+}
+
+TEST(ForwardInputBuilderTest, EngramHistorySkipsPrefillStage) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  BlockManagerImpl manager(options);
+  const std::vector<int32_t> prompt = {10, 11, 12, 13, 14, 15, 16, 17};
+  Sequence sequence = make_basic_sequence(prompt);
+  sequence.add_blocks(BlockType::KV, manager.allocate(3));
+  sequence.add_blocks(BlockType::SWA, manager.allocate(3));
+  sequence.kv_state().incr_kv_cache_tokens_num(4);
+  ASSERT_TRUE(sequence.is_prefill_stage());
+
+  Batch batch({&sequence});
+  const LlmForwardInput input = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, 0, make_engram_args(/*max_ngram_size=*/3));
+
+  EXPECT_TRUE(input.input_params.embedding.engram_history.empty());
+  EXPECT_FALSE(sequence.is_engram_history_restored());
+}
+
+TEST(ForwardInputBuilderTest, EngramHistoryRestoredLatchSuppressesLaterSteps) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  BlockManagerImpl manager(options);
+  const std::vector<int32_t> prompt = {10, 11, 12, 13, 14, 15, 16, 17};
+  Sequence sequence = make_basic_sequence(prompt);
+  sequence.add_blocks(BlockType::KV, manager.allocate(3));
+  sequence.add_blocks(BlockType::SWA, manager.allocate(3));
+  sequence.kv_state().incr_kv_cache_tokens_num(prompt.size());
+  sequence.append_token(Token(18));
+
+  Batch batch({&sequence});
+  const LlmForwardInput first = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, 0, make_engram_args(/*max_ngram_size=*/3));
+  EXPECT_EQ(first.input_params.embedding.engram_history.size(), 4u);
+  ASSERT_TRUE(sequence.is_engram_history_restored());
+
+  sequence.append_token(Token(19));
+  batch.refresh_forward_type();
+  const LlmForwardInput second = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, 0, make_engram_args(/*max_ngram_size=*/3));
+  EXPECT_TRUE(second.input_params.embedding.engram_history.empty());
+}
+
+TEST(ForwardInputBuilderTest, EngramHistorySkipsExpiredPlaceholderBlocks) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4);
+  BlockManagerImpl manager(options);
+  const std::vector<int32_t> prompt = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+  Sequence sequence = make_basic_sequence(prompt);
+  sequence.add_blocks(BlockType::KV, manager.allocate(3));
+  std::vector<Block> live_swa = manager.allocate(2);
+  const int32_t live_block_id = live_swa[0].id();
+  std::vector<Block> swa_table(2);
+  swa_table.insert(swa_table.end(), live_swa.begin(), live_swa.end());
+  sequence.add_blocks(BlockType::SWA, swa_table);
+  sequence.kv_state().incr_kv_cache_tokens_num(prompt.size());
+  sequence.append_token(Token(20));
+
+  Batch batch({&sequence});
+  const LlmForwardInput input = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, 0, make_engram_args(/*max_ngram_size=*/5));
+
+  EXPECT_EQ(input.input_params.embedding.engram_history,
+            (std::vector<int32_t>{
+                live_block_id * 4 + 0, 18, live_block_id * 4 + 1, 19}));
+  EXPECT_TRUE(sequence.is_engram_history_restored());
+}
 
 TEST(BatchTest, ProcessSampleOutputStoresMtpBootstrapEmbedding) {
   BlockManager::Options options;

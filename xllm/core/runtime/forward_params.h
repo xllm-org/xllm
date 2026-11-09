@@ -56,6 +56,22 @@ constexpr int32_t kUnknownPackedSampleCount = -1;
 
 namespace detail {
 
+template <typename T>
+inline void append_and_clear(std::vector<T>& destination,
+                             std::vector<T>& source) {
+  if (source.empty()) {
+    return;
+  }
+  if (destination.empty()) {
+    destination = std::move(source);
+  } else {
+    destination.insert(destination.end(),
+                       std::make_move_iterator(source.begin()),
+                       std::make_move_iterator(source.end()));
+  }
+  source.clear();
+}
+
 constexpr uint64_t kForwardInputBufferAlignment = 16;
 
 inline uint64_t align_up(uint64_t value, uint64_t alignment) {
@@ -615,36 +631,14 @@ inline std::optional<ForwardOutput> make_transfer_failure_output(
 inline void append_failed_request_ids(
     ForwardOutput& destination,
     std::vector<std::string>&& failed_request_ids) {
-  if (failed_request_ids.empty()) {
-    return;
-  }
-  if (destination.failed_request_ids.empty()) {
-    destination.failed_request_ids = std::move(failed_request_ids);
-    return;
-  }
-  destination.failed_request_ids.insert(
-      destination.failed_request_ids.end(),
-      std::make_move_iterator(failed_request_ids.begin()),
-      std::make_move_iterator(failed_request_ids.end()));
-  failed_request_ids.clear();
+  detail::append_and_clear(destination.failed_request_ids, failed_request_ids);
 }
 
 inline void transfer_retained_inputs(ForwardOutput& destination,
                                      ForwardOutput& source) {
   CHECK_NE(&destination, &source)
       << "transfer_retained_inputs cannot alias source and destination";
-  if (source.retained_inputs.empty()) {
-    return;
-  }
-  if (destination.retained_inputs.empty()) {
-    destination.retained_inputs = std::move(source.retained_inputs);
-  } else {
-    destination.retained_inputs.insert(
-        destination.retained_inputs.end(),
-        std::make_move_iterator(source.retained_inputs.begin()),
-        std::make_move_iterator(source.retained_inputs.end()));
-  }
-  source.retained_inputs.clear();
+  detail::append_and_clear(destination.retained_inputs, source.retained_inputs);
 }
 
 inline std::vector<std::shared_ptr<const void>> take_retained_inputs(

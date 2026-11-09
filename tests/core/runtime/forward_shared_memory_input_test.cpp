@@ -35,6 +35,15 @@ namespace {
 
 using LayerOffsets = std::vector<VirtualKVCacheLayerGlobalOffsets>;
 
+std::string unique_segment_name(const std::string& prefix) {
+  std::string name = prefix + std::to_string(getpid()) + "_" +
+                     ::testing::UnitTest::GetInstance()
+                         ->current_test_info()
+                         ->test_suite_name();
+  std::replace(name.begin(), name.end(), '/', '_');
+  return name;
+}
+
 LayerOffsets make_sparse_role_offsets() {
   constexpr uint64_t kLargeOffset = uint64_t{1} << 34;
   return {{{0, kLargeOffset, 128}, {64, kLargeOffset + 64, 256}, {}},
@@ -132,11 +141,7 @@ TYPED_TEST(ForwardSharedFullLeaseInputTest,
 
 TYPED_TEST(ForwardSharedFullLeaseInputTest,
            SharedMemoryReplacesFullLeaseEpochsOnFollowingInput) {
-  std::string name = "forward_full_leases_" + std::to_string(getpid()) + "_" +
-                     ::testing::UnitTest::GetInstance()
-                         ->current_test_info()
-                         ->test_suite_name();
-  std::replace(name.begin(), name.end(), '/', '_');
+  std::string name = unique_segment_name("forward_full_leases_");
   bool is_creator = false;
   constexpr size_t kSegmentBytes = 1 << 20;
   ForwardSharedMemoryTransport writer(
@@ -184,11 +189,85 @@ TYPED_TEST(ForwardSharedFullLeaseInputTest,
   EXPECT_TRUE(decoded.input_params.embedding.full_block_lease_epochs.empty());
 }
 
+TYPED_TEST(ForwardSharedMemoryInputTest,
+           PackedInputPreservesEngramHistoryAfterSourceRelease) {
+  const std::vector<int32_t> expected_history = {4, 11, 5, 23, 8, 42};
+  TypeParam lazy;
+  {
+    TypeParam source = make_input<TypeParam>({});
+    source.input_params.embedding.extra_token_ids = {-1};
+    source.input_params.embedding.engram_history = expected_history;
+    source.input_params.mtp_shifted_token_ids =
+        torch::tensor({41, 43}, torch::kInt32);
+    source.input_params.embedding.mtp_shifted_token_ids =
+        torch::tensor({47, 53}, torch::kInt32);
+    const TypeParam copied =
+        source.to(torch::Device(torch::kCPU), torch::kFloat32);
+    source.input_params.embedding.engram_history.clear();
+    EXPECT_EQ(copied.input_params.embedding.engram_history, expected_history);
+    proto::PackedForwardInput packed;
+    ASSERT_TRUE(copied.to_packed_proto(&packed));
+    ASSERT_TRUE(lazy.from_packed_proto(packed));
+    packed.mutable_payload()->assign(packed.payload().size(), '\0');
+  }
+  const TypeParam decoded =
+      lazy.to(torch::Device(torch::kCPU), torch::kFloat32);
+  EXPECT_EQ(decoded.input_params.embedding.engram_history, expected_history);
+  EXPECT_EQ(decoded.input_params.embedding.extra_token_ids,
+            (std::vector<int32_t>{-1}));
+  EXPECT_TRUE(torch::equal(decoded.input_params.mtp_shifted_token_ids,
+                           torch::tensor({41, 43}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(decoded.input_params.embedding.mtp_shifted_token_ids,
+                           torch::tensor({47, 53}, torch::kInt32)));
+}
+
+TYPED_TEST(ForwardSharedMemoryInputTest,
+           SharedMemoryReplacesEngramHistoryOnFollowingInput) {
+  std::string name = unique_segment_name("forward_engram_history_");
+  bool is_creator = false;
+  constexpr size_t kSegmentBytes = 1 << 20;
+  ForwardSharedMemoryTransport writer(
+      name, kSegmentBytes, is_creator, ForwardType::RAW_INPUT);
+  ASSERT_TRUE(is_creator);
+  ForwardSharedMemoryTransport reader(
+      name, kSegmentBytes, is_creator, ForwardType::RAW_INPUT);
+  ASSERT_FALSE(is_creator);
+  TypeParam source = make_input<TypeParam>({});
+  source.input_params.embedding.extra_token_ids = {-1};
+  source.input_params.mtp_shifted_token_ids =
+      torch::tensor({41, 43}, torch::kInt32);
+  source.input_params.embedding.mtp_shifted_token_ids =
+      torch::tensor({47, 53}, torch::kInt32);
+  TypeParam decoded;
+  const std::vector<std::vector<int32_t>> histories = {
+      {4, 11, 5, 23, 8, 42}, {9, 37}, {}};
+  for (const auto& history : histories) {
+    source.input_params.embedding.engram_history = history;
+    ASSERT_TRUE(
+        ForwardSharedMemoryTransport::can_write_input(source, kSegmentBytes));
+    ASSERT_TRUE(writer.input_write(source));
+    ASSERT_TRUE(reader.input_read(
+        decoded,
+        torch::Device(torch::kCPU),
+        InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE));
+    EXPECT_EQ(decoded.input_params.embedding.engram_history, history);
+    const TypeParam ready =
+        decoded.to(torch::Device(torch::kCPU), torch::kFloat32);
+    EXPECT_EQ(ready.input_params.embedding.engram_history, history);
+    EXPECT_EQ(ready.input_params.embedding.extra_token_ids,
+              (std::vector<int32_t>{-1}));
+    EXPECT_TRUE(torch::equal(ready.input_params.mtp_shifted_token_ids,
+                             torch::tensor({41, 43}, torch::kInt32)));
+    EXPECT_TRUE(torch::equal(ready.input_params.embedding.mtp_shifted_token_ids,
+                             torch::tensor({47, 53}, torch::kInt32)));
+  }
+}
+
 TYPED_TEST(ForwardSharedMemoryInputTest, RejectsPreviousPackedInputSchema) {
   const TypeParam source = make_input<TypeParam>(make_sparse_role_offsets());
   proto::PackedForwardInput packed;
   ASSERT_TRUE(source.to_packed_proto(&packed));
-  constexpr uint16_t kPreviousVersion = 11;
+  constexpr uint16_t kPreviousVersion = 12;
   ASSERT_GE(packed.payload().size(),
             sizeof(uint64_t) + sizeof(kPreviousVersion));
   std::memcpy(packed.mutable_payload()->data() + sizeof(uint64_t),
@@ -245,11 +324,7 @@ TYPED_TEST(ForwardSharedMemoryInputTest,
 
 TYPED_TEST(ForwardSharedMemoryInputTest,
            SharedMemoryReplacesSparseIndexOffsetsOnFollowingInput) {
-  std::string name = "forward_input_offsets_" + std::to_string(getpid()) + "_" +
-                     ::testing::UnitTest::GetInstance()
-                         ->current_test_info()
-                         ->test_suite_name();
-  std::replace(name.begin(), name.end(), '/', '_');
+  std::string name = unique_segment_name("forward_input_offsets_");
   bool is_creator = false;
   constexpr size_t kSegmentBytes = 1 << 20;
   ForwardSharedMemoryTransport writer(

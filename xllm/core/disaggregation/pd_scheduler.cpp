@@ -28,6 +28,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "core/common/types.h"
+#include "core/disaggregation/pd_kv_response.h"
 #include "core/distributed_runtime/distributed_vmm_coordinator.h"
 #include "core/distributed_runtime/kv_transfer_coordinator.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -748,6 +749,9 @@ void PDScheduler::prefill_send_first_generation() {
 
   std::vector<std::shared_ptr<Request>> requests;
   for (auto& request : running_requests_) {
+    if (!request) {
+      continue;
+    }
     // Check if the request is a recently completed prefill request
     if (request->sequences()[0]->num_generated_tokens() == 1) {
       if (!options_.disable_log_stats()) {
@@ -778,6 +782,16 @@ void PDScheduler::prefill_send_first_generation() {
       release_request_blocks(request, /*cache_prefix=*/true);
     };
     for (auto& request : requests) {
+      if (request->finished()) {
+        VLOG(1) << "Prefill terminal response without decode handoff, "
+                << "request_id: " << request->request_id();
+        release_failed_request(request);
+        output_dispatcher_->process_completed_request(request);
+        output_dispatcher_->wait_completion();
+        enqueue_request_block_release(std::move(request),
+                                      /*cache_prefix=*/true);
+        continue;
+      }
       if (request->cancelled()) {
         fail_request(
             request,
@@ -836,37 +850,13 @@ void PDScheduler::prefill_send_first_generation() {
                             instance_info_.cluster_ids);
         ADD_VECTOR_TO_PROTO(gen->mutable_addrs(), instance_info_.addrs);
         Sequence* sequence = request->sequences()[0].get();
-        if (sequence->kv_state().has_multi_block_export()) {
-          const auto export_view =
-              sequence->kv_state().multi_block_export_view();
-          for (const auto& [block_type, blocks_ptr] : export_view) {
-            proto::KVTransferGroup* group = gen->add_source_groups();
-            group->set_group_id(cache_group_id(block_type));
-            group->mutable_ids()->Reserve(blocks_ptr->size());
-            for (const Block& block : *blocks_ptr) {
-              if (block.is_valid()) {
-                group->add_ids(static_cast<uint64_t>(block.id()));
-              }
-            }
-          }
-        } else {
-          const Slice<Block> blocks =
-              sequence->kv_state().blocks(BlockType::KV);
-          proto::KVTransferGroup* group = gen->add_source_groups();
-          group->set_group_id(cache_group_id(BlockType::KV));
-          group->mutable_ids()->Reserve(blocks.size());
-          for (const Block& block : blocks) {
-            CHECK(block.is_valid());
-            group->add_ids(static_cast<uint64_t>(block.id()));
-          }
-        }
-        if (has_linear_attention_layers(engine_->model_args())) {
-          const int32_t linear_state_id = sequence->get_linear_state_slot_id();
-          CHECK_GE(linear_state_id, 0)
-              << "Prefill did not allocate a linear-state slot.";
-          proto::KVTransferGroup* group = gen->add_source_groups();
-          group->set_group_id(cache_group_id(BlockType::LINEAR));
-          group->add_ids(static_cast<uint64_t>(linear_state_id));
+        if (!append_pd_pull_source_groups(
+                sequence->kv_state(),
+                has_linear_attention_layers(engine_->model_args()),
+                gen)) {
+          fail_request(request,
+                       {StatusCode::UNKNOWN, "Invalid PULL KV source groups"});
+          continue;
         }
         gen->set_dp_size(instance_info_.dp_size);
         gen->set_dp_rank(sequence->dp_rank());

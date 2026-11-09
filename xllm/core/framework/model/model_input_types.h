@@ -347,6 +347,10 @@ class LlmEmbeddingInput final {
   // extra token ids for each sequence, and -1 for last chunk
   std::vector<int32_t> extra_token_ids;
 
+  // Prompt-tail pairs: [receiver-local SWA slot, token id]; excluded from the
+  // flat wire payload.
+  std::vector<int32_t> engram_history;
+
   // Precomputed shifted token ids for MTP prefill, aligned with tokens.
   torch::Tensor mtp_shifted_token_ids;
 
@@ -368,6 +372,7 @@ class LlmEmbeddingInput final {
     out.full_block_lease_epochs = full_block_lease_epochs;
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
+    out.engram_history = engram_history;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
     out.mtp_bootstrap_row_idxes = mtp_bootstrap_row_idxes;
     out.mtp_bootstrap_embeddings =
@@ -592,6 +597,8 @@ class VlmEmbeddingInput final {
   // extra token ids for each sequence, and -1 for last chunk
   std::vector<int32_t> extra_token_ids;
 
+  std::vector<int32_t> engram_history;
+
   // Precomputed shifted token ids for MTP prefill, aligned with tokens.
   torch::Tensor mtp_shifted_token_ids;
 
@@ -613,6 +620,7 @@ class VlmEmbeddingInput final {
     out.full_block_lease_epochs = full_block_lease_epochs;
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
+    out.engram_history = engram_history;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
     out.mtp_bootstrap_row_idxes = mtp_bootstrap_row_idxes;
     out.mtp_bootstrap_embeddings =

@@ -400,6 +400,24 @@ class EngramHashState(nn.Module):
         self._kv_cache_ref = weakref.ref(swa_cache)
         return True
 
+    def restore_history(
+        self,
+        history: torch.Tensor,
+    ) -> None:
+        if self._cache is None:
+            raise RuntimeError("Engram history restore requires a bound cache")
+        if history.ndim != 2 or history.shape[1] != 2:
+            raise ValueError("Engram history must contain [slot, token] pairs")
+        history = history.to(device=self._cache.device, dtype=torch.int64)
+        slots, tokens = history.unbind(dim=1)
+        comp = self.token_map[tokens.clamp(0, self.token_map.numel() - 1)]
+        comp = torch.where(
+            image_sentinel_mask(tokens).reshape(-1),
+            ENGRAM_DEAD_ID,
+            comp,
+        ).to(torch.int64)
+        self._write_hash_cache(comp, slots)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -529,25 +547,26 @@ class EngramHashState(nn.Module):
         block_table: torch.Tensor,
         swa_block_size: int,
     ) -> torch.Tensor:
-        """Slot-cache id, applied only where neither the chunk nor explicit history resolved.
-
-        ``known`` is the ``_lookback_source`` mask (None when no explicit
-        history was passed) and takes precedence over the cache, matching the
-        documented resolution order: chunk -> explicit lookback -> slot cache.
-        """
         if self._cache is None:
             raise RuntimeError(
                 "engram hash slot cache is unbound; call ensure_cache with the bound SWA "
                 "KV cache before reading hash history"
             )
         table_cols = block_table.shape[1]
-        # Absolute positions wrap through the physical ring columns below.
         clamped = lookback.clamp_min(0)
         col = torch.div(clamped, swa_block_size, rounding_mode="floor") % table_cols
         req_safe = req.clamp(0, block_table.shape[0] - 1)
         block = block_table.to(torch.int64)[req_safe, col]
-        slot = (block * swa_block_size + clamped % swa_block_size).clamp(0, self._cache.numel() - 1)
+        # Do not upper-clamp absolute lookbacks: it aliases later positions to the final table column.
+        missing = block < 0
+        safe_block = torch.where(missing, torch.zeros_like(block), block)
+        slot = (safe_block * swa_block_size + clamped % swa_block_size).clamp(0, self._cache.numel() - 1)
         fallback = self._cache.index_select(0, slot).to(torch.int64)
+        fallback = torch.where(
+            missing,
+            torch.full_like(fallback, ENGRAM_DEAD_ID),
+            fallback,
+        )
         resolved = in_batch if known is None else (in_batch | known)
         return torch.where(resolved, source, fallback)
 

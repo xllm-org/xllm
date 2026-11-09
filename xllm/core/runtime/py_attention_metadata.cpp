@@ -103,6 +103,8 @@ void register_attention_metadata_views(py::module_& module) {
                              &PyAttentionMetadataView::q_seq_lens_host)
       .def_property_readonly("multi_block_tables",
                              &PyAttentionMetadataView::multi_block_tables)
+      .def_property_readonly("engram_history",
+                             &PyAttentionMetadataView::engram_history)
       .def_property_readonly("block_table",
                              &PyAttentionMetadataView::block_table)
       .def_property_readonly("kv_seq_lens",
@@ -238,6 +240,7 @@ PyAttentionMetadataView::PyAttentionMetadataView(
     new_cache_slots_host_values_ = params.attention.host.new_cache_slots;
   }
   multi_block_tables_ = params.multi_block_tables;
+  engram_history_ = params.embedding.engram_history;
   linear_state_indices_ = params.embedding.linear_state_indices;
   num_accepted_tokens_ = params.num_accepted_tokens;
   num_accepted_tokens_host_values_ = params.num_accepted_tokens_host;
@@ -416,6 +419,10 @@ py::list PyAttentionMetadataView::multi_block_tables() const {
     tables.append(optional_tensor(table));
   }
   return tables;
+}
+
+const std::vector<int32_t>& PyAttentionMetadataView::engram_history() const {
+  return engram_history_;
 }
 
 PyExpandedDecodeMetadataView PyAttentionMetadataView::expanded_decode_metadata()

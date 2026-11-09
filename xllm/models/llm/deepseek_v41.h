@@ -94,7 +94,17 @@ inline void validate_deepseek_v41_args(const ModelArgs& args,
         << "deepseek_v41 kv_source_layer_ids must register ratio 2 before "
            "ratio 1 to match kMultiBlockExportOrder";
   }
-  // Native SWA tensors and Python ring metadata must use the same width.
+  if (!args.engram_layer_ids().empty()) {
+    CHECK_GT(args.engram_max_ngram_size(), 0)
+        << "deepseek_v41 config engram_max_ngram_size must be > 0 when "
+           "engram_layer_ids is enabled, got "
+        << args.engram_max_ngram_size();
+    CHECK_LE(args.engram_max_ngram_size() - 1, args.window_size())
+        << "deepseek_v41 config engram_max_ngram_size - 1 must fit within "
+           "window_size/sliding_window; got engram_max_ngram_size="
+        << args.engram_max_ngram_size()
+        << ", window_size=" << args.window_size();
+  }
   const int64_t block_size = KVCacheConfig::get_instance().block_size();
   CHECK_EQ(block_size, 128)
       << "DeepSeek V4.1 currently only supports block_size=128, got "

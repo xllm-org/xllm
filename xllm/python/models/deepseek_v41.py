@@ -1746,8 +1746,20 @@ class DeepseekV41Model(nn.Module):
             )
 
     def _layer_rope_cache(self, mode: CSA2LayerMode) -> torch.Tensor:
-        """Per-layer RoPE table: compress theta for CSA2 layers, plain otherwise."""
         return self.compress_rotary.cos_sin_cache if mode.is_csa2 else self.rotary.cos_sin_cache
+
+    def restore_engram_history(self, backend: Any, metadata: Any) -> None:
+        history = getattr(metadata, "engram_history", ())
+        if not history or self.engram_hash is None:
+            return
+        if len(history) % 2 != 0:
+            raise ValueError(f"Engram history must contain [slot, token] pairs, got {len(history)} values")
+        cache = backend.swa_history_cache()
+        # An unbound SWA cache is a profiling pass; history cannot be restored yet.
+        if not self.engram_hash.ensure_cache(cache):
+            raise RuntimeError("Cannot restore Engram history before cache binding")
+        pairs = torch.tensor(history, dtype=torch.int64).reshape(-1, 2)
+        self.engram_hash.restore_history(pairs)
 
     def _compute_engram_hashes(
         self,

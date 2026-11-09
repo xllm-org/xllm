@@ -137,6 +137,9 @@ class KVCacheState {
 
   void set_transfer_kv_info(TransferKVInfo&& info);
   std::optional<TransferKVInfo>& transfer_kv_info();
+  const std::optional<TransferKVInfo>& transfer_kv_info() const {
+    return transfer_kv_info_;
+  }
 
   size_t next_transfer_block_idx() const;
   void advance_transfer_block_idx(size_t idx);

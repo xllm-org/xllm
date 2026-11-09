@@ -2705,6 +2705,114 @@ TEST(MooncakeKVCacheTransferDefaultTest, RegistersCompressedIndexAndKpoolTail) {
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
+     RegistersDeepSeekV41TokenGroupsAndFp32State) {
+  for (int32_t tp_rank : {0, 1}) {
+    SCOPED_TRACE(tp_rank);
+    auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+        /*listen_port=*/0, torch::Device(torch::kCPU));
+    RecordingMooncakeTransferEngine* engine_observer = engine.get();
+    MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                            /*listen_port=*/0,
+                                            torch::Device(torch::kCPU),
+                                            /*model_type=*/"deepseek_v41",
+                                            std::move(engine));
+    transfer.addr_ = "local";
+    ModelArgs args;
+    args.model_type("deepseek_v41")
+        .enable_mla(true)
+        .n_layers(6)
+        .n_heads(8)
+        .n_kv_heads(1)
+        .head_dim(16)
+        .index_n_heads(2)
+        .index_head_dim(8)
+        .compress_ratios({0, 0, 2, 2, 1, 1})
+        .kv_source_layer_ids({2, 4});
+    KVCacheCapacity capacity;
+    capacity.block_size(128).swa_count(4).c2_count(4).c1_count(8);
+    const KVCacheShape shape(capacity, args, /*world_size=*/2);
+    KVCacheCreateOptions options;
+    options.device(torch::Device(torch::kCPU))
+        .dtype(torch::kBFloat16)
+        .num_layers(6)
+        .model_type("deepseek_v41")
+        .block_size(128)
+        .head_dim(16)
+        .index_head_dim(8)
+        .window_size(128)
+        .compress_ratios({0, 0, 2, 2, 1, 1})
+        .kv_source_layer_ids({2, 4});
+    std::vector<KVCache> caches;
+    allocate_kv_caches(caches, shape, options);
+    transfer.configure_cache_layout(make_args(tp_rank, 2, 1), args, 128, false);
+    transfer.register_kv_cache(caches, shape, torch::kBFloat16);
+
+    const auto& manifests = transfer.local_cache_layout_.tensors;
+    ASSERT_EQ(manifests.size(),
+              caches[2].get_indexer_cache_scale().has_value() ? 14U : 12U);
+    KVTransferMapping swa;
+    swa.group_id = cache_group_id(BlockType::SWA);
+    swa.local_ids = {0, 1};
+    swa.remote_ids = {2, 3};
+    KVTransferMapping c2;
+    c2.group_id = cache_group_id(BlockType::C2);
+    c2.local_ids = {1};
+    c2.remote_ids = {3};
+    KVTransferMapping c1;
+    c1.group_id = cache_group_id(BlockType::C1);
+    c1.local_ids = {2, 3};
+    c1.remote_ids = {6, 7};
+    ASSERT_TRUE(transfer.pull_kv_blocks(1, "remote", {c1, swa, c2}));
+    ASSERT_EQ(engine_observer->move_calls.size(), 1U);
+    const auto& mappings = engine_observer->move_calls[0].mappings;
+    ASSERT_EQ(mappings.size(), manifests.size());
+    for (const auto& manifest : manifests) {
+      SCOPED_TRACE(manifest.layer_id);
+      SCOPED_TRACE(manifest.role);
+      const KVTransferMapping* expected = nullptr;
+      if (manifest.group_id == swa.group_id) {
+        expected = &swa;
+        EXPECT_EQ(manifest.resource_count, 4U);
+      } else if (manifest.group_id == c2.group_id) {
+        expected = &c2;
+        EXPECT_EQ(manifest.layer_id, 2);
+        EXPECT_EQ(manifest.resource_count, 4U);
+      } else {
+        ASSERT_EQ(manifest.group_id, c1.group_id);
+        expected = &c1;
+        EXPECT_EQ(manifest.layer_id, 4);
+        EXPECT_EQ(manifest.resource_count, 8U);
+      }
+      EXPECT_EQ(manifest.shard.kind, LogicalShardKind::REPLICATED);
+      ASSERT_EQ(manifest.shard.spans.size(), 1U);
+      EXPECT_EQ(manifest.shard.spans[0].owner_tp_rank, 0);
+      const auto mapping = std::find_if(
+          mappings.begin(), mappings.end(), [&](const auto& candidate) {
+            return candidate.buf_id == manifest.mooncake_buffer_id;
+          });
+      ASSERT_NE(mapping, mappings.end());
+      EXPECT_EQ(mapping->local_ids, expected->local_ids);
+      EXPECT_EQ(mapping->remote_ids, expected->remote_ids);
+      if (manifest.role == static_cast<int32_t>(KVCacheTensorRole::KV_STATE) ||
+          manifest.role ==
+              static_cast<int32_t>(KVCacheTensorRole::SCORE_STATE)) {
+        EXPECT_EQ(manifest.layer_id, 2);
+        EXPECT_EQ(manifest.group_id, swa.group_id);
+        EXPECT_EQ(manifest.scalar_type, static_cast<int32_t>(torch::kFloat32));
+        EXPECT_EQ(manifest.element_bytes, 4U);
+      }
+#if defined(USE_NPU)
+      if (manifest.role ==
+          static_cast<int32_t>(KVCacheTensorRole::INDEX_SCALE)) {
+        EXPECT_EQ(manifest.scalar_type, static_cast<int32_t>(torch::kFloat16));
+        EXPECT_EQ(manifest.resource_stride_bytes, 128U * 2U);
+      }
+#endif
+    }
+  }
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
      RegistersTp1SpecDraftBesideTp2MainCache) {
   auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
       /*listen_port=*/0, torch::Device(torch::kCPU));

@@ -188,6 +188,11 @@ class Sequence {
   // whether the new added token is the first token
   bool is_first_token() const { return is_first_token_; }
   std::optional<RemoteToken>& first_token() { return first_token_; }
+
+  bool is_engram_history_restored() const {
+    return is_engram_history_restored_;
+  }
+  void mark_engram_history_restored() { is_engram_history_restored_ = true; }
   // get the total number of tokens
   size_t num_tokens() const { return num_tokens_; }
   // get the number of prompt tokens
@@ -513,6 +518,7 @@ class Sequence {
 
   // whether the added token is the first generated token
   bool is_first_token_ = false;
+  bool is_engram_history_restored_ = false;
 
   // whether the prefill stage has been cached.
   bool is_cache_block_for_prefill_ = false;

@@ -314,6 +314,37 @@ TEST_F(LLMRequestFactoryTest, RejectsEmptyPromptAndReleasesRateLimitSlot) {
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
+TEST_F(LLMRequestFactoryTest, EmptyTokenListFallsBackToPromptText) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams params;
+  auto request = factory->create("hello",
+                                 std::vector<int>{},
+                                 params,
+                                 std::nullopt,
+                                 make_capture_callback(&capture));
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(request->state().prompt_tokens.empty());
+  std::vector<int32_t> expected;
+  ASSERT_TRUE(tokenizer_->encode("hello", &expected, true));
+  EXPECT_EQ(request->state().prompt_tokens, expected);
+}
+
+TEST_F(LLMRequestFactoryTest, EmptyTokenListAndPromptReleaseRateLimitSlot) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams params;
+  auto request = factory->create("",
+                                 std::vector<int>{},
+                                 params,
+                                 std::nullopt,
+                                 make_capture_callback(&capture));
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
 TEST_F(LLMRequestFactoryTest,
        ServerTtftIncludesPreprocessingAndRecordsFirstTokenOnce) {
   auto factory = make_factory();

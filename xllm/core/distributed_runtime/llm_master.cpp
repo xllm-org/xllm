@@ -76,9 +76,6 @@ LLMMaster::LLMMaster(const Options& options)
       use_ssm_engine ? EngineType::SSM : EngineType::LLM;
   const std::string model_type =
       get_model_type(options_.model_path(), options_.backend());
-  // V4.1 cache restoration, speculative accounting, and PD transfer do not
-  // yet handle the grouped C1/C2 caches. Validate before constructing an
-  // engine.
   if (util::is_deepseek_v41_model_type(model_type)) {
     CHECK(!options_.enable_kvcache_store())
         << "DeepSeek-V4.1 does not support KV cache Store: restore for the "
@@ -89,9 +86,6 @@ LLMMaster::LLMMaster(const Options& options)
     CHECK(!v41_speculative_requested)
         << "DeepSeek-V4.1 does not support speculative decoding: grouped KV "
            "(C1/C2) is not implemented in the speculative path.";
-    CHECK(!options_.enable_disagg_pd())
-        << "DeepSeek-V4.1 does not support disaggregated PD: the grouped "
-           "TOKEN KV (C1/C2) transfer path is not implemented.";
   }
   const std::optional<std::string> cp_error = validate_context_parallel_config(
       options_, engine_type, model_type, options_.nnodes());

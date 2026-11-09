@@ -164,6 +164,7 @@ Sequence::Sequence(const Sequence& other, size_t index)
       time_to_first_token_latency_seconds_(
           other.time_to_first_token_latency_seconds_),
       is_first_token_(other.is_first_token_),
+      is_engram_history_restored_(other.is_engram_history_restored_),
       is_cache_block_for_prefill_(other.is_cache_block_for_prefill_),
       sequence_params_(other.sequence_params_),
       decoder_(other.decoder_),
@@ -723,6 +724,7 @@ Sequence::~Sequence() { reset(); }
 
 // release all cache blocks
 void Sequence::reset() {
+  is_engram_history_restored_ = false;
   kv_state_.reset();
   host_kv_state_.reset();
   pending_host_restore_.reset();

@@ -938,14 +938,18 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 return ci.ratio
         return 0
 
-    def swa_group_metadata(self, dsa: DsaMetadata | None) -> _SwaGroupMetadata | None:
-        """The SWA-group slot mapping / block table / cache shared by all layers.
+    def swa_history_cache(self) -> torch.Tensor:
+        if not self._kv_caches:
+            raise RuntimeError("Engram history restore requires a bound SWA cache")
+        mapping = self._resolve_cache_mapping(0, 0)
+        cache = self._kv_caches[0].swa
+        if cache is None or mapping.ori_cache_idx < 0:
+            raise RuntimeError(
+                "Engram history restore requires a bound SWA cache with a valid sliding-window slot mapping"
+            )
+        return cache
 
-        Every layer's first cache entry addresses the SWA group and the group
-        shares one block-table/slot layout (contract section 2), so layer 0's
-        view serves any consumer that needs position-stable ring slots (the
-        engram hash cache).
-        """
+    def swa_group_metadata(self, dsa: DsaMetadata | None) -> _SwaGroupMetadata | None:
         if dsa is None or not self._kv_caches:
             return None
         mapping = self._resolve_cache_mapping(0, 0)

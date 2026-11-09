@@ -34,4 +34,9 @@ void append_pd_kv_transfer_groups(
     proto::DisaggResponse* response,
     std::vector<int32_t>* virtual_memory_block_ids = nullptr);
 
+// Export only source SWA positions needed by the receiver's logical mapping.
+bool append_pd_pull_source_groups(const KVCacheState& kv_state,
+                                  bool include_linear_state,
+                                  proto::DisaggGenerationsRequest* request);
+
 }  // namespace xllm

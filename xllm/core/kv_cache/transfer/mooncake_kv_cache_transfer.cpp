@@ -23,6 +23,7 @@ limitations under the License.
 #include <sstream>
 #include <unordered_set>
 
+#include "absl/strings/str_join.h"
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kv_cache_config.h"
@@ -241,6 +242,22 @@ void MooncakeKVCacheTransferBase::configure_cache_layout(
   fingerprint << model_args.model_type() << ":" << model_args.n_layers() << ":"
               << tensor_layout.kv_head_count << ":" << model_args.head_dim()
               << ":" << tensor_layout.index_head_count;
+  if (util::is_deepseek_v41_model_type(model_args.model_type())) {
+    // Both peers must agree on source layers, compression ratios and Engram
+    // history slots.
+    auto append_list = [&fingerprint](const char* name, const auto& values) {
+      fingerprint << "|" << name << ":" << absl::StrJoin(values, ",");
+      if (!values.empty()) {
+        fingerprint << ",";
+      }
+    };
+    append_list("dsv41_grouped_geometry", model_args.kv_source_layer_ids());
+    append_list("dsv41_index_geometry", model_args.index_source_layer_ids());
+    append_list("dsv41_compress_ratios", model_args.compress_ratios());
+    append_list("dsv41_engram_layers", model_args.engram_layer_ids());
+    fingerprint << "|dsv41_engram_max_ngram_size:"
+                << model_args.engram_max_ngram_size();
+  }
   context.fingerprint = fingerprint.str();
   context.cluster_id = cluster_id_;
   context.addr = addr_;

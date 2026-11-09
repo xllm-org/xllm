@@ -1847,6 +1847,131 @@ TEST(PDSchedulerTest, FailedFirstGenerationDoesNotRecordServerTtft) {
 }
 
 namespace {
+
+void run_prefill_terminal_response(bool stream) {
+  SCOPED_TRACE(stream ? "stream" : "non_stream");
+  FakeEngine decode_engine(/*num_blocks=*/4, /*block_size=*/2);
+  TestPDScheduler decode(&decode_engine, make_decode_options());
+  auto remote = make_request({11, 12}, "terminal");
+  remote->state().pd_reservation_id = "terminal-reservation";
+  auto* decode_pool = decode_engine.block_manager_pool();
+  const auto free_before = decode_pool->num_free_blocks();
+  ASSERT_TRUE(decode.try_allocate(remote->sequences()[0].get()));
+  ASSERT_TRUE(decode.decode_schedule(remote, "prefill"));
+
+  class TerminalService final : public proto::DisaggPDService {
+   public:
+    explicit TerminalService(TestPDScheduler* scheduler)
+        : scheduler_(scheduler) {}
+    void FirstGeneration(google::protobuf::RpcController*,
+                         const proto::DisaggGenerationsRequests*,
+                         proto::Status* response,
+                         google::protobuf::Closure* done) override {
+      brpc::ClosureGuard guard(done);
+      ++first_generation_calls;
+      response->set_ok(false);
+    }
+    void ReleaseReservation(google::protobuf::RpcController*,
+                            const proto::ReleaseReservationRequest* request,
+                            proto::ReleaseReservationResponse* response,
+                            google::protobuf::Closure* done) override {
+      brpc::ClosureGuard guard(done);
+      ++release_calls;
+      const bool released = scheduler_->release_reservation(
+          request->req_id(), request->reservation_id());
+      response->set_result(
+          released ? proto::ReleaseReservationResponse::RELEASED
+                   : proto::ReleaseReservationResponse::NOT_WAITING);
+    }
+    std::atomic<int32_t> first_generation_calls{0};
+    std::atomic<int32_t> release_calls{0};
+
+   private:
+    TestPDScheduler* scheduler_;
+  } service(&decode);
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+  const std::string address =
+      "127.0.0.1:" + std::to_string(server.listen_address().port);
+  brpc::Channel channel;
+  ASSERT_EQ(channel.Init(address.c_str(), nullptr), 0);
+  proto::DisaggPDService_Stub stub(&channel);
+
+  FakeEngine prefill_engine(/*num_blocks=*/4, /*block_size=*/2);
+  auto options = make_options();
+  options.enable_chunked_prefill(false).kv_cache_transfer_mode("PUSH");
+  TestPDScheduler prefill(&prefill_engine, options);
+  auto request = make_request({11, 12},
+                              "terminal",
+                              /*enable_schedule_overlap=*/false,
+                              stream,
+                              /*logprobs=*/false,
+                              /*max_tokens=*/1);
+  request->state().pd_reservation_id = "terminal-reservation";
+  request->state().decode_rpc_address = address;
+  std::promise<void> release_output;
+  auto output_release = release_output.get_future().share();
+  std::atomic<int32_t> output_count{0};
+  request->state().output_func = [&,
+                                  output_release](const RequestOutput& output) {
+    EXPECT_TRUE(output.finished);
+    EXPECT_TRUE(output.status.has_value() && output.status->ok());
+    EXPECT_FALSE(output.finished_on_prefill_instance);
+    EXPECT_EQ(output.stream, stream);
+    EXPECT_EQ(output.outputs.size(), 1u);
+    EXPECT_TRUE(output.usage.has_value());
+    if (output.usage.has_value()) {
+      EXPECT_EQ(output.usage->num_generated_tokens, 1u);
+    }
+    ++output_count;
+    output_release.wait();
+    return true;
+  };
+  prefill.admit_prefill(request, &stub);
+  ASSERT_FALSE(prefill.prepare_batch()[0].empty());
+  finish_prefill(request->sequences()[0].get());
+  request->sequences()[0]->first_token() = RemoteToken{.token_id = 999};
+  auto first_generation = std::async(std::launch::async, [&prefill] {
+    prefill.prefill_send_first_generation();
+  });
+  const std::future_status returned =
+      first_generation.wait_for(std::chrono::seconds(1));
+  release_output.set_value();
+  first_generation.get();
+  EXPECT_EQ(returned, std::future_status::ready);
+  prefill.prefill_send_first_generation();
+  prefill.wait_prefill_completion();
+  prefill.drain_request_releases();
+  prefill.wait_notifications(&decode);
+
+  EXPECT_EQ(output_count, 1);
+  EXPECT_EQ(service.first_generation_calls, 0);
+  EXPECT_EQ(service.release_calls, 1);
+  EXPECT_FALSE(prefill.has_channel(request->request_id()));
+  EXPECT_TRUE(decode.reservations_empty());
+  EXPECT_EQ(decode_pool->num_free_blocks(), free_before);
+  EXPECT_EQ(prefill_engine.block_manager_pool()->num_used_blocks()[0], 0u);
+  EXPECT_TRUE(prefill.prepare_batch()[0].empty());
+  prefill.prefill_send_first_generation();
+  prefill.wait_for_responses();
+  EXPECT_EQ(output_count, 1);
+  server.Stop(0);
+  server.Join();
+}
+
+}  // namespace
+
+TEST(PDSchedulerTest, PrefillTerminalResponseCompletesLocallyWithoutHandoff) {
+  run_prefill_terminal_response(/*stream=*/false);
+}
+
+TEST(PDSchedulerTest,
+     PrefillTerminalStreamingResponseCompletesLocallyWithoutHandoff) {
+  run_prefill_terminal_response(/*stream=*/true);
+}
+
+namespace {
 class ReservationTest : public ::testing::Test {
  protected:
   FakeEngine engine_{/*num_blocks=*/16,

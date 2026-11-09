@@ -285,6 +285,8 @@ class ModelExecutor:
         # capture width for a live executor.
         self.num_speculative_tokens = int(config.get("num_speculative_tokens", 0))
         self.execution_model = model.model
+        restore = getattr(self.execution_model, "restore_engram_history", None)
+        self._restore_engram_history = restore if callable(restore) else None
         self.supports_layerwise_kv_load = bool(
             getattr(self.execution_model, "supports_layerwise_kv_load", False)
         ) and not config.get("is_draft_engine", False)
@@ -613,6 +615,10 @@ class ModelExecutor:
             self.context_kv_graph_runner.warmup(sequences * (width + 1))
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
+
+        # Restore PD history before runner selection so eager and graph paths see the same cache.
+        if self._restore_engram_history is not None:
+            self._restore_engram_history(self.attention_backend, metadata)
 
         eplb = None
         if expert_load_data is not None:
