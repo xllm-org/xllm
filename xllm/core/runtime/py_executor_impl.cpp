@@ -232,8 +232,6 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
       ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit());
   py_causal_lm_->set_context_kv_graph_runner(
       py_executor_.attr("context_kv_graph_runner"));
-  requires_input_batch_metadata_ =
-      py_executor_.attr("requires_input_batch_metadata").cast<bool>();
   supports_layerwise_kv_load_ =
       py_executor_.attr("supports_layerwise_kv_load").cast<bool>();
 }
@@ -249,6 +247,8 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
   const int64_t num_layers = static_cast<int64_t>(kv_caches.size());
   if (!kv_bound_) {
     py_executor_.attr("bind_kv_caches")(build_python_kv_caches(kv_caches));
+    requires_input_batch_metadata_ =
+        py_executor_.attr("requires_input_batch_metadata").cast<bool>();
     kv_bound_ = true;
     kv_layer_count_ = num_layers;
   } else {

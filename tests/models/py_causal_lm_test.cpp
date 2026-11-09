@@ -48,6 +48,7 @@ namespace {
 
 constexpr const char* kBridgeTestModelType = "py_causal_lm_bridge_test";
 constexpr const char* kBridgeTestModule = "xllm_py_causal_lm_bridge_test";
+constexpr const char* kDcpBridgeTestModelType = "deepseek_v41";
 
 void register_bridge_test_model() {
   py::module_ module_type = py::module_::import("types");
@@ -330,11 +331,62 @@ TEST(PyCausalLMContextKVBridgeTest, PassesSwaCacheAsSixthPythonSlot) {
   ASSERT_EQ(py::len(python_caches), 1);
   py::tuple layer_cache = python_caches[0].cast<py::tuple>();
   ASSERT_EQ(py::len(layer_cache), 15);
+  EXPECT_TRUE(layer_cache[12].is_none());
+  EXPECT_TRUE(layer_cache[13].is_none());
+  EXPECT_TRUE(layer_cache[14].is_none());
   py::object bridged_swa = model.python_model().attr("last_swa");
   EXPECT_TRUE(bridged_swa.is(layer_cache[5]));
   EXPECT_EQ(
       bridged_swa.attr("data_ptr")().cast<std::uintptr_t>(),
       reinterpret_cast<std::uintptr_t>(cache_tensors.swa_cache.data_ptr()));
+}
+
+TEST(PyCausalLMDcpBridgeTest, ForwardsEffectiveDcpSizeIntoConfigDict) {
+  py::gil_scoped_acquire gil;
+  register_bridge_test_model();
+  py::module_ registry = py::module_::import("xllm.python.registry");
+  py::object registry_table = registry.attr("_REGISTRY");
+  py::object saved_registration =
+      registry_table.attr("get")(kDcpBridgeTestModelType);
+  ASSERT_FALSE(saved_registration.is_none());
+  py::object bridge_cls =
+      registry.attr("get_model_class")(kBridgeTestModelType);
+  registry.attr("register_model")(kDcpBridgeTestModelType)(bridge_cls);
+
+  try {
+    ProcessGroup process_group(/*rank=*/0,
+                               /*world_size=*/2,
+                               torch::Device(torch::kCPU));
+    ParallelArgs parallel_args(/*rank=*/0,
+                               /*world_size=*/2,
+                               &process_group);
+    parallel_args.tp_group_ = &process_group;
+    parallel_args.moe_tp_group_ = &process_group;
+    parallel_args.python_rendezvous_host_ = "127.0.0.1";
+    parallel_args.python_rendezvous_port_ = 1;
+    parallel_args.kv_split_size(2);
+
+    ModelArgs model_args;
+    model_args.model_type(kDcpBridgeTestModelType);
+    ModelContext context(
+        parallel_args,
+        model_args,
+        QuantArgs(),
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+    PyCausalLM model(context);
+    EXPECT_EQ(model.kv_split_size(), 2);
+
+    registry_table.attr("__setitem__")(kDcpBridgeTestModelType,
+                                       saved_registration);
+
+    py::dict config = model.config_dict();
+    ASSERT_TRUE(config.contains("dcp_size"));
+    EXPECT_EQ(config["dcp_size"].cast<int64_t>(), 2);
+  } catch (...) {
+    registry_table.attr("__setitem__")(kDcpBridgeTestModelType,
+                                       saved_registration);
+    throw;
+  }
 }
 
 }  // namespace

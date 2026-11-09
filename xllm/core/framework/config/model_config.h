@@ -65,6 +65,7 @@ class ModelConfig final {
          "reasoning_parser",
          "tool_call_parser",
          "enable_qwen3_reranker",
+         "engram_config",
          "enable_return_mm_full_embeddings",
          "mm_download_headers",
          "flashinfer_workspace_buffer_size",
@@ -102,6 +103,8 @@ class ModelConfig final {
   PROPERTY(std::string, tool_call_parser);
 
   PROPERTY(bool, enable_qwen3_reranker) = false;
+
+  PROPERTY(std::string, engram_config) = "{}";
 
   PROPERTY(bool, enable_return_mm_full_embeddings) = false;
 

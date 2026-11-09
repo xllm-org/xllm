@@ -20,25 +20,33 @@ import os
 import re
 import unicodedata
 import weakref
-from typing import Callable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xllm.python.attention.dsa_metadata import last_ring_writes
-from xllm.python.model_executor.forward_context import in_acl_graph
+from xllm.python.attention.dsa_metadata import (
+    READ_TABLE_LAYOUT_RING,
+    DsaMetadataBuilder,
+    build_cache_specs_v41,
+    last_ring_writes,
+)
+from xllm.python.model_executor.forward_context import get_forward_context_or_none, in_acl_graph
+from xllm.python.models.engram_shared_memory import SharedHostEngramStorage
 
-# Cache value for tokens that take no part in an n-gram (image spans).
+if TYPE_CHECKING:
+    from xllm.python.attention.backend import AttentionMetadata, LayerCache
+    from xllm.python.model_executor.input_batch import InputBatch
+
 ENGRAM_DEAD_ID = -1
-# Image sentinel / padding token ids that break an n-gram (mm_preprocess.py).
 ENGRAM_IMAGE_SENTINEL_BASE_ID = 129264
 ENGRAM_IMAGE_PAD_ID = 129265
-# Signed-sqrt clamp of the gate input (reference kernel clamp_value).
 _ENGRAM_GATE_CLAMP = 1e-6
 
 _WHITESPACE_RE = re.compile(r"[ \t\r\n]+")
-# Private-use char so a token that is exactly one space survives Strip().
+# A private-use character keeps a token containing one space from being stripped.
 _SENTINEL = "\ue000"
 
 
@@ -88,18 +96,11 @@ def _e4m3_to_float(x_e4m3: torch.Tensor) -> torch.Tensor:
 
 
 def image_sentinel_mask(input_ids: torch.Tensor) -> torch.Tensor:
-    """True where the token is an image sentinel and must break every n-gram."""
     ids = input_ids.reshape(-1)
     return (ids == ENGRAM_IMAGE_SENTINEL_BASE_ID) | (ids == ENGRAM_IMAGE_PAD_ID)
 
 
-# ---------------------------------------------------------------------------
-# Prime bucket layout
-# ---------------------------------------------------------------------------
-
-
 def _is_prime(n: int) -> bool:
-    """Deterministic Miller-Rabin for n < 2**32 (same witnesses as vLLM)."""
     if n < 2:
         return False
     for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
@@ -551,31 +552,97 @@ class EngramHashState(nn.Module):
         return torch.where(resolved, source, fallback)
 
 
-# ---------------------------------------------------------------------------
-# Hash table embedding
-# ---------------------------------------------------------------------------
-
-
-# Table storage layouts: the official FP8 checkpoint keeps FP8-E4M3 payloads
-# plus ue8m0 per-32 scales as raw bytes; the Ascend W8A8 export
-# requantizes the tables to symmetric int8 with float32 group-32 scales
-# (quant_model_description.json optional.embedding_storage, format int8_sym).
 ENGRAM_STORAGE_FP8 = "fp8"
 ENGRAM_STORAGE_INT8 = "int8"
 
 
-def load_quarot_gate_unrotate(model_path: str, device: torch.device) -> torch.Tensor | None:
-    """The QuaRot global rotation transpose used to un-rotate the gate input.
+# Keep staging capacity monotonic so eager reuse does not churn device addresses.
+_ENGRAM_HOST_MIN_CAPACITY = 256
 
-    The W8A8 export rotates the residual stream (h_rot = h @ Q) and
-    folds the rotation into every trunk weight, so the stream reaches the
-    engram gate in the rotated basis while q/k/wkv-K stay in the original
-    basis. The gate dot therefore needs ``h_rot @ Q.T``; the V half of ``wkv``
-    is pre-folded (Q.T @ Wv) and must NOT be rotated again. Returns ``Q.T``
-    ([hidden, hidden] fp32) or None when the checkpoint is not rotated. The
-    safetensors payload may be saved as F64/F32/F16/BF16; the dtype is read
-    from the file header and the result is converted to fp32 on return.
-    """
+
+_host_pin_warned = False
+
+
+def _host_buffer(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[torch.Tensor, bool, str | None]:
+    """Return the pin failure with the buffer; some hosts have no registered pinning accelerator."""
+    global _host_pin_warned
+    try:
+        buffer = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    except (RuntimeError, ValueError) as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        if not _host_pin_warned:
+            _host_pin_warned = True
+            try:
+                from scripts.logger import logger
+
+                logger.warning(
+                    "engram host offload cannot allocate pinned CPU staging "
+                    f"({failure}); the lookup op contract refuses "
+                    "unpinned staging, so set engram_config.cpu_offload=false on "
+                    "a host that cannot pin host memory"
+                )
+            except Exception:  # noqa: BLE001 - logging must never mask the fallback
+                pass
+        return torch.empty(shape, dtype=dtype, device="cpu"), False, failure
+    _host_pin_warned = False
+    return buffer, True, None
+
+
+def _staging_stream(device: torch.device | None) -> torch.npu.Stream | torch.cuda.Stream | None:
+    if device is None or device.type == "cpu":
+        return None
+    if device.type in ("npu", "privateuseone"):
+        return torch.npu.current_stream(device)
+    if device.type == "cuda":
+        return torch.cuda.current_stream(device)
+    raise RuntimeError(f"unsupported Engram offload device: {device}")
+
+
+def _sync_accelerator(device: torch.device | None) -> None:
+    stream = _staging_stream(device)
+    if stream is not None:
+        stream.synchronize()
+
+
+_engram_lookup_op: Any = None
+
+
+def _get_engram_lookup_op() -> Any:
+    global _engram_lookup_op
+    if _engram_lookup_op is not None:
+        return _engram_lookup_op
+    try:
+        op = torch.ops.xllm_ops.engram_int8_lookup_cpu
+    except (AttributeError, RuntimeError) as exc:
+        raise RuntimeError(
+            "engram host offload requires the in-repo CPU int8 lookup op "
+            "torch.ops.xllm_ops.engram_int8_lookup_cpu, which is not registered; "
+            "rebuild/reinstall xLLM with core/kernels/npu/xllm_ops/"
+            "engram_int8_lookup_cpu.cpp compiled in (the fused op is the only "
+            "offload dequant path)"
+        ) from exc
+    _engram_lookup_op = op
+    return op
+
+
+_engram_lookup_op_active_logged = False
+
+
+def _log_engram_lookup_op_active() -> None:
+    global _engram_lookup_op_active_logged
+    if _engram_lookup_op_active_logged:
+        return
+    _engram_lookup_op_active_logged = True
+    try:
+        from scripts.logger import logger
+
+        logger.info("engram CPU int8 lookup op active (fused offload dequant)")
+    except Exception:  # noqa: BLE001 - logging must never block the lookup
+        pass
+
+
+def load_quarot_gate_unrotate(model_path: str, device: torch.device) -> torch.Tensor | None:
+    """QuaRot rotates the residual stream; the gate needs h_rot @ Q.T in the original basis."""
     config_path = os.path.join(str(model_path), "config.json")
     try:
         with open(config_path, encoding="utf-8") as handle:
@@ -602,6 +669,10 @@ class EngramEmbedding(nn.Module):
         quant_block: int = 32,
         storage: str = ENGRAM_STORAGE_FP8,
         device: torch.device | None = None,
+        offload: bool = False,
+        layer_id: int = -1,
+        dp_shared_memory: bool = False,
+        dp_group: Any = None,
     ) -> None:
         super().__init__()
         if not head_sizes or any(size <= 0 for size in head_sizes):
@@ -622,26 +693,71 @@ class EngramEmbedding(nn.Module):
         self.vocab_end = sum(head_sizes[:head_end])
         self.part_num_embeddings = self.vocab_end - self.vocab_start
         self.tp_size = int(tp_size)
+        self.tp_rank = int(tp_rank)
+        self.layer_id = int(layer_id)
+        self.setup_device = torch.device(device) if device is not None else torch.device("cpu")
+        self.offload = bool(offload) and storage == ENGRAM_STORAGE_INT8
+        if offload and not self.offload:
+            self._warn_offload_unsupported(storage)
+        if dp_shared_memory and not offload:
+            raise ValueError("engram_config.dp_shared_memory=true requires engram_config.cpu_offload=true")
+        if dp_shared_memory and storage != ENGRAM_STORAGE_INT8:
+            raise ValueError(
+                "engram_config.dp_shared_memory=true requires the int8 (W8A8) table "
+                f"storage (the only CPU-shareable format), got storage={storage!r}"
+            )
+        self.dp_shared_memory = bool(dp_shared_memory) and self.offload
+        if self.dp_shared_memory and dp_group is None:
+            raise ValueError("engram_config.dp_shared_memory=true requires an initialized node-local DP group")
+        self._dp_group = dp_group
+        self._shared_storage: SharedHostEngramStorage | None = None
+        if self.offload and self.quant_block != 32:
+            raise ValueError(
+                "engram host offload requires quant_block=32 (the fused CPU int8 "
+                f"lookup op's fixed group size), got {self.quant_block}; set "
+                "engram_config.cpu_offload=false to use the HBM table path"
+            )
+        table_device: torch.device | str | None = device
+        if self.offload:
+            table_device = "cpu"
+            self._ids_host: torch.Tensor | None = None
+            self._owned_host: torch.Tensor | None = None
+            self._rows_host: torch.Tensor | None = None
+            self._host_capacity = 0
+            self._ids_host_pinned = False
+            self._rows_host_pinned = False
+            self._host_pin_failure: str | None = None
+            self._graph_metadata_bound = False
+            self._eager_staged_device: torch.Tensor | None = None
+            self._eager_capacity = 0
         if storage == ENGRAM_STORAGE_INT8:
-            # Symmetric int8 payloads with one float32 scale per 32 columns
-            # (W8A8 embedding_storage format int8_sym).
-            self.weight = nn.Parameter(
-                torch.empty(self.part_num_embeddings, self.dim, dtype=torch.int8, device=device),
-                requires_grad=False,
-            )
-            self.weight_scale = nn.Parameter(
-                torch.empty(
-                    self.part_num_embeddings,
-                    self.dim // self.quant_block,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                requires_grad=False,
-            )
+            if self.dp_shared_memory and self.part_num_embeddings > 0:
+                self._shared_storage = SharedHostEngramStorage(
+                    layer_id=self.layer_id,
+                    rows=self.part_num_embeddings,
+                    dim=self.dim,
+                    quant_block=self.quant_block,
+                    group=self._dp_group,
+                )
+                self._shared_storage.create_or_attach()
+                self.weight = nn.Parameter(self._shared_storage.codes, requires_grad=False)
+                self.weight_scale = nn.Parameter(self._shared_storage.scales, requires_grad=False)
+            else:
+                self.weight = nn.Parameter(
+                    torch.empty(self.part_num_embeddings, self.dim, dtype=torch.int8, device=table_device),
+                    requires_grad=False,
+                )
+                self.weight_scale = nn.Parameter(
+                    torch.empty(
+                        self.part_num_embeddings,
+                        self.dim // self.quant_block,
+                        dtype=torch.float32,
+                        device=table_device,
+                    ),
+                    requires_grad=False,
+                )
         else:
-            # FP8-E4M3 payloads and ue8m0 scales are kept as raw uint8 bytes:
-            # index_select stays on a universally supported dtype and the
-            # bit-level decoders in deepseek_v41 do the rest.
+            # Keep FP8 payload and ue8m0 scales as raw bytes to avoid unsupported native float8 gathers.
             self.weight = nn.Parameter(
                 torch.empty(self.part_num_embeddings, self.dim, dtype=torch.uint8, device=device),
                 requires_grad=False,
@@ -656,22 +772,30 @@ class EngramEmbedding(nn.Module):
                 requires_grad=False,
             )
 
-    def _local_block(self, indices: torch.Tensor) -> torch.Tensor:
-        """This rank's ``[T, part_n_hash_cols, dim]`` block of the lookup.
+    @staticmethod
+    def _warn_offload_unsupported(storage: str) -> None:
+        try:
+            from scripts.logger import logger
 
-        Real head columns are dequantized from the quantized table; columns
-        this rank does not own (hash ids outside its row range, slice padding
-        when ``tp_size`` does not divide ``n_hash_cols``, or a rank entirely
-        past the last head) contribute zeros.
-        """
-        # Deferred: deepseek_v41 imports this module at load time, so the
-        # inlined quant decoders are resolved on first use instead.
+            logger.warning(
+                "engram_config.cpu_offload=true ignored for engram storage %r; only the "
+                "int8 (W8A8) tables have a host decoder, falling back to the HBM path",
+                storage,
+            )
+        except Exception:
+            pass
 
+    def _owned_local_cols(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        local_cols = indices[:, self.head_start : self.head_start + self.part_n_hash_cols]
+        if local_cols.size(1) < self.part_n_hash_cols:
+            local_cols = F.pad(local_cols, (0, self.part_n_hash_cols - local_cols.size(1)))
+        owned = (local_cols >= self.vocab_start) & (local_cols < self.vocab_end)
+        local = (local_cols - self.vocab_start).clamp(0, max(self.part_num_embeddings - 1, 0))
+        return owned, local
+
+    def _local_block_device(self, indices: torch.Tensor) -> torch.Tensor:
         num_tokens = indices.shape[0]
         if self.part_num_embeddings == 0:
-            # tp_size > n_hash_cols: this rank's head slice starts past the
-            # last head, so it owns no table rows; the empty table cannot
-            # serve index_select at all -- contribute an all-zero block.
             return torch.zeros(
                 num_tokens,
                 self.part_n_hash_cols,
@@ -679,16 +803,7 @@ class EngramEmbedding(nn.Module):
                 dtype=torch.bfloat16,
                 device=indices.device,
             )
-        local_cols = indices[:, self.head_start : self.head_start + self.part_n_hash_cols]
-        if local_cols.size(1) < self.part_n_hash_cols:
-            # tp_size does not divide n_hash_cols: the last head-owning
-            # rank's slice runs short of the uniform block width. Pad with
-            # column 0 (id 0 predates every non-first rank's row range, so
-            # the padding is never owned and is zeroed below) to keep the
-            # gathered blocks shape-uniform.
-            local_cols = F.pad(local_cols, (0, self.part_n_hash_cols - local_cols.size(1)))
-        owned = (local_cols >= self.vocab_start) & (local_cols < self.vocab_end)
-        local = (local_cols - self.vocab_start).clamp(0, self.part_num_embeddings - 1)
+        owned, local = self._owned_local_cols(indices)
         flat = local.reshape(-1).to(torch.int64)
         payload = self.weight.index_select(0, flat)
         scale = self.weight_scale.index_select(0, flat)
@@ -697,46 +812,223 @@ class EngramEmbedding(nn.Module):
             scale = scale.repeat_interleave(self.quant_block, dim=-1)
         else:
             values = _e4m3_to_float(payload)
-            # Persistent scales were validated by the weight loader. Keeping
-            # lookup tensor-only avoids a D2H sync and supports graph capture.
+            # Persistent scales were checked at load; lookup must not introduce a D2H validation sync.
             scale = ue8m0_to_scale(scale, validate=False).repeat_interleave(self.quant_block, dim=-1)
         rows = (values * scale).to(torch.bfloat16)
         rows = rows.view(num_tokens, self.part_n_hash_cols, self.dim)
         return torch.where(owned.unsqueeze(-1), rows, torch.zeros_like(rows))
 
-    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
-        """``[T, n_hash_cols]`` global row ids -> ``[T, n_hash_cols, dim]`` bf16.
+    def _ensure_host_buffers(self, num_tokens: int) -> None:
+        self._ensure_host_scratch(num_tokens)
+        self._ensure_eager_staging(num_tokens)
 
-        Only this rank's head columns are read; foreign rows contribute zeros
-        and the TP all-gather reassembles the full head set. Short or empty
-        head slices (``tp_size`` not dividing ``n_hash_cols``) contribute
-        zero columns; the post-gather trim restores exactly the
-        ``n_hash_cols`` real columns.
-        """
-        rows = self._local_block(indices)
+    def _wait_for_upload(self) -> None:
+        event = getattr(self, "_upload_done", None)
+        if event is not None:
+            event.synchronize()
+            self._upload_done = None
+
+    def _record_upload(self) -> None:
+        stream = _staging_stream(self.setup_device)
+        if stream is None:
+            return
+        event = getattr(self, "_upload_event", None)
+        if event is None:
+            event = torch.cuda.Event() if self.setup_device.type == "cuda" else torch.npu.Event()
+            self._upload_event = event
+        event.record(stream)
+        self._upload_done = event
+
+    def _ensure_host_scratch(self, num_tokens: int) -> None:
+        width = self.part_n_hash_cols
+        if self._ids_host is not None and self._host_capacity >= num_tokens:
+            return
+        # Wait for the prior H2D upload before replacing pinned source buffers.
+        if self._ids_host is not None:
+            self._wait_for_upload()
+        capacity = max(self._host_capacity, _ENGRAM_HOST_MIN_CAPACITY)
+        while capacity < num_tokens:
+            capacity *= 2
+        ids_host, ids_pinned, ids_failure = _host_buffer((capacity, width), torch.int64)
+        owned_host, _, owned_failure = _host_buffer((capacity, width), torch.bool)
+        rows_host, rows_pinned, rows_failure = _host_buffer((capacity, width, self.dim), torch.bfloat16)
+        # Publish scratch only after every allocation succeeds, allowing a failed grow to retry.
+        self._ids_host, self._ids_host_pinned = ids_host, ids_pinned
+        self._owned_host = owned_host
+        self._rows_host, self._rows_host_pinned = rows_host, rows_pinned
+        self._host_capacity = capacity
+        self._host_pin_failure = ids_failure or owned_failure or rows_failure
+
+    def _ensure_eager_staging(self, num_tokens: int) -> None:
+        if self._eager_staged_device is not None and self._eager_capacity >= num_tokens:
+            return
+        capacity = max(self._eager_capacity, _ENGRAM_HOST_MIN_CAPACITY)
+        while capacity < num_tokens:
+            capacity *= 2
+        staged = self._alloc_staging(capacity)
+        self._eager_staged_device = staged
+        self._eager_capacity = capacity
+
+    def _alloc_staging(self, capacity: int) -> torch.Tensor:
+        return torch.empty(
+            (capacity, self.part_n_hash_cols, self.dim),
+            dtype=torch.bfloat16,
+            device=self.setup_device,
+        )
+
+    def _engram_lookup_op_contract_error(
+        self,
+        ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> str:
+        if not self.offload:
+            return "table is not host-offloaded"
+        if self._shared_storage is not None and not self._shared_storage.is_loaded:
+            return f"shared host table is {self._shared_storage.state}, not loaded"
+        if not self._staging_operand_pinned(ids, self._ids_host, self._ids_host_pinned):
+            return f"ids staging is not pinned{self._pin_failure_hint(self._ids_host_pinned)}"
+        if not self._staging_operand_pinned(output, self._rows_host, self._rows_host_pinned):
+            return f"output staging is not pinned{self._pin_failure_hint(self._rows_host_pinned)}"
+        return ""
+
+    @staticmethod
+    def _staging_operand_pinned(
+        operand: torch.Tensor,
+        staging: torch.Tensor | None,
+        pinned: bool,
+    ) -> bool:
+        """Compare storage pointers so offset views of the recorded pinned buffer remain valid."""
+        return (
+            pinned
+            and staging is not None
+            and operand.untyped_storage().data_ptr() == staging.untyped_storage().data_ptr()
+        )
+
+    def _pin_failure_hint(self, pinned: bool) -> str:
+        if pinned or self._host_pin_failure is None:
+            return ""
+        return (
+            f" (this host cannot allocate pinned CPU memory: {self._host_pin_failure}; "
+            "the offloaded table needs pinned staging, so set "
+            "engram_config.cpu_offload=false)"
+        )
+
+    def stage_ids_offload(self, indices: torch.Tensor, *, output: torch.Tensor | None = None) -> None:
+        """Queue D2H on the current stream; the caller waits once across all layers."""
+        num_tokens = indices.shape[0]
+        self._wait_for_upload()
+        if output is None:
+            self._ensure_host_buffers(num_tokens)
+        else:
+            expected = (num_tokens, self.part_n_hash_cols, self.dim)
+            if tuple(output.shape) != expected or output.dtype != torch.bfloat16 or output.device != self.setup_device:
+                raise ValueError("Engram staging output must match this shard's shape, dtype and device")
+            self._ensure_host_scratch(num_tokens)
+
+        assert self._ids_host is not None
+        assert self._owned_host is not None
+
+        owned, local = self._owned_local_cols(indices)
+
+        self._ids_host[:num_tokens].copy_(local, non_blocking=True)
+        self._owned_host[:num_tokens].copy_(owned, non_blocking=True)
+
+    def finish_stage_offload(self, num_tokens: int, *, output: torch.Tensor | None = None) -> torch.Tensor:
+        """The caller must finish D2H first; the upload event protects pinned sources until reuse."""
+        assert self._ids_host is not None
+        assert self._owned_host is not None
+        assert self._rows_host is not None
+        staging = output
+        if staging is None:
+            staging = self._eager_staged_device
+        assert staging is not None
+        flat = self._ids_host[:num_tokens].reshape(-1)
+        rows_out = self._rows_host[:num_tokens].view(-1, self.dim)
+        if self.part_num_embeddings == 0:
+            rows_out.zero_()
+        else:
+            reason = self._engram_lookup_op_contract_error(flat, rows_out)
+            if reason:
+                raise RuntimeError(
+                    f"engram host offload cannot run the CPU int8 lookup op ({reason}); "
+                    "the fused op is the only dequant path for the offloaded table"
+                )
+            _get_engram_lookup_op()(self.weight, self.weight_scale, flat, rows_out)
+        rows_out.masked_fill_(~self._owned_host[:num_tokens].reshape(-1, 1), 0.0)
+        _log_engram_lookup_op_active()
+
+        staging[:num_tokens].copy_(self._rows_host[:num_tokens], non_blocking=True)
+        self._record_upload()
+        return staging[:num_tokens]
+
+    def _local_block_offload(self, indices: torch.Tensor) -> torch.Tensor:
+        self.stage_ids_offload(indices)
+        _sync_accelerator(self.setup_device)
+        return self.finish_stage_offload(indices.shape[0])
+
+    def fallback_to_device(self) -> bool:
+        """Quiesce execution before demotion; persistent graph rows and DP-shared tables cannot be demoted."""
+        if not self.offload:
+            return False
+        if self._shared_storage is not None:
+            raise RuntimeError(
+                "engram fallback_to_device() is not supported for a DP-shared host table: "
+                f"layer={self.layer_id} rank={self.tp_rank} shares its table with its "
+                "node-local DP group, and a per-rank HBM demotion would desynchronize the "
+                "group. engram_config.dp_shared_memory requires the shared host load to succeed"
+            )
+        if self._graph_metadata_bound:
+            raise RuntimeError(
+                "engram fallback_to_device() must run before ACL-graph capture: "
+                f"layer={self.layer_id} rank={self.tp_rank} already allocated a "
+                "persistent execution metadata. A "
+                "captured graph has baked that address, so demoting the table to HBM "
+                "here would make every replay read freed memory. Reconcile the "
+                "offload decision before the first capture instead."
+            )
+        # Complete both copies before replacing either parameter, so failure leaves a usable host table.
+        device_weight = self.weight.data.to(self.setup_device)
+        device_weight_scale = self.weight_scale.data.to(self.setup_device)
+        self.weight.data = device_weight
+        self.weight_scale.data = device_weight_scale
+        self.offload = False
+        self._ids_host = None
+        self._owned_host = None
+        self._rows_host = None
+        self._host_capacity = 0
+        self._ids_host_pinned = False
+        self._rows_host_pinned = False
+        self._eager_staged_device = None
+        self._eager_capacity = 0
+        return True
+
+    def close_host_offload(self) -> None:
+        storage = self._shared_storage
+        if storage is None:
+            return
+        self.weight = nn.Parameter(torch.empty(0, dtype=torch.int8, device="cpu"), requires_grad=False)
+        self.weight_scale = nn.Parameter(torch.empty(0, dtype=torch.float32, device="cpu"), requires_grad=False)
+        storage.close()
+        self._shared_storage = None
+
+    def local_block(self, indices: torch.Tensor) -> torch.Tensor:
+        if self.offload:
+            return self._local_block_offload(indices)
+        return self._local_block_device(indices)
+
+    def gather_heads(self, local: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
             from xllm.python import distributed as _distributed
 
-            gathered = _distributed.tp_all_gather(rows, dim=1, world_size=self.tp_size)
-            rows = gathered[:, : self.n_hash_cols]
-        return rows
+            rows = _distributed.tp_all_gather(local, dim=1, world_size=self.tp_size)
+            return rows[:, : self.n_hash_cols]
+        return local
 
-
-# ---------------------------------------------------------------------------
-# Per-layer Engram module
-# ---------------------------------------------------------------------------
+    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.gather_heads(self.local_block(indices))
 
 
 class Engram(nn.Module):
-    """Writes an n-gram lookup into the residual stream, gated by match quality.
-
-    The hash ids fetch ``n_hash_cols`` rows; ``wkv`` turns them into one key
-    per hc copy plus a shared value. The gate is a normalized dot product of
-    the stream against the key, signed-sqrt'ed before the sigmoid (matching
-    the reference kernel bit-for-bit, including the ``dot == 0`` edge that
-    keeps the positive clamp value).
-    """
-
     def __init__(
         self,
         layout: EngramLayout,
@@ -750,6 +1042,9 @@ class Engram(nn.Module):
         device: torch.device,
         storage: str = ENGRAM_STORAGE_FP8,
         gate_unrotate: torch.Tensor | None = None,
+        offload: bool = False,
+        dp_shared_memory: bool = False,
+        dp_group: Any = None,
     ) -> None:
         super().__init__()
         self.layer_hash_index = layer_hash_index
@@ -764,9 +1059,12 @@ class Engram(nn.Module):
             tp_rank,
             storage=storage,
             device=device,
+            offload=offload,
+            layer_id=layout.layer_ids[layer_hash_index],
+            dp_shared_memory=dp_shared_memory,
+            dp_group=dp_group,
         )
         n_hash_cols = layout.n_hash_cols
-        # Replicated (not TP-sharded), matching the reference ReplicatedLinear.
         self.wkv = nn.Linear(
             n_hash_cols * layout.head_dim,
             hidden_size * (hc_mult + 1),
@@ -782,17 +1080,64 @@ class Engram(nn.Module):
             torch.empty(hc_mult, hidden_size, dtype=dtype, device=device),
             requires_grad=False,
         )
-        # QuaRot gate un-rotation (W8A8 export): the stream arrives
-        # rotated (h_rot) while q/k/wkv-K are in the original basis, so the
-        # gate dot uses h_rot @ Q.T. None on unrotated checkpoints.
         self.register_buffer("gate_unrotate", gate_unrotate, persistent=False)
         self._staged_rows: torch.Tensor | None = None
+        # Stage the host gather outside capture; the TP all-gather stays inside the graph.
+        self._staged_local: torch.Tensor | None = None
+        self._staging_num_tokens = 0
+
+    @property
+    def offload(self) -> bool:
+        return self.embed_tokens.offload
+
+    def close_host_offload(self) -> None:
+        self.embed_tokens.close_host_offload()
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        """Gather this layer's rows before the decoder layer loop starts."""
-        self._staged_rows = self.embed_tokens.lookup(hash_ids)
+        if self.offload:
+            self._staged_local = self.embed_tokens.local_block(hash_ids)
+        else:
+            self._staged_rows = self.embed_tokens.lookup(hash_ids)
 
-    def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+    def begin_stage_offload(self, hash_ids: torch.Tensor, *, output: torch.Tensor | None = None) -> None:
+        if not self.offload:
+            return
+        self.embed_tokens.stage_ids_offload(hash_ids, output=output)
+        self._staging_num_tokens = hash_ids.shape[0]
+
+    def finish_stage_offload(self, *, output: torch.Tensor | None = None) -> None:
+        if not self.offload:
+            return
+        self._staged_local = self.embed_tokens.finish_stage_offload(
+            self._staging_num_tokens,
+            output=output,
+        )
+
+    def _reject_stale_row_count(self, staged: torch.Tensor, num_tokens: int | None) -> None:
+        if num_tokens is not None and staged.shape[0] != num_tokens:
+            raise RuntimeError(
+                "engram mixed-mode staging row mismatch: staged "
+                f"{staged.shape[0]} rows but this step has "
+                f"{num_tokens} tokens; the graph would read the wrong rows"
+            )
+
+    def embed(self, hash_ids: torch.Tensor | None, num_tokens: int | None = None) -> torch.Tensor:
+        if hash_ids is None:
+            if self._staged_local is not None:
+                self._reject_stale_row_count(self._staged_local, num_tokens)
+                return self.embed_tokens.gather_heads(self._staged_local)
+            if self._staged_rows is not None:
+                self._reject_stale_row_count(self._staged_rows, num_tokens)
+                return self._staged_rows
+            raise RuntimeError(
+                "engram embed called without hash ids and no staged rows; "
+                "offload mode requires the pre-graph staging pass"
+            )
+        if self.offload:
+            # A smaller invocation must gather again; a capacity check would return stale rows.
+            if self._staged_local is None or self._staged_local.shape[0] != hash_ids.shape[0]:
+                self._staged_local = self.embed_tokens.local_block(hash_ids)
+            return self.embed_tokens.gather_heads(self._staged_local[: hash_ids.shape[0]])
         if self._staged_rows is None or self._staged_rows.shape[0] < hash_ids.shape[0]:
             self._staged_rows = self.embed_tokens.lookup(hash_ids)
         return self._staged_rows[: hash_ids.shape[0]]
@@ -800,20 +1145,19 @@ class Engram(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        hash_ids: torch.Tensor,
+        hash_ids: torch.Tensor | None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Gated residual injection into the full mHC stream.
-
-        Args:
-            hidden_states: ``[T, hc_mult, dim]`` residual stream entering this
-                block (between the previous sublayer's post and this block's
-                pre, so the mix coefficients see the injected stream).
-            hash_ids: ``[T, n_hash_cols]`` row ids of this layer.
-            token_mask: ``[T]``; False shuts the gate so those positions pass
-                through untouched (image spans).
-        """
-        rows = self.embed(hash_ids).to(self.wkv.weight.dtype)
+        context = get_forward_context_or_none() if self.offload else None
+        execution = context.layer_shared_cache.get(EngramExecutionMetadata) if context is not None else None
+        if execution is not None:
+            local_rows = execution.local_rows[self.layer_hash_index]
+            self._reject_stale_row_count(local_rows, hidden_states.shape[0])
+            rows = self.embed_tokens.gather_heads(local_rows)
+            token_mask = execution.gate_mask
+        else:
+            rows = self.embed(hash_ids, num_tokens=hidden_states.shape[0])
+        rows = rows.to(self.wkv.weight.dtype)
         kv = self.wkv(rows.flatten(-2))
         num_tokens, hc_mult, dim = hidden_states.shape
         keys = kv[:, : hc_mult * dim].view(num_tokens, hc_mult, dim).float()
@@ -832,7 +1176,150 @@ class Engram(nn.Module):
         gate = torch.sigmoid(gate_input)
         if token_mask is not None:
             gate = torch.where(token_mask.reshape(-1, 1), gate, torch.zeros_like(gate))
-        # The value is shared across hc copies ([T, dim]); the gate is
-        # per-copy ([T, hc]).
         output = hidden + gate.unsqueeze(-1) * value.unsqueeze(1)
         return output.to(hidden_states.dtype)
+
+
+def stage_offload_rows(
+    engrams: Sequence[Engram],
+    hash_ids: Sequence[torch.Tensor],
+    *,
+    outputs: Sequence[torch.Tensor] | None = None,
+) -> None:
+    if not engrams:
+        return
+    destinations = [None] * len(engrams) if outputs is None else outputs
+    for engram, ids, output in zip(engrams, hash_ids, destinations, strict=True):
+        engram.begin_stage_offload(ids, output=output)
+    _sync_accelerator(engrams[0].embed_tokens.setup_device)
+    for engram, output in zip(engrams, destinations, strict=True):
+        engram.finish_stage_offload(output=output)
+
+
+@dataclass(slots=True)
+class EngramExecutionMetadata:
+    """Rows and gate mask owned by one eager invocation or captured graph."""
+
+    local_rows: tuple[torch.Tensor, ...]
+    gate_mask: torch.Tensor | None
+
+
+class EngramExecutionMetadataBuilder:
+    metadata_type = EngramExecutionMetadata
+    requires_flat_slot_mapping = False
+
+    def __init__(self, hash_state: EngramHashState, engrams: Sequence[Engram], window_size: int) -> None:
+        self._hash_state = hash_state
+        self._engrams = tuple(sorted(engrams, key=lambda engram: engram.layer_hash_index))
+        self._window_size = window_size
+        caches, groups = build_cache_specs_v41([0], [], window_size, 1)
+        self._swa_builder = DsaMetadataBuilder(
+            caches, groups, read_table_layout=READ_TABLE_LAYOUT_RING, preserve_query_padding=True
+        )
+        self._cache: torch.Tensor | None = None
+        self._eager: EngramExecutionMetadata | None = None
+
+    def bind_layer_caches(self, layer_caches: list[LayerCache]) -> None:
+        self._cache = layer_caches[0].swa if layer_caches else None
+        if self._cache is not None:
+            self._hash_state.ensure_cache(self._cache)
+
+    def _allocate(self, num_tokens: int, device: torch.device) -> EngramExecutionMetadata:
+        return EngramExecutionMetadata(
+            local_rows=tuple(
+                torch.empty(
+                    (num_tokens, engram.embed_tokens.part_n_hash_cols, engram.embed_tokens.dim),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                for engram in self._engrams
+            ),
+            gate_mask=torch.empty(num_tokens, dtype=torch.bool, device=device),
+        )
+
+    def allocate_persistent(self, input_batch: InputBatch, metadata: AttentionMetadata) -> EngramExecutionMetadata:
+        if self._cache is None or self._cache.numel() == 0:
+            raise RuntimeError("Engram graph capture requires a bound SWA cache")
+        result = self._allocate(input_batch.num_tokens_after_padding, input_batch.input_ids.device)
+        for engram in self._engrams:
+            engram.embed_tokens._graph_metadata_bound = True
+        return result
+
+    def build(self, input_batch: InputBatch, metadata: AttentionMetadata) -> EngramExecutionMetadata:
+        if self._cache is None or self._cache.numel() == 0:
+            return EngramExecutionMetadata((), None)
+        size = input_batch.num_tokens_after_padding
+        if self._eager is None or self._eager.gate_mask.numel() < size:
+            capacity = max(size, 2 * self._eager.gate_mask.numel() if self._eager else 1)
+            self._eager = self._allocate(capacity, input_batch.input_ids.device)
+        result = EngramExecutionMetadata(
+            tuple(rows[:size] for rows in self._eager.local_rows), self._eager.gate_mask[:size]
+        )
+        self.update_persistent(result, input_batch, metadata)
+        return result
+
+    def update_persistent(
+        self, persistent_metadata: object, input_batch: InputBatch, metadata: AttentionMetadata
+    ) -> None:
+        if not isinstance(persistent_metadata, EngramExecutionMetadata):
+            raise TypeError("Engram received invalid execution metadata")
+        size = input_batch.num_tokens_after_padding
+        if persistent_metadata.gate_mask is None or persistent_metadata.gate_mask.shape != (size,):
+            raise RuntimeError("Engram metadata capacity does not match the execution batch")
+        if input_batch.is_dummy:
+            for rows in persistent_metadata.local_rows:
+                rows.zero_()
+            persistent_metadata.gate_mask.zero_()
+            return
+        if self._cache is None or not self._hash_state.ensure_cache(self._cache):
+            raise RuntimeError("Engram host offload requires a bound SWA cache before execution")
+        if not metadata.multi_block_tables or metadata.multi_block_tables[0] is None:
+            raise RuntimeError("Engram host offload requires the SWA block table")
+        query_lengths = list(input_batch.num_scheduled_tokens)
+        context_lengths = [
+            computed + scheduled
+            for computed, scheduled in zip(
+                input_batch.num_computed_tokens, input_batch.num_scheduled_tokens, strict=True
+            )
+        ]
+        padding = size - sum(query_lengths)
+        if padding < 0:
+            raise ValueError("Engram query lengths exceed the execution batch")
+        if padding:
+            query_lengths.append(padding)
+            context_lengths.append(0)
+        block_table = metadata.multi_block_tables[0]
+        slots = self._swa_builder.build_swa_slot_mapping(
+            block_table,
+            self._window_size,
+            context_lengths,
+            query_lengths,
+            len(query_lengths),
+            size,
+            getattr(metadata, "new_cache_slots_host_values", None),
+        )
+        device = input_batch.input_ids.device
+        query_ends = [0]
+        for count in query_lengths:
+            query_ends.append(query_ends[-1] + count)
+        dead = image_sentinel_mask(input_batch.input_ids)
+        if input_batch.is_padding is not None:
+            dead = dead | input_batch.is_padding
+        elif padding:
+            dead = dead | (torch.arange(size, device=device) >= size - padding)
+        hashes = self._hash_state(
+            input_batch.input_ids,
+            input_batch.positions,
+            torch.tensor(query_ends, dtype=torch.int64, device=device),
+            dead,
+            None,
+            slots.to(device=device, dtype=torch.int64),
+            block_table.to(device=device),
+            self._window_size,
+        )
+        persistent_metadata.gate_mask.copy_(~dead)
+        stage_offload_rows(
+            self._engrams,
+            [hashes[:, engram.layer_hash_index].to(torch.int64) for engram in self._engrams],
+            outputs=persistent_metadata.local_rows,
+        )

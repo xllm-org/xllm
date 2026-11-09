@@ -184,3 +184,15 @@ def _v41_cpu_grouped_moe(request: pytest.FixtureRequest, monkeypatch: pytest.Mon
         return native(hidden_states, *args, **kwargs)
 
     monkeypatch.setattr(kernels, "grouped_moe_bf16", grouped_moe_bf16, raising=False)
+
+
+@pytest.fixture
+def _engram_offload_lookup_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    import xllm.python.models.deepseek_v41_engram as engram
+
+    try:
+        engram._get_engram_lookup_op()
+    except RuntimeError:
+        from tests.python._engram_reference import _reference_engram_lookup
+
+        monkeypatch.setattr(engram, "_get_engram_lookup_op", lambda: _reference_engram_lookup)

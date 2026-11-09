@@ -55,6 +55,8 @@ def _clear_collective_state():
         cuda_collectives._symm_eligible.clear()
         cuda_collectives._symm_buffers.clear()
         collectives._world_topology = None
+        collectives._world_rank = None
+        collectives._world_endpoint = None
         collectives._world_initialized = False
 
     reset()
@@ -613,3 +615,175 @@ def test_attn_dp_rejects_a_partial_world_before_rendezvous() -> None:
         pytest.raises(ValueError, match="full process world"),
     ):
         collectives.init_process_group("attn_dp", "127.0.0.1", 46004, 0, 2, "cuda:0", 0, 4, 0)
+
+
+@pytest.mark.parametrize(
+    "dp_size, shard_size, world, expected",
+    [
+        (4, 2, 8, [[0, 2], [4, 6], [1, 3], [5, 7]]),
+        (4, 4, 8, [[0, 2, 4, 6], [1, 3, 5, 7]]),
+        (8, 4, 8, [[0, 1, 2, 3], [4, 5, 6, 7]]),
+        (2, 2, 8, [[0, 4], [1, 5], [2, 6], [3, 7]]),
+        (4, 2, 16, [[0, 4], [8, 12], [1, 5], [9, 13], [2, 6], [10, 14], [3, 7], [11, 15]]),
+    ],
+)
+def test_engram_dp_memberships_partition_dp_cohorts(
+    dp_size: int, shard_size: int, world: int, expected: list[list[int]]
+) -> None:
+    assert collectives._engram_dp_memberships(dp_size, shard_size, world) == expected
+
+
+@pytest.mark.parametrize(
+    "dp_size, shard_size, world",
+    [
+        (4, 2, 8),
+        (8, 4, 8),
+        (2, 1, 8),
+        (4, 4, 16),
+        (8, 2, 16),
+        (6, 3, 12),
+    ],
+)
+def test_engram_dp_memberships_are_increasing_shards_of_one_dp_cohort(
+    dp_size: int, shard_size: int, world: int
+) -> None:
+    memberships = collectives._engram_dp_memberships(dp_size, shard_size, world)
+    dp_cohorts = collectives._group_memberships("dp", dp_size, world)
+
+    assert len(memberships) * shard_size == world
+    assert sorted(rank for group in memberships for rank in group) == list(range(world))
+    assert all(len(group) == shard_size for group in memberships)
+    assert all(group == sorted(group) for group in memberships)
+    for group in memberships:
+        assert sum(set(group) <= set(cohort) for cohort in dp_cohorts) == 1
+
+
+@pytest.mark.parametrize("dp_size, shard_size, world", [(4, 3, 8), (4, 0, 8), (4, -1, 8), (6, 4, 12)])
+def test_engram_dp_memberships_reject_bad_shard_size(dp_size: int, shard_size: int, world: int) -> None:
+    with pytest.raises(ValueError, match="must divide DP size"):
+        collectives._engram_dp_memberships(dp_size, shard_size, world)
+
+
+@pytest.mark.parametrize("dp_size, world", [(3, 8), (5, 12)])
+def test_engram_dp_memberships_reject_dp_that_does_not_tile_the_world(dp_size: int, world: int) -> None:
+    with pytest.raises(ValueError, match="does not divide the world size"):
+        collectives._engram_dp_memberships(dp_size, 1, world)
+
+
+@pytest.mark.parametrize(
+    "world_size, dp_size, replica_size, expected_shard_size",
+    [
+        (8, 4, 2, 2),
+        (16, 8, 2, 4),
+        (8, 8, 1, 4),
+        (16, 4, 4, 2),
+    ],
+)
+def test_engram_dp_memberships_agree_with_the_topology_shard_size(
+    world_size: int, dp_size: int, replica_size: int, expected_shard_size: int
+) -> None:
+    hosts = ["node-0"] * (world_size // 2) + ["node-1"] * (world_size // 2)
+    topology = [{"hostname": host} for host in hosts]
+    shard_size = collectives.get_engram_dp_shard_size(world_size, dp_size, replica_size, topology)
+    assert shard_size == expected_shard_size
+
+    memberships = collectives._engram_dp_memberships(dp_size, shard_size, world_size)
+    for group in memberships:
+        assert len({topology[rank]["hostname"] for rank in group}) == 1
+
+
+def _engram_topology(hosts: str | None) -> list[dict[str, object]] | None:
+    if hosts is None:
+        return None
+    return [{"hostname": host} for host in hosts]
+
+
+@pytest.mark.parametrize(
+    "world_size, dp_size, replica_size, hosts, expected",
+    [
+        (16, 4, 4, None, 1),
+        (0, 4, 4, "", 1),
+        (16, 0, 4, "a" * 16, 1),
+        (16, -4, 4, "a" * 16, 1),
+        (16, 4, 0, "a" * 16, 1),
+        (16, 4, -2, "a" * 16, 1),
+        (16, 4, 4, "a" * 8, 1),
+        (6, 3, 2, "aaabbb", 1),
+        (8, 4, 2, "aabbccdd", 1),
+        (16, 4, 4, "a" * 16, 4),
+        (16, 4, 4, "a" * 8 + "b" * 8, 2),
+        (12, 6, 2, "a" * 6 + "b" * 6, 3),
+        (8, 4, 2, "abababab", 1),
+        (8, 4, 2, "aaaaaabb", 1),
+    ],
+)
+def test_get_engram_dp_shard_size_accepts_and_declines(
+    world_size: int, dp_size: int, replica_size: int, hosts: str | None, expected: int
+) -> None:
+    topology = _engram_topology(hosts)
+    assert collectives.get_engram_dp_shard_size(world_size, dp_size, replica_size, topology) == expected
+
+
+@pytest.mark.parametrize("hostname", [None, "", 7, 1.5, ["a"]])
+def test_get_engram_dp_shard_size_rejects_nonstring_hostname(hostname: object) -> None:
+    topology: list[dict[str, object]] = [{"hostname": "a"} for _ in range(8)]
+    topology[3] = {"hostname": hostname}
+    assert collectives.get_engram_dp_shard_size(8, 4, 2, topology) == 1
+
+
+def test_get_engram_dp_shard_size_rejects_missing_hostname() -> None:
+    topology: list[dict[str, object]] = [{"hostname": "a"} for _ in range(8)]
+    topology[3] = {}
+    assert collectives.get_engram_dp_shard_size(8, 4, 2, topology) == 1
+
+
+def test_engram_group_reuses_framework_with_gloo_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    topology = [{"hostname": "node-0" if rank < 4 else "node-1", "device_index": rank} for rank in range(8)]
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=2, topology=topology)
+    collectives.init_process_group("tp", "127.0.0.1", 46001, 0, 2, "cuda:0", 2, 8, 1)
+    new_group.reset_mock()
+    group = collectives.init_engram_dp_group("cuda:0", 4, 2)
+    assert group.rank() == 1 and group.size() == 2
+    assert collectives._group_ranks[("engram_dp", "cuda:0")] == (0, 2)
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [[0, 2], [4, 6], [1, 3], [5, 7]]
+    assert all(call.kwargs["backend"] == "gloo" for call in new_group.call_args_list)
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+    assert collectives.init_engram_dp_group("cuda:0", 4, 2) is group
+
+
+@pytest.mark.parametrize("memberships", [[[0, 1], [1, 3]], [[1, 0], [2, 3]], [[0, True], [2, 3]]])
+def test_explicit_group_memberships_fail_before_world_creation(
+    monkeypatch: pytest.MonkeyPatch, memberships: list[list[int]]
+) -> None:
+    _, init_world, _, new_group = _mock_process_groups(monkeypatch, global_rank=0)
+    with pytest.raises((ValueError, TypeError)):
+        collectives.init_process_group(
+            "engram_dp", "127.0.0.1", 46001, 0, 2, "cuda:0", 0, 4, 0, group_ranks=memberships, backend="gloo"
+        )
+    init_world.assert_not_called()
+    new_group.assert_not_called()
+
+
+def test_engram_collectives_keep_the_callers_group_with_multiple_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first, selected = _FakeGroup(0, 2), _FakeGroup(1, 2)
+    monkeypatch.setattr(collectives, "_groups", {("engram_dp", "cuda:0"): first, ("engram_dp", "cuda:1"): selected})
+    global_rank = MagicMock(return_value=7)
+    broadcast, gather, barrier, monitored = (MagicMock() for _ in range(4))
+    monkeypatch.setattr(dist, "get_global_rank", global_rank)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    monkeypatch.setattr(dist, "barrier", barrier)
+    monkeypatch.setattr(dist, "monitored_barrier", monitored)
+    payload, gathered = ["descriptor"], [None, None]
+    collectives.engram_broadcast_object_list(payload, src=1, group=selected)
+    collectives.engram_all_gather_object(gathered, None, group=selected)
+    collectives.engram_barrier(group=selected)
+    timeout = timedelta(seconds=3)
+    collectives.engram_barrier(group=selected, timeout=timeout)
+    global_rank.assert_called_once_with(selected, 1)
+    broadcast.assert_called_once_with(payload, src=7, group=selected)
+    gather.assert_called_once_with(gathered, None, group=selected)
+    barrier.assert_called_once_with(group=selected)
+    monitored.assert_called_once_with(group=selected, timeout=timeout, wait_all_ranks=True)

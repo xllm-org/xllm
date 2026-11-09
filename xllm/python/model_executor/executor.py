@@ -520,14 +520,7 @@ class ModelExecutor:
             from xllm.python.model_executor.runners.inductor import InductorRunner
 
             self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
-        self.requires_input_batch_metadata = any(
-            runner is not None and runner.execution_metadata_builders
-            for runner in (
-                self.eager_runner,
-                self.inductor_runner,
-                self.decode_graph_runner,
-            )
-        )
+        self.requires_input_batch_metadata = False
 
     @staticmethod
     def _attention_config(
@@ -571,6 +564,14 @@ class ModelExecutor:
             self.inductor_runner.bind_layer_caches(layer_caches)
         if self.context_kv_graph_runner is not None:
             self.context_kv_graph_runner.bind_kv_caches(layer_caches)
+        self.requires_input_batch_metadata = any(
+            runner is not None and runner.execution_metadata_builders
+            for runner in (
+                self.eager_runner,
+                self.inductor_runner,
+                self.decode_graph_runner,
+            )
+        )
         self._kv_bound = True
 
     @torch.inference_mode()

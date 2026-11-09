@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,8 +24,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import torch.nn as nn
 
-from tests.python._engram_reference import _engram_test_token_map, _tiny_engram_hash_state
+from tests.python._engram_reference import _engram_test_layout, _engram_test_token_map, _tiny_engram_hash_state
 from xllm.python import distributed
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa2_attention import (
@@ -48,6 +50,7 @@ from xllm.python.layers import moe_parallel
 from xllm.python.layers.attention import Attention
 from xllm.python.model_executor import executor as executor_module
 from xllm.python.model_executor.executor import ModelExecutor
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import deepseek_v41 as dq
 from xllm.python.models.deepseek_v41 import (
     CSA2_MODE_FULL,
@@ -57,8 +60,10 @@ from xllm.python.models.deepseek_v41 import (
     V41_QUANT_ASCEND,
     V41_QUANT_FP8,
     V41_QUANT_NONE,
+    CSA2LayerMode,
     CSA2LayerPlan,
     DeepseekV41Config,
+    DeepseekV41DecoderLayer,
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
     DeepseekV41MoE,
@@ -1933,9 +1938,8 @@ def test_engram_embedding_tp_sharding_nondivisible() -> None:
 
     for tp_size in (2, 3, 5, 8):
         part = (len(head_sizes) + tp_size - 1) // tp_size
-        blocks = [make(tp_size, rank)._local_block(ids) for rank in range(tp_size)]
+        blocks = [make(tp_size, rank).local_block(ids) for rank in range(tp_size)]
         assert all(block.shape == (t, part, dim) for block in blocks)
-        # Ranks past the last head own no table rows and contribute zeros.
         for rank in range(tp_size):
             if rank * part >= len(head_sizes):
                 assert not blocks[rank].any()
@@ -1967,16 +1971,7 @@ def _quarot_gate_reference(
 
 
 def test_engram_gate_quarot_unrotation() -> None:
-    layout = EngramLayout(
-        layer_ids=[1],
-        num_embeddings=[290],
-        max_ngram_size=3,
-        n_heads=2,
-        head_dim=32,
-        vocab_size=64,
-        compressed_vocab_size=16,
-        pad_token_id=0,
-    )
+    layout = _engram_test_layout(1)
     dim, hc_mult = 48, 2
     g = torch.Generator().manual_seed(99)
     q_orth = torch.linalg.qr(torch.randn(dim, dim, generator=g))[0]
@@ -2745,3 +2740,447 @@ def test_engram_cache_reuses_resolved_token_ids() -> None:
     expected = reference(ids, positions, boundaries, dead, None, None, None, 0)
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(state._cache[:3], torch.tensor([-1, int(state.token_map[7]), -1], dtype=torch.int32))
+
+
+def test_close_host_offload_releases_every_layer_despite_one_failure() -> None:
+    closed: list[str] = []
+
+    class _Engram:
+        def __init__(self, name: str, *, boom: bool = False) -> None:
+            self._name = name
+            self._boom = boom
+
+        def close_host_offload(self) -> None:
+            if self._boom:
+                raise RuntimeError(f"{self._name} refuses to close")
+            closed.append(self._name)
+
+    class _Layer:
+        def __init__(self, engram: object | None) -> None:
+            self.engram = engram
+
+    model = type("_Model", (), {})()
+    model.layers = [
+        _Layer(_Engram("a")),
+        _Layer(_Engram("b", boom=True)),
+        _Layer(_Engram("c")),
+        _Layer(None),
+    ]
+    with pytest.raises(RuntimeError, match="layer 1"):
+        dq.DeepseekV41Model.close_host_offload(model)
+    assert closed == ["a", "c"]
+
+
+def test_engram_private_host_copy_failure_logs_traceback_and_falls_back() -> None:
+    class _Embed:
+        def __init__(self) -> None:
+            self.offload = True
+            self.fallback_calls = 0
+
+        def fallback_to_device(self) -> bool:
+            self.fallback_calls += 1
+            self.offload = False
+            return True
+
+    table = torch.zeros(1, 32, dtype=torch.int8)
+    scale = torch.zeros(1, 1, dtype=torch.float32)
+
+    def make_self(copy_rows: Callable[[_Embed, torch.Tensor, torch.Tensor, int, int], None]) -> SimpleNamespace:
+        return SimpleNamespace(
+            _load_engram_ascend_table=lambda *args, **kwargs: (table, scale, 0, 1),
+            _copy_engram_rows=copy_rows,
+        )
+
+    xllm_logger = dq.logger
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    xllm_logger.addHandler(handler)
+    try:
+        embed = _Embed()
+        copies = {"count": 0}
+
+        def _fail_first(_embed: _Embed, _table: torch.Tensor, _scale: torch.Tensor, _start: int, _rows: int) -> None:
+            copies["count"] += 1
+            if copies["count"] == 1:
+                raise RuntimeError("simulated host copy failure")
+
+        dq.DeepseekV41ForCausalLM._load_engram_ascend_private(make_self(_fail_first), None, "ck.", 7, embed)
+
+        embed2 = _Embed()
+
+        def _always_fail(_embed: _Embed, _table: torch.Tensor, _scale: torch.Tensor, _start: int, _rows: int) -> None:
+            raise RuntimeError("simulated HBM copy failure")
+
+        with pytest.raises(RuntimeError, match="partially populated"):
+            dq.DeepseekV41ForCausalLM._load_engram_ascend_private(make_self(_always_fail), None, "ck.", 9, embed2)
+    finally:
+        xllm_logger.removeHandler(handler)
+
+    assert copies["count"] == 2, "the fallback must re-run the copy on the HBM path"
+    assert embed.fallback_calls == 1
+    assert embed.offload is False
+    assert embed2.fallback_calls == 1
+
+    warnings = [
+        record
+        for record in records
+        if "host-table load failed" in record.getMessage() and "layer 7" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is not None, "the wide catch must keep the traceback"
+    rendered = logging.Formatter().format(warnings[0])
+    assert "Traceback" in rendered and "simulated host copy failure" in rendered
+
+
+def _fake_v41_layers(*engrams: Engram | None) -> list[SimpleNamespace]:
+    return [SimpleNamespace(engram=engram) for engram in engrams]
+
+
+def test_engram_offload_reconcile_demotes_all_layers_on_fallback() -> None:
+    layout = _engram_test_layout(layer_id=1)
+    off_a = _make_int8_engram(layout, 48, 2, offload=True)
+    off_b = _make_int8_engram(layout, 48, 2, offload=True)
+    assert off_b.embed_tokens.fallback_to_device() is True
+    assert off_b.offload is False
+
+    fake = SimpleNamespace(
+        engram_offload_active=True,
+        dp_shared_memory=False,
+        layers=_fake_v41_layers(off_a, off_b, None),
+        execution_metadata_builders=(dq.EngramExecutionMetadataBuilder(_tiny_engram_hash_state(), [off_a, off_b], 2),),
+    )
+    runner = executor_module.EagerRunner(fake, MagicMock(), torch.device("cpu"))
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(fake) is True
+    runner.bind_layer_caches([])
+    assert runner._build_execution_contexts(SimpleNamespace(), None) == {}
+    assert fake.engram_offload_active is False
+    assert off_a.offload is False
+    assert off_b.offload is False
+
+
+def test_engram_offload_reconcile_skips_already_demoted_layer() -> None:
+    layout = _engram_test_layout(layer_id=1)
+    off_a = _make_int8_engram(layout, 48, 2, offload=True)
+    off_b = _make_int8_engram(layout, 48, 2, offload=True)
+    assert off_b.embed_tokens.fallback_to_device() is True
+    assert off_b.offload is False
+
+    calls: list[str] = []
+    real_a = off_a.embed_tokens.fallback_to_device
+    real_b = off_b.embed_tokens.fallback_to_device
+
+    def spy_a() -> bool:
+        calls.append("a")
+        return real_a()
+
+    def spy_b() -> bool:
+        calls.append("b")
+        return real_b()
+
+    off_a.embed_tokens.fallback_to_device = spy_a
+    off_b.embed_tokens.fallback_to_device = spy_b
+
+    fake = SimpleNamespace(
+        engram_offload_active=True, dp_shared_memory=False, layers=_fake_v41_layers(off_a, off_b, None)
+    )
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(fake) is True
+    assert calls == ["a"], "only the still-offloading layer may be demoted"
+    assert off_a.offload is False
+    assert fake.engram_offload_active is False
+
+
+def test_engram_offload_reconcile_keeps_offload_when_all_layers_held() -> None:
+    layout = _engram_test_layout(layer_id=1)
+    off_a = _make_int8_engram(layout, 48, 2, offload=True)
+    fake = SimpleNamespace(engram_offload_active=True, dp_shared_memory=False, layers=_fake_v41_layers(off_a, None))
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(fake) is False
+    assert fake.engram_offload_active is True
+    assert off_a.offload is True
+    inactive = SimpleNamespace(engram_offload_active=False, dp_shared_memory=False, layers=_fake_v41_layers(off_a))
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(inactive) is False
+
+
+def test_engram_offload_reconcile_skips_demotion_for_dp_shared_memory() -> None:
+    layout = _engram_test_layout(layer_id=1)
+    off_a = _make_int8_engram(layout, 48, 2, offload=True)
+    off_b = _make_int8_engram(layout, 48, 2, offload=True)
+    assert off_b.embed_tokens.fallback_to_device() is True
+    assert off_b.offload is False
+
+    calls: list[str] = []
+    real_a = off_a.embed_tokens.fallback_to_device
+    real_b = off_b.embed_tokens.fallback_to_device
+
+    def spy_a() -> bool:
+        calls.append("a")
+        return real_a()
+
+    def spy_b() -> bool:
+        calls.append("b")
+        return real_b()
+
+    off_a.embed_tokens.fallback_to_device = spy_a
+    off_b.embed_tokens.fallback_to_device = spy_b
+
+    fake = SimpleNamespace(
+        engram_offload_active=True,
+        dp_shared_memory=True,
+        layers=_fake_v41_layers(off_a, off_b, None),
+    )
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(fake) is False
+    assert calls == [], "a DP-shared table must not trigger any per-layer demotion"
+    assert fake.engram_offload_active is True
+    assert off_a.offload is True
+
+
+def test_engram_fallback_layer_serves_embed_none_from_staged_rows() -> None:
+    layout = _engram_test_layout(layer_id=1)
+    dim, hc_mult = 48, 2
+    off = _make_int8_engram(layout, dim, hc_mult, offload=True)
+    dev = _make_int8_engram(layout, dim, hc_mult, offload=False)
+    with torch.no_grad():
+        dev.embed_tokens.weight.copy_(off.embed_tokens.weight)
+        dev.embed_tokens.weight_scale.copy_(off.embed_tokens.weight_scale)
+
+    assert off.embed_tokens.fallback_to_device() is True
+    assert off.offload is False
+
+    ids = torch.zeros(6, layout.n_hash_cols, dtype=torch.int64)
+    off.prepare_embeddings(ids)
+    assert off._staged_local is None
+    assert off._staged_rows is not None
+
+    replay_rows = off.embed(None)
+    dev.prepare_embeddings(ids)
+    assert torch.equal(replay_rows, dev._staged_rows)
+
+
+def test_engram_mixed_mode_embed_none_checks_staged_row_count() -> None:
+    layout = _engram_test_layout(layer_id=1)
+    eng = _make_int8_engram(layout, 48, 2, offload=False)
+    ids = torch.zeros(6, layout.n_hash_cols, dtype=torch.int64)
+    eng.prepare_embeddings(ids)
+    assert eng._staged_rows is not None and eng._staged_rows.shape[0] == 6
+
+    assert eng.embed(None, num_tokens=6).shape[0] == 6
+    assert eng.embed(None).shape[0] == 6
+
+    with pytest.raises(RuntimeError, match="row mismatch"):
+        eng.embed(None, num_tokens=3)
+
+
+def test_engram_embed_re_gathers_for_a_shorter_batch(_engram_offload_lookup_op: None) -> None:
+    layout = _engram_test_layout(layer_id=1)
+    off = _make_int8_engram(layout, 48, 2, offload=True)
+    g = torch.Generator().manual_seed(31)
+    long_ids = torch.randint(0, layout.num_embeddings[0], (8, layout.n_hash_cols), generator=g)
+    short_ids = torch.randint(0, layout.num_embeddings[0], (3, layout.n_hash_cols), generator=g)
+
+    off.prepare_embeddings(long_ids)
+    assert off._staged_local is not None and off._staged_local.shape[0] == 8
+
+    short_rows = off.embed(short_ids)
+    assert short_rows.shape[0] == 3
+    assert off._staged_local.shape[0] == 3
+    ref = _make_int8_engram(layout, 48, 2, offload=True)
+    ref.prepare_embeddings(short_ids)
+    assert torch.equal(short_rows, ref.embed(None))
+
+
+class _EngramRoutingAttnStub(nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((hidden_size,), 0.5), requires_grad=False)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden * self.scale
+
+
+class _EngramRoutingMlpStub(nn.Module):
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden * 0.25
+
+
+def _make_engram_routing_decoder_layer() -> DeepseekV41DecoderLayer:
+    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
+    layout = _engram_test_layout(1)
+    layer = DeepseekV41DecoderLayer(
+        cfg,
+        1,
+        torch.float32,
+        torch.device("cpu"),
+        CSA2LayerMode(layer_id=1, mode=CSA2_MODE_SWA, compress_ratio=0, main_kv_source_layer=-1),
+        engram_layout=layout,
+        engram_storage=ENGRAM_STORAGE_INT8,
+        engram_offload=True,
+    )
+    eng = layer.engram
+    assert eng is not None
+    g = torch.Generator().manual_seed(17)
+    with torch.no_grad():
+        for name in ("hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base"):
+            getattr(layer.hc, name).normal_(0.0, 0.02)
+        for name in ("hc_attn_scale", "hc_ffn_scale"):
+            getattr(layer.hc, name).fill_(1.0)
+        payload = torch.randint(-127, 128, eng.embed_tokens.weight.shape, dtype=torch.int8, generator=g)
+        scales = torch.rand(eng.embed_tokens.weight_scale.shape, generator=g).float() * 0.05 + 0.01
+        eng.embed_tokens.weight.copy_(payload)
+        eng.embed_tokens.weight_scale.copy_(scales)
+        eng.wkv.weight.normal_(0.0, 0.05)
+        eng.q_weight.normal_(0.0, 0.05)
+        eng.k_weight.normal_(0.0, 0.05)
+    layer.self_attn = _EngramRoutingAttnStub(cfg.hidden_size)
+    layer.mlp = _EngramRoutingMlpStub()
+    return layer
+
+
+def test_decoder_layer_routes_none_hashes_to_staged_rows(
+    _engram_offload_lookup_op: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+        mixed = torch.matmul(residual.transpose(-2, -1), comb).transpose(-2, -1)
+        return mixed + post.unsqueeze(-1) * x.unsqueeze(-2)
+
+    monkeypatch.setattr(dq.kernels, "hc_post", hc_post)
+    layer = _make_engram_routing_decoder_layer()
+    eng = layer.engram
+    assert eng is not None and eng.offload is True
+
+    hidden_size = layer.input_layernorm.weight.numel()
+    hc_mult = layer.hc.hc_mult
+    t = 5
+    g = torch.Generator().manual_seed(29)
+    hashes = torch.randint(
+        0,
+        eng.embed_tokens.num_embeddings,
+        (t, 1, eng.embed_tokens.n_hash_cols),
+        generator=g,
+    )
+    hidden = torch.randn(t, hc_mult, hidden_size, generator=g)
+    positions = torch.arange(t, dtype=torch.int64)
+    cos_sin_cache = torch.zeros(1)
+    mask = torch.tensor([True, True, False, True, True])
+
+    eng.prepare_embeddings(hashes[:, 0])
+
+    out_hashes, _ = layer(hidden, positions, cos_sin_cache, None, None, hashes, mask)
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=None,
+        layer_caches=[],
+        layer_shared_cache={dq.EngramExecutionMetadata: dq.EngramExecutionMetadata((eng._staged_local,), mask)},
+    )
+    with forward_context(context):
+        out_none_mask, _ = layer(hidden, positions, cos_sin_cache, None, None, None, mask)
+    out_none_none, _ = layer(hidden, positions, cos_sin_cache, None, None, None, None)
+
+    assert torch.equal(out_none_mask, out_hashes)
+
+    saved = layer.engram
+    layer.engram = None
+    try:
+        ref_none_none, _ = layer(hidden, positions, cos_sin_cache, None, None, None, None)
+    finally:
+        layer.engram = saved
+    assert torch.equal(out_none_none, ref_none_none)
+
+    assert not torch.equal(out_none_mask, out_none_none)
+
+
+def _make_int8_engram(layout: EngramLayout, dim: int, hc_mult: int, offload: bool) -> Engram:
+    eng = Engram(
+        layout,
+        0,
+        dim,
+        hc_mult,
+        rms_norm_eps=1e-6,
+        tp_size=1,
+        tp_rank=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        storage=ENGRAM_STORAGE_INT8,
+        offload=offload,
+    )
+    g = torch.Generator().manual_seed(17)
+    with torch.no_grad():
+        payload = torch.randint(-127, 128, eng.embed_tokens.weight.shape, dtype=torch.int8, generator=g)
+        scales = torch.rand(eng.embed_tokens.weight_scale.shape, generator=g).float() * 0.05 + 0.01
+        eng.embed_tokens.weight.copy_(payload)
+        eng.embed_tokens.weight_scale.copy_(scales)
+        eng.wkv.weight.copy_(torch.randn(eng.wkv.weight.shape, generator=g).bfloat16())
+        eng.q_weight.copy_(torch.randn(eng.q_weight.shape, generator=g).bfloat16())
+        eng.k_weight.copy_(torch.randn(eng.k_weight.shape, generator=g).bfloat16())
+    return eng
+
+
+def test_engram_offload_forward_without_hash_ids_matches_device(_engram_offload_lookup_op: None) -> None:
+    layout = _engram_test_layout(1)
+    dim, hc_mult = 48, 2
+    dev = _make_int8_engram(layout, dim, hc_mult, offload=False)
+    off = _make_int8_engram(layout, dim, hc_mult, offload=True)
+    with torch.no_grad():
+        off.embed_tokens.weight.copy_(dev.embed_tokens.weight)
+        off.embed_tokens.weight_scale.copy_(dev.embed_tokens.weight_scale)
+        off.wkv.weight.copy_(dev.wkv.weight)
+        off.q_weight.copy_(dev.q_weight)
+        off.k_weight.copy_(dev.k_weight)
+
+    t = 4
+    hash_ids = torch.zeros(t, layout.n_hash_cols, dtype=torch.int64)
+    dev.prepare_embeddings(hash_ids)
+    off.prepare_embeddings(hash_ids)
+    assert dev._staged_rows is not None
+    assert off._staged_local is not None
+    assert torch.equal(off.embed_tokens.gather_heads(off._staged_local), dev._staged_rows)
+
+    hidden = torch.randn(t, hc_mult, dim, generator=torch.Generator().manual_seed(23)).bfloat16()
+    out_dev = dev(hidden, hash_ids)
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=None,
+        layer_caches=[],
+        layer_shared_cache={
+            dq.EngramExecutionMetadata: dq.EngramExecutionMetadata(
+                (off._staged_local,), torch.ones(t, dtype=torch.bool)
+            )
+        },
+    )
+    with forward_context(context):
+        out_off = off(hidden, None)
+    assert torch.equal(out_off, out_dev)
+
+    fresh = _make_int8_engram(layout, dim, hc_mult, offload=True)
+    with pytest.raises(RuntimeError, match="no staged rows"):
+        fresh.embed(None)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_shared_engram_load_fences_its_own_process_group(monkeypatch: pytest.MonkeyPatch, rank: int) -> None:
+    group = SimpleNamespace(rank=lambda: rank, size=lambda: 2)
+    storage = SimpleNamespace(mark_loaded=MagicMock(), mark_failed=MagicMock())
+    embed = SimpleNamespace(_shared_storage=storage, _dp_group=group)
+    model = SimpleNamespace(
+        _load_engram_ascend_table=MagicMock(return_value=(None, None, 0, 0)),
+        _copy_engram_rows=MagicMock(),
+    )
+    gather, barrier = MagicMock(), MagicMock()
+    monkeypatch.setattr(dq, "engram_all_gather_object", gather)
+    monkeypatch.setattr(dq, "engram_barrier", barrier)
+    DeepseekV41ForCausalLM._load_engram_ascend_shared(model, None, "model.layers.0.", 0, embed)
+    gather.assert_called_once_with([None, None], None, group=group)
+    barrier.assert_called_once_with(group=group, timeout=dq._ENGRAM_SHARED_LOAD_BARRIER_TIMEOUT)
+    storage.mark_loaded.assert_called_once_with()
+    storage.mark_failed.assert_not_called()
+    assert model._copy_engram_rows.call_count == (1 if rank == 0 else 0)

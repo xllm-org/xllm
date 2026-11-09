@@ -59,7 +59,7 @@ else:
     _cuda_collectives = None
     _all_reduce = dist.all_reduce
 
-_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp", "attn_dp"))
+_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp", "attn_dp", "engram_dp"))
 # ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp``,
 # ``moe_ep``, ``cp`` and ``dcp`` stride across those blocks. Both layouts follow
 # from how the caller derives a rank within each group, so a group's full
@@ -79,12 +79,14 @@ _groups = {}
 _group_ranks = {}
 _stores = {}
 _world_topology = None
+_world_rank = None
+_world_endpoint = None
 _world_initialized = False
 
 
 def _shutdown_process_groups() -> None:
     """Release owned groups before torch_npu shuts down the device runtime."""
-    global _world_initialized, _world_topology
+    global _world_initialized, _world_topology, _world_rank, _world_endpoint
     if not _world_initialized:
         return
     if dist.is_initialized():
@@ -93,6 +95,8 @@ def _shutdown_process_groups() -> None:
     _group_ranks.clear()
     _stores.clear()
     _world_topology = None
+    _world_rank = None
+    _world_endpoint = None
     _world_initialized = False
 
 
@@ -149,7 +153,7 @@ def _ensure_world(
     instead of constructing communicators directly registers them with c10d,
     which is what lets a group back a symmetric-memory allocation.
     """
-    global _world_initialized, _world_topology
+    global _world_initialized, _world_topology, _world_rank, _world_endpoint
     if _world_initialized:
         return
     store = _shared_store(host, port, global_rank, global_world_size)
@@ -173,6 +177,8 @@ def _ensure_world(
     _groups[world_key] = dist.group.WORLD
     _group_ranks[world_key] = tuple(range(global_world_size))
     _world_topology = _exchange_world_topology(store, device, global_rank, global_world_size)
+    _world_rank = global_rank
+    _world_endpoint = (host, port)
 
 
 def _group_memberships(
@@ -213,6 +219,38 @@ def _group_memberships(
     return [[index + offset * count for offset in range(world_size)] for index in range(count)]
 
 
+def _validate_explicit_group_topology(
+    group_name: str,
+    memberships: list[list[int]],
+    rank: int,
+    world_size: int,
+    global_rank: int,
+    global_world_size: int,
+    group_index: int,
+) -> None:
+    if (
+        global_world_size <= 0
+        or world_size <= 0
+        or len(memberships) * world_size != global_world_size
+        or any(len(ranks) != world_size for ranks in memberships)
+    ):
+        raise ValueError(f"{group_name} topology sizes do not match the process-group initialization")
+    all_ranks = [member for ranks in memberships for member in ranks]
+    if any(not isinstance(member, int) or isinstance(member, bool) for member in all_ranks):
+        raise TypeError(f"{group_name} topology ranks must be integers")
+    if sorted(all_ranks) != list(range(global_world_size)):
+        raise ValueError(f"{group_name} topology must partition all global ranks exactly once")
+    # c10d new_group sorts ranks; reject a different caller order before creating the group.
+    if any(ranks != sorted(ranks) for ranks in memberships):
+        raise ValueError(f"{group_name} topology members within each group must be sorted")
+    if (
+        not 0 <= group_index < len(memberships)
+        or not 0 <= rank < world_size
+        or memberships[group_index][rank] != global_rank
+    ):
+        raise RuntimeError(f"{group_name} topology rank or group index does not match the caller")
+
+
 def init_process_group(
     group_name: str,
     host: str,
@@ -224,6 +262,8 @@ def init_process_group(
     global_world_size: int,
     group_index: int,
     group_stride: int | None = None,
+    group_ranks: Sequence[Sequence[int]] | None = None,
+    backend: str | None = None,
 ) -> ProcessGroup:
     if group_name not in _GROUP_NAMES:
         raise ValueError(f"unsupported parallel group: {group_name}")
@@ -233,6 +273,14 @@ def init_process_group(
         raise ValueError("attn_dp must use the full process world and global rank")
     device_obj = torch.device(device)
     group_key = (group_name, str(device_obj))
+    if group_stride is not None and group_ranks is not None:
+        raise ValueError("group_stride and group_ranks are mutually exclusive")
+    memberships = None
+    if group_ranks is not None:
+        memberships = [list(ranks) for ranks in group_ranks]
+        _validate_explicit_group_topology(
+            group_name, memberships, rank, world_size, global_rank, global_world_size, group_index
+        )
     group = _groups.get(group_key)
     if group is not None:
         if group.rank() != rank or group.size() != world_size:
@@ -241,18 +289,26 @@ def init_process_group(
                 f"rank {group.rank()}/{group.size()}, requested "
                 f"rank {rank}/{world_size}"
             )
+        if memberships is not None and _group_ranks.get(group_key) != tuple(memberships[group_index]):
+            raise RuntimeError(f"{group_name} group is already initialized with different members")
+        if backend is not None and dist.get_backend(group) != backend:
+            raise RuntimeError(f"{group_name} group is already initialized with a different backend")
         return group
 
     _ensure_world(host, port, device_obj, global_rank, global_world_size)
     if group_name == "attn_dp":
-        return _groups[group_key]
-    backend = _backend_for(device_obj)
+        group = _groups[group_key]
+        if backend is not None and dist.get_backend(group) != backend:
+            raise RuntimeError("attn_dp uses the existing world process-group backend")
+        return group
+    effective_backend = _backend_for(device_obj) if backend is None else backend
 
     own = None
     own_ranks = None
-    memberships = _group_memberships(group_name, world_size, global_world_size, group_stride)
+    if memberships is None:
+        memberships = _group_memberships(group_name, world_size, global_world_size, group_stride)
     for index, ranks in enumerate(memberships):
-        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=backend)
+        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=effective_backend)
         if global_rank in ranks:
             own = candidate
             own_index = index
@@ -269,7 +325,7 @@ def init_process_group(
     assert own_ranks is not None
     _groups[group_key] = own
     _group_ranks[group_key] = tuple(own_ranks)
-    if _cuda_collectives is not None:
+    if _cuda_collectives is not None and effective_backend == _backend_for(device_obj):
         _cuda_collectives.init_group(own, device_obj, own_ranks, _world_topology)
     return own
 
@@ -410,6 +466,109 @@ def moe_ep_hccl_info(device: torch.device | str) -> tuple[str, int, int]:
 
 def dcp_group(device: torch.device | str) -> ProcessGroup | None:
     return _groups.get(("dcp", str(torch.device(device))))
+
+
+def world_topology() -> list[dict[str, object]] | None:
+    return _world_topology
+
+
+def get_engram_dp_shard_size(
+    world_size: int,
+    dp_size: int,
+    replica_size: int,
+    topology: Sequence[dict[str, object]] | None,
+) -> int:
+    if topology is None or world_size <= 0 or dp_size <= 0 or replica_size <= 0 or len(topology) != world_size:
+        return 1
+    hostnames = [entry.get("hostname") for entry in topology]
+    if any(not isinstance(host, str) or not host for host in hostnames):
+        return 1
+    node_count = len(set(hostnames))
+    replicas_per_node, remainder = divmod(world_size, node_count * replica_size)
+    if remainder:
+        return 1
+    shard_size = math.gcd(dp_size, replicas_per_node)
+    if shard_size == 1 or node_count == 1:
+        return shard_size
+    ranks_per_node = replicas_per_node * replica_size
+    for start in range(0, world_size, ranks_per_node):
+        node_ranks = [rank for rank, host in enumerate(hostnames) if host == hostnames[start]]
+        if node_ranks != list(range(start, start + ranks_per_node)):
+            return 1
+    return shard_size
+
+
+def _engram_dp_memberships(dp_size: int, shard_size: int, global_world_size: int) -> list[list[int]]:
+    if not (shard_size > 0 and dp_size % shard_size == 0):
+        raise ValueError(f"engram DP shard size {shard_size} must divide DP size {dp_size}")
+    return [
+        dp_members[start : start + shard_size]
+        for dp_members in _group_memberships("dp", dp_size, global_world_size)
+        for start in range(0, len(dp_members), shard_size)
+    ]
+
+
+def engram_dp_shard_size(dp_size: int, replica_size: int) -> int:
+    if not _world_initialized or _world_topology is None:
+        return 1
+    return get_engram_dp_shard_size(len(_world_topology), dp_size, replica_size, _world_topology)
+
+
+def init_engram_dp_group(device: str, dp_size: int, shard_size: int) -> ProcessGroup:
+    if not _world_initialized or _world_topology is None or _world_rank is None or _world_endpoint is None:
+        raise RuntimeError("engram DP-shared host table requires an initialized process-group world")
+    global_world_size = len(_world_topology)
+    if shard_size <= 1:
+        raise RuntimeError(
+            f"engram DP sharing requires more than one rank per shard; got DP={dp_size}, shard_size={shard_size}"
+        )
+    memberships = _engram_dp_memberships(dp_size, shard_size, global_world_size)
+    # Hostname agreement is only a precheck; attaching with the matching token proves SHM locality.
+    for ranks in memberships:
+        hosts = {_world_topology[rank].get("hostname") for rank in ranks}
+        if len(hosts) != 1:
+            raise RuntimeError(
+                "engram DP sharing group spans multiple nodes: "
+                f"ranks {ranks} on hosts {sorted(str(host) for host in hosts)}"
+            )
+    own_index, own_rank = None, None
+    for index, ranks in enumerate(memberships):
+        if _world_rank in ranks:
+            own_index, own_rank = index, ranks.index(_world_rank)
+            break
+    if own_index is None:
+        raise RuntimeError(f"global rank {_world_rank} is missing from the engram DP memberships")
+    assert own_rank is not None
+    host, port = _world_endpoint
+    return init_process_group(
+        "engram_dp",
+        host,
+        port,
+        own_rank,
+        shard_size,
+        device,
+        _world_rank,
+        global_world_size,
+        own_index,
+        group_ranks=memberships,
+        backend="gloo",
+    )
+
+
+def engram_broadcast_object_list(object_list: list, src: int = 0, *, group: ProcessGroup) -> None:
+    global_src = dist.get_global_rank(group, src)
+    dist.broadcast_object_list(object_list, src=global_src, group=group)
+
+
+def engram_all_gather_object(object_list: list, obj: object, *, group: ProcessGroup) -> None:
+    dist.all_gather_object(object_list, obj, group=group)
+
+
+def engram_barrier(*, group: ProcessGroup, timeout: timedelta | None = None) -> None:
+    if timeout is None:
+        dist.barrier(group=group)
+        return
+    dist.monitored_barrier(group=group, timeout=timeout, wait_all_ranks=True)
 
 
 class AllGatherContext(NamedTuple):
@@ -739,6 +898,13 @@ def gather_dp_execution_tokens(
 
 __all__ = [
     "init_process_group",
+    "world_topology",
+    "get_engram_dp_shard_size",
+    "engram_dp_shard_size",
+    "init_engram_dp_group",
+    "engram_broadcast_object_list",
+    "engram_all_gather_object",
+    "engram_barrier",
     "init_tp_group",
     "tp_rank",
     "cp_rank",

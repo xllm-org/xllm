@@ -646,7 +646,7 @@ class DsaMetadataBuilder:
     # -- SWA group (process_swa_group, cpp:466-572) ------------------------
     # Writes only the current forward's query tokens, ring-indexed by position.
 
-    def _process_swa_group(
+    def build_swa_slot_mapping(
         self,
         raw_bt: torch.Tensor,
         block_size: int,
@@ -654,9 +654,8 @@ class DsaMetadataBuilder:
         q_lens: Sequence[int],
         batch_size: int,
         graph_slot_capacity: int,
-        graph_block_table_capacity_cols: int,
         new_cache_slots: Sequence[int] | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         query_total_tokens = 0
         valid_total_tokens = 0
         for seq in range(batch_size):
@@ -698,41 +697,25 @@ class DsaMetadataBuilder:
                         slots_list[write_idx + i] = slot_for_position(seq, q_start + i)
                 write_idx += row_count
         out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
+        return out_slots
 
-        # Rebuild the read-side block table with the SWA ring semantics.
-        #
-        # The write path (`slot_for_position`) maps position `p` to
-        # `raw_bt[seq, (p // block_size) % semantic_cols]`, so a read consumer
-        # must resolve logical column `(p // block_size) % semantic_cols`.
-        # Two layouts satisfy that contract:
-        #
-        #   * "ring" (DeepSeek-V4.1, requested by ``Csa2AttentionBackend``):
-        #     every storage column `d` carries the ring block for its own
-        #     logical index, `new_bt[s, d] = raw_bt[s, d % semantic_cols]`, for
-        #     EVERY column `d`. The three V4.1 readers address the table by
-        #     absolute column `(p // block_size) % table_width` and do NOT
-        #     compensate for a shifted layout: `csa2_attention.py`'s
-        #     `_gather_swa_positions` / `_swa_position_slots` and
-        #     `deepseek_v41_engram.py`'s `_cache_source`. In production
-        #     `semantic_cols == 1` and the writer only fills column 0, so a
-        #     right-aligned table parks the single ring block in the LAST
-        #     column: every other addressed column reads `-1`. The eager
-        #     readers `clamp_min(0)` that to block 0 -- a foreign KV block
-        #     whenever the sequence's ring block is not 0 (e.g. ctx=257 with
-        #     `blocks=[0,9]` resolves as block 0 for 127/128 positions) -- and
-        #     the fused `sparse_attn_sharedkv` / `sparse_flash_mla` op does not
-        #     clamp at all: it reads the `int32_t(-1)` through a `uint64_t`
-        #     (`sparse_attn_sharedkv_common.h:149-158`), wraps it to a huge
-        #     offset and reads out of bounds.
-        #   * "right_aligned" (shared default, DSV4 / V4-dspark): only the last
-        #     `min(semantic_cols, dst_lens)` columns are filled and the rest
-        #     stay `-1`. Its consumers compensate for the shift:
-        #     `csa_attention.py`'s `_build_dspark_swa_indices` is
-        #     layout-adaptive (`valid_block_counts` / `first_retained_columns`)
-        #     and resolves both layouts identically, so this default keeps the
-        #     historical behaviour for those paths.
-        #
-        # The table width decision below is shared by both layouts.
+    def _process_swa_group(
+        self,
+        raw_bt: torch.Tensor,
+        block_size: int,
+        ctx_lens: Sequence[int],
+        q_lens: Sequence[int],
+        batch_size: int,
+        graph_slot_capacity: int,
+        graph_block_table_capacity_cols: int,
+        new_cache_slots: Sequence[int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        out_slots = self.build_swa_slot_mapping(
+            raw_bt, block_size, ctx_lens, q_lens, batch_size, graph_slot_capacity, new_cache_slots
+        )
+        semantic_cols = int(raw_bt.size(1))
+
+        # Ring readers address columns modulo semantic_cols; right-aligned readers compensate for the shift.
         dst_lens = [(max(int(ctx_lens[s]), 0) + block_size - 1) // block_size for s in range(batch_size)]
         max_dst_len = max(max(dst_lens) if dst_lens else 0, semantic_cols)
         if graph_slot_capacity > 0 and graph_block_table_capacity_cols > 0:

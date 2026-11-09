@@ -54,8 +54,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import torch
@@ -65,6 +67,13 @@ import torch.nn.functional as F
 from scripts.logger import logger
 from xllm.python import distributed as _distributed
 from xllm.python import kernels
+from xllm.python.distributed import (
+    engram_all_gather_object,
+    engram_barrier,
+    engram_dp_shard_size,
+    init_engram_dp_group,
+    world_topology,
+)
 from xllm.python.layers.attention import Attention
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.layernorm import RMSNorm
@@ -72,7 +81,9 @@ from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy, dp_gather_tokens
 from xllm.python.layers.rotary_embedding import RotaryEmbedding
 from xllm.python.model_executor.forward_context import (
+    get_execution_context,
     get_forward_context,
+    in_acl_graph,
     record_layer_event,
 )
 from xllm.python.model_loader import W8A8WeightLoader
@@ -93,6 +104,9 @@ from xllm.python.models.deepseek_v41_engram import (
     ENGRAM_STORAGE_FP8,
     ENGRAM_STORAGE_INT8,
     Engram,
+    EngramEmbedding,
+    EngramExecutionMetadata,
+    EngramExecutionMetadataBuilder,
     EngramHashState,
     EngramLayout,
     _e4m3_to_float,
@@ -101,6 +115,8 @@ from xllm.python.models.deepseek_v41_engram import (
     load_quarot_gate_unrotate,
     ue8m0_to_scale,
 )
+from xllm.python.models.engram_config import EngramConfig
+from xllm.python.models.engram_shared_memory import ensure_dev_shm_capacity, estimate_shared_bytes
 
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
@@ -235,11 +251,11 @@ _V41_FIELD_DEFAULTS: dict[str, Any] = {
     "rms_norm_eps": 1e-20,
 }
 
+_ENGRAM_SHARED_LOAD_BARRIER_TIMEOUT = timedelta(seconds=30)
+
 
 @dataclass
 class DeepseekV41Config(DeepseekV4Config):
-    """DeepSeek-V4.1 Flash model config (V4 fields + CSA2/CED/Engram/DSpark)."""
-
     model_type: str = "deepseek_v41"
     hidden_size: int = 5120
     n_layers: int = 40
@@ -272,6 +288,17 @@ class DeepseekV41Config(DeepseekV4Config):
     # -- Vision (Phase 4); image_token_id also drives gate.bias_vl --
     # -1 = no image tokens (text-only), matching the C++ loader default.
     image_token_id: int = -1
+    # -- Engram host-offload switches (from --engram_config) --
+    # Parsed strictly from the raw ``engram_config`` JSON string by
+    # EngramConfig.from_value; {} (the C++ default) disables both switches.
+    engram_config: EngramConfig = field(default_factory=EngramConfig)
+    # -- Parallel / weight-format contract --
+    # Passed in by the C++ executor (py_causal_lm.cpp). Engram currently
+    # requires PP=1 and DCP=1 and is only validated against safetensors/dummy
+    # weights; the values are surfaced here so config validation and the
+    # Python executor read them from one place.
+    pp_size: int = 1
+    dcp_size: int = 1
 
     @property
     def dense_intermediate_size(self) -> int:
@@ -288,18 +315,14 @@ class DeepseekV41Config(DeepseekV4Config):
         for key, value in _V41_FIELD_DEFAULTS.items():
             if merged.get(key) is None:
                 merged[key] = value
-        # The layer count has two aliases; only inject when both are absent
-        # so an explicit value of either alias always wins.
         if merged.get("num_hidden_layers") is None and merged.get("n_layers") is None:
             merged["num_hidden_layers"] = 40
         cfg = super().from_dict(merged)
-        return replace(
+        cfg = replace(
             cfg,
             dense_ffn_intermediate_size=int(_pick(merged, "intermediate_size", default=0)),
-            # Re-parse: V4's from_dict normalized "ratio <= 1 -> 1".
             compress_ratios=_parse_v41_compress_ratios(list(merged.get("compress_ratios") or []), cfg.n_layers),
-            # V4.1 removed hash routing (gate.tid2eid); the field stays for
-            # the inherited V4 machinery.
+            # Retain the inherited field, but V4.1 does not use hash routing.
             n_hash_layers=0,
             kv_source_layer_ids=_int_list(merged, "kv_source_layer_ids"),
             index_source_layer_ids=_int_list(merged, "index_source_layer_ids"),
@@ -322,6 +345,24 @@ class DeepseekV41Config(DeepseekV4Config):
             dspark_n_routed_experts=int(_pick(merged, "dspark_n_routed_experts", default=128)),
             dspark_num_experts_per_tok=int(_pick(merged, "dspark_num_experts_per_tok", default=3)),
             image_token_id=int(_pick(merged, "image_token_id", default=-1)),
+            engram_config=EngramConfig.from_value(merged.get("engram_config", {})),
+            pp_size=int(_pick(merged, "pp_size", default=1)),
+            dcp_size=int(_pick(merged, "dcp_size", default=1)),
+        )
+        _validate_engram_config(cfg)
+        return cfg
+
+
+def _validate_engram_config(cfg: DeepseekV41Config) -> None:
+    if not cfg.engram_layer_ids:
+        return
+    if not cfg.engram_config.cpu_offload:
+        return
+    if cfg.tp_size not in (1, 2, 4, 8) or cfg.pp_size != 1 or cfg.dcp_size != 1:
+        raise ValueError(
+            "Engram requires TP in {1, 2, 4, 8} with PP=1 and DCP=1; got "
+            f"TP={cfg.tp_size}, PP={cfg.pp_size}, DCP={cfg.dcp_size}. "
+            "dp_shared_memory does not change TP sharding."
         )
 
 
@@ -902,6 +943,9 @@ class DeepseekV41DecoderLayer(nn.Module):
         engram_layout: EngramLayout | None = None,
         engram_storage: str = ENGRAM_STORAGE_FP8,
         engram_gate_unrotate: torch.Tensor | None = None,
+        engram_offload: bool = False,
+        engram_dp_shared_memory: bool = False,
+        engram_dp_group: Any | None = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -924,8 +968,10 @@ class DeepseekV41DecoderLayer(nn.Module):
                 device,
                 storage=engram_storage,
                 gate_unrotate=engram_gate_unrotate,
+                offload=engram_offload,
+                dp_shared_memory=engram_dp_shared_memory,
+                dp_group=engram_dp_group,
             )
-        # Dense vs MoE by first_k_dense_replace / moe_layer_freq.
         is_dense = (layer_id < cfg.first_k_dense_replace) or (
             cfg.moe_layer_freq > 1 and layer_id % cfg.moe_layer_freq != 0
         )
@@ -957,13 +1003,10 @@ class DeepseekV41DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if pre_mix is None:
             pre_mix = DeepseekV41HyperConnection.make_identity_pre_mix(hidden, self.hc.hc_mult)
-        # Engram injection happens between the previous sublayer's post and
-        # this block's pre, on the full hc stream, so the mix coefficients
-        # see the injected stream (reference model.py:336-360).
-        if self.engram is not None and engram_hashes is not None:
+        if self.engram is not None and (engram_hashes is not None or engram_mask is not None):
             hidden = self.engram(
                 hidden,
-                engram_hashes[:, self.engram.layer_hash_index],
+                None if engram_hashes is None else engram_hashes[:, self.engram.layer_hash_index],
                 engram_mask,
             )
         residual = hidden
@@ -1029,17 +1072,38 @@ class DeepseekV41Model(nn.Module):
                 cfg.engram_compressed_vocab_size,
                 cfg.engram_pad_token_id,
             )
-            # The sidecar-derived buffers (token_map / primes / offsets /
-            # multipliers) load on CPU; move them onto the model device.
             self.engram_hash = EngramHashState.from_config(
                 self.engram_layout,
                 {**(config or {}), "vocab_size": cfg.vocab_size},
             ).to(device)
-        # Engram runtime format per checkpoint family: the ascend (W8A8)
-        # export stores the tables as symmetric int8 + fp32 group scales and
-        # rotates the residual stream (QuaRot), so the gate dot needs the
-        # un-rotated stream; the official FP8/bf16 releases need neither.
         self.engram_storage = ENGRAM_STORAGE_INT8 if quant_mode == V41_QUANT_ASCEND else ENGRAM_STORAGE_FP8
+        self.engram_offload_active = bool(cfg.engram_layer_ids) and cfg.engram_config.cpu_offload
+        if self.engram_offload_active and self.engram_storage != ENGRAM_STORAGE_INT8:
+            logger.warning(
+                "engram_config.cpu_offload=true requested but engram storage is %r; keeping the table on HBM",
+                self.engram_storage,
+            )
+            self.engram_offload_active = False
+        shared_requested = bool(cfg.engram_layer_ids) and cfg.engram_config.dp_shared_memory
+        if shared_requested and self.engram_storage != ENGRAM_STORAGE_INT8:
+            raise ValueError(
+                "engram_config.dp_shared_memory=true requires the int8 (W8A8) engram table "
+                f"storage, got {self.engram_storage!r}"
+            )
+        self.dp_shared_memory = shared_requested and self.engram_offload_active
+        self.engram_dp_group: Any | None = None
+        if self.dp_shared_memory:
+            # A DP replica spans TP x PP x CP; DCP reuses the TP ranks.
+            replica_size = cfg.tp_size * cfg.pp_size * cfg.cp_size
+            shard_size = engram_dp_shard_size(cfg.dp_size, replica_size)
+            if shard_size <= 1:
+                raise ValueError(
+                    "engram_config.dp_shared_memory=true requires a node-local DP sharing "
+                    f"group with more than one rank; got DP={cfg.dp_size}, shard_size={shard_size}."
+                )
+            # Check the aggregate node footprint once; per-table checks would double-count layers.
+            ensure_dev_shm_capacity(self._engram_shared_node_bytes(cfg.tp_size, replica_size, shard_size))
+            self.engram_dp_group = init_engram_dp_group(str(device), cfg.dp_size, shard_size)
         self.engram_gate_unrotate = None
         if cfg.engram_layer_ids and quant_mode == V41_QUANT_ASCEND:
             self.engram_gate_unrotate = load_quarot_gate_unrotate(str((config or {}).get("model_path") or ""), device)
@@ -1059,6 +1123,9 @@ class DeepseekV41Model(nn.Module):
                     self.engram_layout,
                     engram_storage=self.engram_storage,
                     engram_gate_unrotate=self.engram_gate_unrotate,
+                    engram_offload=self.engram_offload_active,
+                    engram_dp_shared_memory=self.dp_shared_memory,
+                    engram_dp_group=self.engram_dp_group,
                 )
                 for i in range(cfg.n_layers)
             ]
@@ -1082,6 +1149,16 @@ class DeepseekV41Model(nn.Module):
             dtype=torch.float32,
             device=device,
         )
+
+        if self.engram_offload_active:
+            assert self.engram_hash is not None
+            self.execution_metadata_builders = (
+                EngramExecutionMetadataBuilder(
+                    self.engram_hash,
+                    [layer.engram for layer in self.layers if layer.engram is not None],
+                    cfg.window_size,
+                ),
+            )
 
     def _layer_rope_cache(self, mode: CSA2LayerMode) -> torch.Tensor:
         """Per-layer RoPE table: compress theta for CSA2 layers, plain otherwise."""
@@ -1118,6 +1195,61 @@ class DeepseekV41Model(nn.Module):
         )
         return hashes, ~dead
 
+    def _engram_shared_node_bytes(self, tp_size: int, replica_size: int, shard_size: int, quant_block: int = 32) -> int:
+        assert self.engram_layout is not None
+        head_dim = self.engram_layout.head_dim
+        per_layer = 0
+        for layer_hash_index in range(len(self.engram_layout.layer_ids)):
+            head_sizes = self.engram_layout.head_sizes(layer_hash_index)
+            part = (len(head_sizes) + tp_size - 1) // tp_size
+            for shard in range(tp_size):
+                start = shard * part
+                rows = sum(head_sizes[start : start + part])
+                if rows:
+                    per_layer += estimate_shared_bytes(rows, head_dim, quant_block)
+        copies = 1
+        topology = world_topology()
+        if topology is not None and replica_size > 0 and shard_size > 0:
+            my_host = socket.gethostname()
+            ranks_on_node = sum(1 for entry in topology if entry.get("hostname") == my_host)
+            replicas_per_node = ranks_on_node // replica_size
+            if replicas_per_node > 0:
+                copies = max(replicas_per_node // shard_size, 1)
+        return per_layer * copies
+
+    def _reconcile_engram_offload_active(self) -> bool:
+        if not self.engram_offload_active or self.dp_shared_memory:
+            return False
+        engram_layers = [layer.engram for layer in self.layers if getattr(layer, "engram", None) is not None]
+        fell_back = [engram for engram in engram_layers if not engram.embed_tokens.offload]
+        if not fell_back:
+            return False
+        for engram in engram_layers:
+            if engram.embed_tokens.offload:
+                engram.embed_tokens.fallback_to_device()
+        self.engram_offload_active = False
+        self.execution_metadata_builders = ()
+        logger.warning(
+            "engram host offload disabled: %d/%d engram layer(s) failed the host-table load; "
+            "falling back the whole model to the HBM table path",
+            len(fell_back),
+            len(engram_layers),
+        )
+        return True
+
+    def close_host_offload(self) -> None:
+        failures: list[str] = []
+        for layer_id, layer in enumerate(self.layers):
+            engram = getattr(layer, "engram", None)
+            if engram is None:
+                continue
+            try:
+                engram.close_host_offload()
+            except Exception as exc:  # noqa: BLE001 - aggregated; keep releasing the rest
+                failures.append(f"layer {layer_id}: {type(exc).__name__}: {exc}")
+        if failures:
+            raise RuntimeError("engram host-table close failed for " + "; ".join(failures))
+
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
@@ -1137,15 +1269,20 @@ class DeepseekV41Model(nn.Module):
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         if self.engram_hash is not None:
-            engram_hashes, engram_mask = self._compute_engram_hashes(backend, metadata, input_ids, positions)
-            if engram_hashes is not None:
-                for layer in self.layers:
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index].to(torch.int64))
+            if self.engram_offload_active:
+                engram_execution = get_execution_context(EngramExecutionMetadata)
+                if engram_execution is None:
+                    raise RuntimeError("Engram host offload requires execution metadata from the runner")
+                engram_mask = engram_execution.gate_mask
+            else:
+                engram_hashes, engram_mask = self._compute_engram_hashes(backend, metadata, input_ids, positions)
+                if engram_hashes is not None:
+                    for layer in self.layers:
+                        if layer.engram is not None:
+                            layer.engram.prepare_embeddings(
+                                engram_hashes[:, layer.engram.layer_hash_index].to(torch.int64)
+                            )
 
-        # Expand to hc_mult identical copies; the first pre_mix is one-hot on
-        # copy 0 (model.py:1258-1260).
         hidden = hidden.unsqueeze(1).expand(-1, self.cfg.hc_mult, -1).contiguous()
         pre_mix = DeepseekV41HyperConnection.make_identity_pre_mix(hidden, self.cfg.hc_mult)
         for layer_id, layer in enumerate(self.layers):
@@ -1182,16 +1319,18 @@ class DeepseekV41ForCausalLM(PyModelBase):
             device=device,
         )
 
-    # -- weight loading ---------------------------------------------------------
-
     def load_weights(self, state_dicts: list[StateDict], tp_rank: int, tp_size: int) -> None:
         if self.quant_mode == V41_QUANT_ASCEND:
             self._load_weights_ascend(state_dicts)
         else:
             self._load_weights_torch(state_dicts)
+        # A failed private host load must demote every Engram layer, not leave mixed paths.
+        self.model._reconcile_engram_offload_active()
+
+    def close_host_offload(self) -> None:
+        self.model.close_host_offload()
 
     def _load_weights_torch(self, state_dicts: list[StateDict]) -> None:
-        """fp8-block / bf16 loading: dequantized bf16 plain-linear modules."""
         cfg = self.cfg
         loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
         is_fp8 = self.quant_mode == V41_QUANT_FP8
@@ -1331,8 +1470,7 @@ class DeepseekV41ForCausalLM(PyModelBase):
         if rows > 0:
             local_scale = scale_u8.narrow(0, start, rows)
             _validate_ue8m0_scale_bytes(local_scale)
-            eng.embed_tokens.weight.data.copy_(table_u8.narrow(0, start, rows))
-            eng.embed_tokens.weight_scale.data.copy_(local_scale)
+            self._copy_engram_rows(eng.embed_tokens, table_u8, scale_u8, start, rows)
         if is_fp8:
             wkv = dequant_fp8_block(
                 loader.get_tensor(ck + "engram.wkv.weight"),
@@ -1472,20 +1610,22 @@ class DeepseekV41ForCausalLM(PyModelBase):
         pm: str,
         layer_id: int,
     ) -> None:
-        """Load one engram layer from the W8A8 export.
-
-        The hash table stays int8 in memory (payload [rows, 256] int8 + one
-        fp32 scale per 32-column group) and is narrowed to this rank's
-        head-bucket row range; ``wkv`` / ``q_weight`` / ``k_weight`` are bf16
-        and copied verbatim (the K half and gate stay in the original basis,
-        the V half is pre-folded with the QuaRot rotation).
-        """
         eng = self.model.layers[layer_id].engram
         if eng is None:
             raise RuntimeError(
                 f"DeepSeek-V4.1 layer {layer_id} has no engram module to load the checkpoint engram tensors into"
             )
-        table = loader.get_tensor(ck + "engram.embed.weight")
+        embed = eng.embed_tokens
+        if embed._shared_storage is not None:
+            self._load_engram_ascend_shared(loader, ck, layer_id, embed)
+        else:
+            self._load_engram_ascend_private(loader, ck, layer_id, embed)
+        loader.copy_in(pm + "engram.wkv.weight", loader.get_tensor(ck + "engram.wkv.weight"))
+        loader.copy_in(pm + "engram.q_weight", loader.get_tensor(ck + "engram.q_weight"))
+        loader.copy_in(pm + "engram.k_weight", loader.get_tensor(ck + "engram.k_weight"))
+
+    @staticmethod
+    def _validate_engram_table_dtypes(layer_id: int, table: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         if table.dtype == torch.uint8:
             table = table.view(torch.int8)
         if table.dtype != torch.int8:
@@ -1494,41 +1634,116 @@ class DeepseekV41ForCausalLM(PyModelBase):
                 "ascend loader implements the int8_sym export only (fp32 group "
                 "scales, see quant_model_description.json optional.embedding_storage)"
             )
-        scale = loader.get_tensor(ck + "engram.embed.scale")
         if scale.dtype != torch.float32:
             raise NotImplementedError(
                 f"engram table scale for layer {layer_id} has dtype {scale.dtype}; "
                 "expected float32 group scales of the int8_sym export"
             )
-        start = eng.embed_tokens.vocab_start
-        rows = eng.embed_tokens.part_num_embeddings
-        if table.size(0) < eng.embed_tokens.num_embeddings:
+        return table
+
+    @staticmethod
+    def _copy_engram_rows(
+        embed: EngramEmbedding, table: torch.Tensor, scale: torch.Tensor, start: int, rows: int
+    ) -> None:
+        if rows <= 0:
+            return
+        embed.weight.data.copy_(table.narrow(0, start, rows))
+        embed.weight_scale.data.copy_(scale.narrow(0, start, rows))
+
+    def _load_engram_ascend_table(
+        self,
+        loader: W8A8WeightLoader,
+        ck: str,
+        layer_id: int,
+        embed: EngramEmbedding,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        table = loader.get_tensor(ck + "engram.embed.weight")
+        scale = loader.get_tensor(ck + "engram.embed.scale")
+        table = self._validate_engram_table_dtypes(layer_id, table, scale)
+        start = embed.vocab_start
+        rows = embed.part_num_embeddings
+        if table.size(0) < embed.num_embeddings:
             raise ValueError(
-                f"engram table for layer {layer_id} has {table.size(0)} rows, "
-                f"config declares {eng.embed_tokens.num_embeddings}"
+                f"engram table for layer {layer_id} has {table.size(0)} rows, config declares {embed.num_embeddings}"
             )
-        if rows > 0:
-            # Direct H2D copy_ from the mmap view; a prior .to(device) would
-            # materialize a 12+GB device temporary on top of the parameter.
-            eng.embed_tokens.weight.data.copy_(table.narrow(0, start, rows))
-            eng.embed_tokens.weight_scale.data.copy_(scale.narrow(0, start, rows))
-        loader.copy_in(pm + "engram.wkv.weight", loader.get_tensor(ck + "engram.wkv.weight"))
-        loader.copy_in(pm + "engram.q_weight", loader.get_tensor(ck + "engram.q_weight"))
-        loader.copy_in(pm + "engram.k_weight", loader.get_tensor(ck + "engram.k_weight"))
+        return table, scale, start, rows
+
+    def _load_engram_ascend_private(
+        self,
+        loader: W8A8WeightLoader,
+        ck: str,
+        layer_id: int,
+        embed: EngramEmbedding,
+    ) -> None:
+        table, scale, start, rows = self._load_engram_ascend_table(loader, ck, layer_id, embed)
+        # Copy directly from mmap; an intermediate device tensor would double the peak table allocation.
+        try:
+            self._copy_engram_rows(embed, table, scale, start, rows)
+        except (RuntimeError, MemoryError) as exc:
+            # Catch only host-copy failures; unrelated loading errors must propagate.
+            if not embed.offload:
+                raise
+            logger.warning(
+                "engram layer %d host-table load failed (%s); falling back to "
+                "the HBM table path for this layer (the model then demotes all "
+                "offload layers to HBM)",
+                layer_id,
+                exc,
+                exc_info=True,
+            )
+            embed.fallback_to_device()
+            try:
+                self._copy_engram_rows(embed, table, scale, start, rows)
+            except (RuntimeError, MemoryError) as exc:
+                raise RuntimeError(
+                    f"engram layer {layer_id}: HBM table copy failed even "
+                    f"after the host->HBM fallback ({exc}); the engram table "
+                    "is only partially populated and the model cannot serve "
+                    "correctly, aborting instead of running with a "
+                    "half-loaded table"
+                ) from exc
+
+    def _load_engram_ascend_shared(
+        self,
+        loader: W8A8WeightLoader,
+        ck: str,
+        layer_id: int,
+        embed: EngramEmbedding,
+    ) -> None:
+        storage = embed._shared_storage
+        group = embed._dp_group
+        assert storage is not None and group is not None
+        error: str | None = None
+        if group.rank() == 0:
+            try:
+                table, scale, start, rows = self._load_engram_ascend_table(loader, ck, layer_id, embed)
+                self._copy_engram_rows(embed, table, scale, start, rows)
+            except Exception as exc:  # noqa: BLE001 - propagated to every rank below
+                error = f"{type(exc).__name__}: {exc}"
+        errors: list[str | None] = [None] * group.size()
+        engram_all_gather_object(errors, error, group=group)
+        failures = "; ".join(f"rank {rank}: {failure}" for rank, failure in enumerate(errors) if failure is not None)
+        # Fence success and failure alike before any rank unwinds or enters the next collective.
+        try:
+            engram_barrier(group=group, timeout=_ENGRAM_SHARED_LOAD_BARRIER_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - re-raised with context below
+            storage.mark_failed()
+            raise RuntimeError(
+                f"Engram shared host-table load fence failed for layer {layer_id} "
+                f"(phase=barrier, group_rank={group.rank()}): {type(exc).__name__}: {exc}"
+            ) from exc
+        if failures:
+            storage.mark_failed()
+            raise RuntimeError(f"Engram shared host-table load failed for layer {layer_id}: {failures}")
+        storage.mark_loaded()
 
     def _load_ascend_moe(self, loader: W8A8WeightLoader, ck: str, pm: str, layer_id: int) -> None:
-        """Ascend MoE: the V4 W8A8 staging plus the V4.1 ``gate.bias_vl``."""
-        # The W8A8 export stores the MoE block under either the native
-        # ``ffn.`` or the legacy ``mlp.`` prefix; resolve it once here and
-        # share it with the shared V4 loader and the V4.1-only ``bias_vl``.
         source_prefix = _resolve_dsv4_moe_prefix(loader, ck, f"DeepSeek-V4.1 layer {layer_id}")
         mlp = self.model.layers[layer_id].mlp
         DeepseekV4ForCausalLM._load_dsv4_moe(mlp, loader, ck, pm, layer_id, source_prefix)
         bias_vl_key = source_prefix + "gate.bias_vl"
         if loader.has(bias_vl_key):
             loader.copy_in(pm + "mlp.gate_bias_vl", loader.get_tensor(bias_vl_key))
-            # Deferred until the vision phase; loaded only for checkpoint
-            # compatibility. The W8A8 expert path never reads gate_bias_vl.
             mlp.gate_bias_vl_loaded = True
 
     def _load_common_layer_norms(

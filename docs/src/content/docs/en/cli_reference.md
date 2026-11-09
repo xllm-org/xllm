@@ -49,6 +49,7 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `use_audio_in_video` | `bool` | `false` | Whether to decode both audio and video when the input is a video. |
 | `audio_max_upload_file_mb` | `int32` | `25` | Maximum speech-to-text audio upload size in MiB. Must be positive. |
 | `audio_max_decode_duration_s` | `int32` | `600` | Maximum decoded speech-to-text audio duration in seconds. `0` disables the limit. |
+| `engram_config` | `string` | `"{}"` | Engram host offload options as a JSON object (`cpu_offload`, `dp_shared_memory`). Shared memory requires CPU offload. |
 | `use_cpp_chat_template` | `bool` | `true` | Use native C++ chat templates for supported models, for example `deepseek_v32`, `deepseek_v4`, and `deepseek_v41`. Set to `false` to fall back to Jinja for debugging. |
 
 ## LoadConfig

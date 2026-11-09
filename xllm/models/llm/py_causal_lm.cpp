@@ -331,6 +331,21 @@ PyCausalLM::PyCausalLM(const ModelContext& context,
 PyCausalLM::~PyCausalLM() {
   clear_python_object(context_kv_graph_runner_);
   clear_python_object(python_kv_caches_);
+  // Release Python-owned shared-table mappings before dropping the model or
+  // finalizing Python.
+  if (py_model_ && Py_IsInitialized() && !python_is_finalizing()) {
+    py::gil_scoped_acquire gil;
+    try {
+      if (py::hasattr(py_model_, "close_host_offload")) {
+        py_model_.attr("close_host_offload")();
+      }
+    } catch (const py::error_already_set& e) {
+      LOG(WARNING) << "PyCausalLM close_host_offload failed: " << e.what();
+    } catch (...) {
+      LOG(WARNING)
+          << "PyCausalLM close_host_offload failed with a non-Python exception";
+    }
+  }
   clear_python_object(py_model_);
   clear_python_object(config_dict_);
 }
@@ -392,6 +407,10 @@ py::dict PyCausalLM::build_config_dict(const ModelContext& context) const {
       requires_eager_execution
           ? std::string("off")
           : ExecutionConfig::get_instance().python_graph_backend();
+  d["engram_config"] = ModelConfig::get_instance().engram_config();
+  // PP is unsupported here; DCP is the live KV-split dimension.
+  d["pp_size"] = 1;
+  d["dcp_size"] = kv_split_size_;
 #if defined(USE_NPU)
   const auto& flash_comm1_options = context.get_flash_comm1_options();
   d["enable_flashcomm1"] = flash_comm1_options.enable_flashcomm1;

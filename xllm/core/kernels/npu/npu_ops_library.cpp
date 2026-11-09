@@ -1009,6 +1009,9 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def("npu_all_reduce(Tensor(a!) x, int comm) -> ()");
   m.def("npu_all_gather(Tensor input, Tensor(a!) output, int comm) -> ()");
   m.def("npu_reduce_scatter(Tensor input, Tensor(a!) output, int comm) -> ()");
+  m.def(
+      "engram_int8_lookup_cpu(Tensor weight, Tensor scale, Tensor ids, "
+      "Tensor(a!) output) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -1129,4 +1132,10 @@ TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, m) {
          TORCH_FN(xllm::kernel::npu::sparse_attn_sharedkv_metadata));
   m.impl("quant_lightning_indexer_metadata",
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_metadata));
+}
+
+// Host lookup accepts CPU tensors and runs before graph capture.
+TORCH_LIBRARY_IMPL(xllm_ops, CPU, m) {
+  m.impl("engram_int8_lookup_cpu",
+         TORCH_FN(xllm::kernel::npu::engram_int8_lookup_cpu));
 }

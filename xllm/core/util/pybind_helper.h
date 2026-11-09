@@ -25,14 +25,24 @@ limitations under the License.
 
 namespace xllm {
 
+// Py_IsInitialized misses finalization; acquiring the GIL then can hang or
+// terminate the thread.
+inline bool python_is_finalizing() {
+#if PY_VERSION_HEX >= 0x030D0000
+  return Py_IsFinalizing() != 0;
+#else
+  return _Py_IsFinalizing() != 0;
+#endif
+}
+
 // Releases a pybind object with the GIL held; if the interpreter is already
-// finalized (static teardown) it is leaked instead of running an off-GIL
-// dec_ref that would abort with "pybind11 PyGILState_Check() failure".
+// finalized or finalizing (static teardown) it is leaked instead of running an
+// off-GIL dec_ref that would abort with "pybind11 PyGILState_Check() failure".
 inline void clear_python_object(pybind11::object& object) {
   if (!object) {
     return;
   }
-  if (!Py_IsInitialized()) {
+  if (!Py_IsInitialized() || python_is_finalizing()) {
     (void)object.release();
     return;
   }

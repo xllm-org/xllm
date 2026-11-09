@@ -473,6 +473,11 @@ void scatter_nd_update(torch::Tensor& var,
                        const torch::Tensor& indices,
                        const torch::Tensor& updates);
 
+void engram_int8_lookup_cpu(const torch::Tensor& weight,
+                            const torch::Tensor& scale,
+                            const torch::Tensor& ids,
+                            torch::Tensor& output);
+
 void reshape_and_cache_a5(const torch::Tensor& key,
                           const torch::Tensor& value,
                           torch::Tensor& key_cache,

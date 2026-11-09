@@ -17,6 +17,7 @@
 import os
 from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
+from typing import Callable
 from unittest.mock import Mock, patch
 
 import pytest
@@ -123,7 +124,7 @@ def test_shared_gdn_verify_admission_uses_bound_model_capability() -> None:
         builder.supports_linear_spec_verify_graph = True
 
     builder.bind_layer_caches = bind
-    runner.execution_metadata_builders = (builder,)
+    runner.model.execution_metadata_builders = (builder,)
     runner.attention_backend.shared_kv_layout = object()
     runner.attention_backend.supports_linear_spec_verify_graph = False
     runner.bind_layer_caches([LayerCache(key=None, value=None, conv=torch.empty(2, 1), ssm=torch.empty(2, 1))])
@@ -1986,3 +1987,53 @@ def test_mla_admission_retains_index_history_capacity_check() -> None:
     metadata.linear_state_indices = torch.tensor([-1], dtype=torch.int32)
 
     assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)
+
+
+@pytest.mark.parametrize("failure_phase", ["metadata", "attention", "capture"])
+def test_graph_entry_published_only_after_complete_capture(monkeypatch: pytest.MonkeyPatch, failure_phase: str) -> None:
+    runner = _runner(max_batch=8, max_model_len=32)
+    runner._graphs = {}
+    runner._stream = Mock()
+    runner._taskless_replay_stream = None
+    runner._has_linear_cache = False
+    stream = Mock()
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: stream)
+    monkeypatch.setattr(runner, "_padded_batch_size", lambda *args: 4)
+    monkeypatch.setattr(runner, "_expanded_verify_view", lambda *args: None)
+    monkeypatch.setattr(runner, "_token_capacity_bucket", lambda *args: 0)
+    monkeypatch.setattr(runner, "_prepare_graph_eplb_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_fill_entry", lambda *args, **kwargs: None)
+    allocated = []
+    key = (4,)
+
+    def allocate(*args: object, **kwargs: object) -> SimpleNamespace:
+        entry = SimpleNamespace(static_metadata=SimpleNamespace())
+        allocated.append(entry)
+        return entry
+
+    monkeypatch.setattr(runner, "_allocate_entry", allocate)
+    phases = []
+    fail = True
+
+    def phase(name: str) -> Callable[..., None]:
+        def run(*args: object, **kwargs: object) -> None:
+            phases.append(name)
+            assert key not in runner._graphs
+            if fail and name == failure_phase:
+                raise RuntimeError(name)
+
+        return run
+
+    monkeypatch.setattr(runner, "_bind_graph_input_batch", phase("metadata"))
+    monkeypatch.setattr(runner, "_prepare_attention", phase("attention"))
+    monkeypatch.setattr(runner, "_capture", phase("capture"))
+    ids = torch.arange(4)
+    with pytest.raises(RuntimeError, match=failure_phase):
+        runner._prepare_graph_entry(ids, ids, SimpleNamespace(), None, graph_key=key)
+    assert runner._graphs == {}
+    fail = False
+    result = runner._prepare_graph_entry(ids, ids, SimpleNamespace(), None, graph_key=key)
+    assert runner._graphs == {key: result}
+    assert len(allocated) == 2
+    assert result is allocated[1]
+    assert phases[-3:] == ["metadata", "attention", "capture"]

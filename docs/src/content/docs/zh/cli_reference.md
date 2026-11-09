@@ -49,6 +49,7 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `use_audio_in_video` | `bool` | `false` | 输入为视频时，是否同时解码音频和视频。 |
 | `audio_max_upload_file_mb` | `int32` | `25` | 语音转文本音频上传大小上限，单位 MiB，必须为正数。 |
 | `audio_max_decode_duration_s` | `int32` | `600` | 语音转文本音频解码后的时长上限，单位秒。`0` 表示不限制。 |
+| `engram_config` | `string` | `"{}"` | Engram 主机卸载选项的 JSON 对象（`cpu_offload`、`dp_shared_memory`）。共享内存要求启用 CPU 卸载。 |
 | `use_cpp_chat_template` | `bool` | `true` | 对支持的模型使用原生 C++ chat template，例如 `deepseek_v32`、`deepseek_v4`、`deepseek_v41`；设为 `false` 可回退到 Jinja 以便调试。 |
 
 ## LoadConfig

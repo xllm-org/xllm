@@ -43,16 +43,23 @@ class BaseRunner(ABC):
         self.attention_backend = attention_backend
         self.device = device
         self.layer_caches: list[LayerCache] = []
-        builders = tuple(getattr(model, "execution_metadata_builders", ()))
+        self._refresh_execution_metadata_builders()
         seen_types: set[object] = set()
-        for builder in builders:
+        for builder in self.execution_metadata_builders:
             metadata_type = builder.metadata_type
             if metadata_type in seen_types:
                 raise RuntimeError(f"duplicate execution metadata builder for {metadata_type.__name__}")
             seen_types.add(metadata_type)
-        self.execution_metadata_builders: tuple[ExecutionMetadataBuilder, ...] = builders
+
+    def _refresh_execution_metadata_builders(self) -> None:
+        builders: tuple[ExecutionMetadataBuilder, ...] = tuple(getattr(self.model, "execution_metadata_builders", ()))
+        self.execution_metadata_builders = builders
+        self._requires_flat_slot_mapping = any(
+            getattr(builder, "requires_flat_slot_mapping", True) for builder in builders
+        )
 
     def bind_layer_caches(self, layer_caches: list[LayerCache]) -> None:
+        self._refresh_execution_metadata_builders()
         for builder in self.execution_metadata_builders:
             builder.bind_layer_caches(layer_caches)
         self.layer_caches = layer_caches
@@ -66,7 +73,7 @@ class BaseRunner(ABC):
             return {}
         if input_batch is None:
             raise RuntimeError("execution metadata builders require upstream InputBatch metadata")
-        if input_batch.num_tokens != int(metadata.slot_mapping.numel()):
+        if self._requires_flat_slot_mapping and input_batch.num_tokens != int(metadata.slot_mapping.numel()):
             raise ValueError("execution metadata must contain one slot per input token")
         execution_contexts: dict[object, object] = {}
         for builder in self.execution_metadata_builders:

@@ -119,6 +119,14 @@ DEFINE_int32(audio_max_decode_duration_s,
              "Maximum decoded speech-to-text audio duration in seconds. "
              "0 disables the limit.");
 
+DEFINE_string(engram_config,
+              "{}",
+              "Engram host-offload switches as a raw JSON object string, e.g. "
+              "'{\"cpu_offload\":true,\"dp_shared_memory\":true}'. Forwarded "
+              "verbatim to the Python executor, which parses and validates it "
+              "(xllm/python/models/engram_config.py). \"{}\" disables both "
+              "switches.");
+
 // NOTE: This is an experimental flag,
 //       it needs to be removed after the function is stable.
 DEFINE_bool(use_cpp_chat_template,
@@ -159,6 +167,7 @@ void ModelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(reasoning_parser);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(tool_call_parser);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_qwen3_reranker);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(engram_config);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_return_mm_full_embeddings);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(mm_download_headers);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(flashinfer_workspace_buffer_size);
@@ -231,6 +240,7 @@ void ModelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(reasoning_parser);
   XLLM_CONFIG_ASSIGN_FROM_JSON(tool_call_parser);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_qwen3_reranker);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(engram_config);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_return_mm_full_embeddings);
   XLLM_CONFIG_ASSIGN_FROM_JSON(mm_download_headers);
   XLLM_CONFIG_ASSIGN_FROM_JSON(flashinfer_workspace_buffer_size);
@@ -264,6 +274,8 @@ void ModelConfig::append_config_json(
       config_json, default_config, tool_call_parser);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_qwen3_reranker);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, engram_config);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_return_mm_full_embeddings);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

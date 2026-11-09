@@ -1113,7 +1113,6 @@ class DecodeAclGraphRunner(AclGraphRunner):
             entry.static_metadata.dsa_graph_token_capacity = self._token_capacity_bucket(
                 metadata, decode_metadata
             ) * int(getattr(self.attention_backend, "graph_token_capacity_granularity", 0) or 0)
-            self._graphs[graph_key] = entry
 
         if self._stream is None:
             self._stream = torch.npu.Stream(device=input_ids.device)
@@ -1184,6 +1183,8 @@ class DecodeAclGraphRunner(AclGraphRunner):
                 )
                 self._bind_graph_input_batch(entry, input_batch)
                 self._prepare_attention(entry, entry.static_metadata, replay=True)
+        if first_capture:
+            self._graphs[graph_key] = entry
         return entry
 
     @staticmethod

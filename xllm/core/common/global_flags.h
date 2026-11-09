@@ -51,6 +51,8 @@ DECLARE_int32(limit_image_per_prompt);
 
 DECLARE_string(mm_download_headers);
 
+DECLARE_string(engram_config);
+
 // --- kvcache config ---
 DECLARE_int32(block_size);
 DECLARE_int64(max_cache_size);

@@ -20,6 +20,17 @@ import torch
 from xllm.python.models.deepseek_v41_engram import EngramHashState, EngramLayout, compute_hash_multipliers
 
 
+def _reference_engram_lookup(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    ids: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    payload = weight.index_select(0, ids).to(torch.float32)
+    factor = scale.index_select(0, ids).repeat_interleave(32, dim=-1)
+    output.copy_((payload * factor).to(torch.bfloat16))
+
+
 def _engram_test_token_map() -> list[int]:
     return (torch.arange(64) % 16).tolist()
 
