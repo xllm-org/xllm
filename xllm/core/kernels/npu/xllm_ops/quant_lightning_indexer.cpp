@@ -29,12 +29,6 @@ construct_quant_lightning_indexer_output_tensor(const at::Tensor& query,
                                                 std::string query_layout_str,
                                                 std::string key_layout_str,
                                                 bool return_value) {
-  constexpr int64_t SIZE = 8;
-  constexpr int64_t DIM_0 = 0;
-  constexpr int64_t DIM_1 = 1;
-  constexpr int64_t DIM_2 = 2;
-  constexpr int64_t DIM_3 = 3;
-  at::SmallVector<int64_t, SIZE> output_size;
   for (size_t i = 0; i < query.sizes().size(); i++) {
     TORCH_CHECK(query.size(i) > 0,
                 "All values within query's shape should be greater "
@@ -54,14 +48,8 @@ construct_quant_lightning_indexer_output_tensor(const at::Tensor& query,
   TORCH_CHECK(sparse_count > 0,
               "sparse count should be greater than 0, but now is ",
               sparse_count);
-  int64_t key_head_num =
-      (key_layout_str == "TND") ? key.size(DIM_1) : key.size(DIM_2);
-  if (query_layout_str == "BSND") {
-    output_size = {
-        query.size(DIM_0), query.size(DIM_1), key_head_num, sparse_count};
-  } else {
-    output_size = {query.size(DIM_0), key_head_num, sparse_count};
-  }
+  const auto output_size = detail::qli_output_size(
+      query, key, sparse_count, query_layout_str, key_layout_str);
   at::Tensor sparse_indices_out =
       at::zeros(output_size, query.options().dtype(at::kInt));
   at::Tensor sparse_values_out;

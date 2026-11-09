@@ -11,6 +11,7 @@ cc_library (
         kimik2_detector.h
         deepseekv3_detector.h
         deepseekv32_detector.h
+        deepseekv41_detector.h
         glm45_detector.h
         glm47_detector.h
         function_call_parser.h
@@ -22,6 +23,7 @@ cc_library (
         kimik2_detector.cpp
         deepseekv3_detector.cpp
         deepseekv32_detector.cpp
+        deepseekv41_detector.cpp
         glm45_detector.cpp
         glm47_detector.cpp
         function_call_parser.cpp

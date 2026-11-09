@@ -102,6 +102,7 @@ _EXPORTS = {
         "gemma_rms_norm",
         "l2_norm",
         "rms_norm",
+        "rms_norm_cast_va",
         "rms_norm_dynamic_quant",
         "rms_norm_gated",
         "rms_norm_sigmoid_gated",
@@ -152,6 +153,7 @@ _EXPORTS = {
 __all__ = [
     "ep_moe_w8a8",
     "rms_norm",
+    "rms_norm_cast_va",
     "gemma_rms_norm",
     "fused_add_rms_norm",
     "fused_add_gemma_rms_norm",

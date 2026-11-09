@@ -46,17 +46,40 @@ cc_library (
 
 cc_library (
   NAME
+    deepseek_chat_template
+  HDRS
+    deepseek_chat_template.h
+  SRCS
+    deepseek_chat_template.cpp
+  DEPS
+    :chat_template
+    :tokenizer
+    glog::glog
+    absl::strings
+)
+
+cc_library (
+  NAME
     deepseek_v4_cpp_template
   HDRS
     deepseek_v4_cpp_template.h
   SRCS
     deepseek_v4_cpp_template.cpp
   DEPS
-    :chat_template
+    :deepseek_chat_template
     :tokenizer
-    nlohmann_json::nlohmann_json
-    glog::glog
-    absl::strings
+)
+
+cc_library (
+  NAME
+    deepseek_v41_cpp_template
+  HDRS
+    deepseek_v41_cpp_template.h
+  SRCS
+    deepseek_v41_cpp_template.cpp
+  DEPS
+    :deepseek_chat_template
+    :tokenizer
 )
 
 # Factory (depends on all implementations)
@@ -73,6 +96,7 @@ cc_library (
     :jinja_chat_template
     :deepseek_v32_cpp_template
     :deepseek_v4_cpp_template
+    :deepseek_v41_cpp_template
     nlohmann_json::nlohmann_json
     glog::glog
 )
@@ -88,6 +112,7 @@ cc_binary(
     :jinja_chat_template
     :deepseek_v32_cpp_template
     :deepseek_v4_cpp_template
+    :deepseek_v41_cpp_template
     nlohmann_json::nlohmann_json
     benchmark::benchmark
     benchmark::benchmark_main

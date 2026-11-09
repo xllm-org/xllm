@@ -580,8 +580,16 @@ bool WorkerImpl::allocate_kv_cache_storage(
   // "int8": enables INT8 quantization
   const bool enable_kv_cache_quant = options_.kv_cache_dtype() == "int8";
 
-  const bool enable_indexer_cache_quant =
+  bool enable_indexer_cache_quant =
       ::xllm::KVCacheConfig::get_instance().indexer_cache_dtype() == "int8";
+  if (enable_indexer_cache_quant &&
+      util::is_deepseek_v41_model_type(args.model_type())) {
+    LOG(WARNING)
+        << "--indexer_cache_dtype=int8 has no effect on DeepSeek V4.1: "
+           "its index cache dtype is chosen by the platform cache "
+           "policy (int8 + fp16 per-token scale on NPU). Ignoring it.";
+    enable_indexer_cache_quant = false;
+  }
   if (enable_lighting_indexer) {
     CHECK_EQ(kv_cache_shape.has_index_cache_scale_shape(),
              enable_indexer_cache_quant)

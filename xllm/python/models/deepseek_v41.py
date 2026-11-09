@@ -12,43 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek-V4.1 Flash Python model (CED + CSA2, TORCH backend).
-
-The forward uses torch on NPU (there is no CPU/CUDA attention backend).
-The reference QDQ
-numerics are preserved by the inlined quantization helpers at the bottom of
-this file (device-agnostic, unit-tested on CPU; ue8m0 decode, FP8 block
-dequant, MXFP4 dequant, activation QDQ):
-
-  * ``CSA2LayerPlan`` -- static Full/Reindex/Reuse/SWA assignment. Every
-    kv-source layer compresses its OWN attention input (there is no
-    cross-layer CED hidden capture in the reference); the group's Reindex /
-    Reuse layers read that source's caches (``main_kv_source_layer``).
-  * ``DeepseekV41Attention`` -- latent Q/KV projections + interleaved-pair
-    RoPE, the ratio-1/ratio-2 compressor weights, the CSA2 indexer weights
-    (``wk`` acts on the 512-d latent, not the hidden), and the grouped
-    ``wo_a``/``wo_b`` output projection with output de-rotation.
-  * ``Csa2AttentionBackend`` (``xllm/python/attention/csa2_attention.py``)
-    owns the cache orchestration: SWA ring, state parking/pooling, index
-    writes, scoring, candidate pool, top-k and the sink softmax.
-  * ``DeepseekV41HyperConnection`` -- single-pass Mega-mHC with the
-    Sinkhorn split; attention collapses with the previous block's
-    ``ffn_pre``, the FFN with this block's ``attn_pre``, and the final
-    merge is the learned ``hc_pre(h, last_ffn_pre)`` weighted sum.
-  * ``DeepseekV41MoE`` -- fp32 sqrtsoftplus routing with bias-steered
-    selection (``gate.bias`` / per-token ``gate.bias_vl``), clamped SwiGLU
-    experts and one shared expert.
-  * ``DeepseekV41ForCausalLM`` -- checkpoint-mode-aware construction and
-    loading: ``fp8`` (official FP8-block/MXFP4 release, dequantized to bf16
-    at load), ``ascend`` (W8A8 export, existing kernel path) and ``none``.
-
-Vision and the DSpark draft model are out of scope here; their checkpoint
-tensors are simply not consumed. Engram IS implemented
-(:mod:`deepseek_v41_engram`): the layers listed in ``engram_layer_ids``
-carry the gated n-gram lookup injected into the mHC residual stream, with
-the tokenizer-derived hash state loaded from the
-``engram_hash_state.bin`` sidecar.
-"""
 
 from __future__ import annotations
 
@@ -81,9 +44,10 @@ from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy, dp_gather_tokens
 from xllm.python.layers.rotary_embedding import RotaryEmbedding
 from xllm.python.model_executor.forward_context import (
+    get_execution_buffer,
     get_execution_context,
     get_forward_context,
-    in_acl_graph,
+    get_forward_context_or_none,
     record_layer_event,
 )
 from xllm.python.model_loader import W8A8WeightLoader
@@ -100,7 +64,6 @@ from xllm.python.models.deepseek_v4 import (
 )
 from xllm.python.models.deepseek_v32 import DeepseekV3MLP, W8A8DynamicLinear
 from xllm.python.models.deepseek_v41_engram import (
-    _E4M3_SUBNORMAL_STEP,
     ENGRAM_STORAGE_FP8,
     ENGRAM_STORAGE_INT8,
     Engram,
@@ -117,6 +80,7 @@ from xllm.python.models.deepseek_v41_engram import (
 )
 from xllm.python.models.engram_config import EngramConfig
 from xllm.python.models.engram_shared_memory import ensure_dev_shm_capacity, estimate_shared_bytes
+from xllm.python.platform import current_platform
 
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
@@ -286,24 +250,15 @@ class DeepseekV41Config(DeepseekV4Config):
     dspark_n_routed_experts: int = 128
     dspark_num_experts_per_tok: int = 3
     enable_dsa_cp: bool = False
-    # -- Vision (Phase 4); image_token_id also drives gate.bias_vl --
-    # -1 = no image tokens (text-only), matching the C++ loader default.
+    enable_fused_mc2: bool = False
+    mc2_group_info: tuple[str, int, int] | None = None
     image_token_id: int = -1
-    # -- Engram host-offload switches (from --engram_config) --
-    # Parsed strictly from the raw ``engram_config`` JSON string by
-    # EngramConfig.from_value; {} (the C++ default) disables both switches.
     engram_config: EngramConfig = field(default_factory=EngramConfig)
-    # -- Parallel / weight-format contract --
-    # Passed in by the C++ executor (py_causal_lm.cpp). Engram currently
-    # requires PP=1 and DCP=1 and is only validated against safetensors/dummy
-    # weights; the values are surfaced here so config validation and the
-    # Python executor read them from one place.
     pp_size: int = 1
     dcp_size: int = 1
 
     @property
     def dense_intermediate_size(self) -> int:
-        """Match the C++ dense-width resolution for explicit and omitted values."""
         if self.dense_ffn_intermediate_size > 0:
             return self.dense_ffn_intermediate_size
         if self.moe_intermediate_size > 0:
@@ -346,6 +301,8 @@ class DeepseekV41Config(DeepseekV4Config):
             dspark_n_routed_experts=int(_pick(merged, "dspark_n_routed_experts", default=128)),
             dspark_num_experts_per_tok=int(_pick(merged, "dspark_num_experts_per_tok", default=3)),
             enable_dsa_cp=bool(_pick(merged, "enable_dsa_cp", default=False)),
+            enable_fused_mc2=bool(_pick(merged, "enable_fused_mc2", default=False)),
+            mc2_group_info=_pick(merged, "mc2_group_info", default=None),
             image_token_id=int(_pick(merged, "image_token_id", default=-1)),
             engram_config=EngramConfig.from_value(merged.get("engram_config", {})),
             pp_size=int(_pick(merged, "pp_size", default=1)),
@@ -411,9 +368,197 @@ def _make_v41_linear(
     return nn.Linear(in_features, out_features, bias=False, dtype=dtype, device=device)
 
 
-# ---------------------------------------------------------------------------
-# RoPE tables / mHC
-# ---------------------------------------------------------------------------
+_rms_norm_cast_op: Any = None
+
+
+def _get_rms_norm_cast_op() -> Any:
+    from xllm.python.kernels_npu.op_api import has_op_api
+
+    global _rms_norm_cast_op
+    if (
+        _rms_norm_cast_op is None
+        and hasattr(torch.ops.xllm_ops, "rms_norm_cast_va")
+        and has_op_api("aclnnRmsNormCastVa")
+    ):
+        _rms_norm_cast_op = getattr(kernels, "rms_norm_cast_va", None)
+    return _rms_norm_cast_op
+
+
+def _rms_norm_cast_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        x.dim() in (2, 3)
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 1
+        and weight.numel() == x.size(-1)
+        and _get_rms_norm_cast_op() is not None
+        and x.device.type in ("npu", "privateuseone")
+    )
+
+
+_rms_norm_cast_active_logged = False
+_rms_norm_cast_fallback_logged = False
+
+
+def _log_rms_norm_cast_active() -> None:
+    global _rms_norm_cast_active_logged
+    if not _rms_norm_cast_active_logged:
+        _rms_norm_cast_active_logged = True
+        logger.info("rms_norm_cast fused path active (op=xllm_ops.rms_norm_cast_va)")
+
+
+def _log_rms_norm_cast_fallback(x: torch.Tensor, weight: torch.Tensor) -> None:
+    global _rms_norm_cast_fallback_logged
+    if _rms_norm_cast_fallback_logged:
+        return
+    _rms_norm_cast_fallback_logged = True
+    logger.warning(
+        "the fused RMSNorm+cast op is unavailable "
+        f"(device={x.device.type} dim={x.dim()} dtype={x.dtype} "
+        f"weight_dtype={weight.dtype} op_registered={_get_rms_norm_cast_op() is not None}); "
+        "staying on the eager path"
+    )
+
+
+_fused_shared_act_active_logged = False
+_fused_shared_act_fallback_logged = False
+
+
+def _fused_shared_act_device_supported(x: torch.Tensor) -> bool:
+    return x.device.type in ("npu", "privateuseone")
+
+
+def _fused_shared_act_grouped_supported(shared: nn.Module) -> bool:
+    gate_up = getattr(shared, "gate_up_proj", None)
+    down = getattr(shared, "down_proj", None)
+    weight_scale = getattr(gate_up, "weight_scale", None)
+    gate_up_width = getattr(gate_up, "out_features", None)
+    down_in = getattr(down, "in_features", None)
+    if weight_scale is None or gate_up_width is None or down_in is None:
+        return False
+    if weight_scale.dim() > 2:
+        return False
+    return weight_scale.numel() == gate_up_width == 2 * down_in
+
+
+def _fused_shared_act_supported(x: torch.Tensor, shared: nn.Module, limit: float) -> bool:
+    return (
+        isinstance(shared, DeepseekV3MLP)
+        and 0.0 < limit < 1_000_000.0
+        and x.dim() == 2
+        and x.numel() > 0
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and getattr(shared.gate_up_proj, "weight_scale", None) is not None
+        and getattr(shared.down_proj, "weight_scale", None) is not None
+        and _fused_shared_act_grouped_supported(shared)
+        and _fused_shared_act_device_supported(x)
+    )
+
+
+def _log_fused_shared_act_active() -> None:
+    global _fused_shared_act_active_logged
+    if not _fused_shared_act_active_logged:
+        _fused_shared_act_active_logged = True
+        logger.info("shared expert fused clamped-SwiGLU active (op=xllm_ops.dequant_swiglu_quant)")
+
+
+def _log_fused_shared_act_fallback(x: torch.Tensor, shared: nn.Module, limit: float) -> None:
+    global _fused_shared_act_fallback_logged
+    if _fused_shared_act_fallback_logged:
+        return
+    _fused_shared_act_fallback_logged = True
+    logger.warning(
+        "the fused shared-expert activation is unavailable "
+        f"(device={x.device.type} dim={x.dim()} dtype={x.dtype} "
+        f"max={x.numel()} limit={limit} module={type(shared).__name__} "
+        f"grouped_form_ok={_fused_shared_act_grouped_supported(shared)}); "
+        "staying on the eager clamped SwiGLU"
+    )
+
+
+_MOE_MC2_MAX_LOCAL_TOKENS = 256
+
+_moe_mc2_active_logged = False
+_moe_mc2_fallback_logged = False
+_moe_mc2_draft_fallback_logged = False
+_moe_mc2_collective_warned = False
+
+
+def _moe_mc2_ops_available() -> bool:
+    try:
+        import torch_npu
+    except ImportError:
+        return False
+    return hasattr(torch_npu, "npu_moe_distribute_dispatch_v2") and hasattr(torch_npu, "npu_moe_distribute_combine_v2")
+
+
+def _moe_mc2_device_supported(x: torch.Tensor) -> bool:
+    return x.device.type in ("npu", "privateuseone")
+
+
+def _moe_mc2_decode_step() -> bool:
+    ctx = get_forward_context_or_none()
+    if ctx is None:
+        return False
+    metadata = ctx.metadata
+    if getattr(metadata, "is_dummy", False):
+        return False
+    return not (metadata.is_prefill or metadata.is_chunked_prefill)
+
+
+def _moe_mc2_all_dp_ranks_decode(metadata: Any) -> bool:
+    dp_is_decode = getattr(metadata, "dp_is_decode", None)
+    if dp_is_decode:
+        return all(int(flag) == 1 for flag in dp_is_decode)
+    token_counts = getattr(metadata, "dp_execution_token_counts", None)
+    return not token_counts or len(token_counts) <= 1
+
+
+def _log_moe_mc2_active(ep_rank: int, ep_size: int) -> None:
+    global _moe_mc2_active_logged
+    if not _moe_mc2_active_logged:
+        _moe_mc2_active_logged = True
+        logger.info(
+            f"MoE MC2 decode path active (ep_rank={ep_rank} ep_size={ep_size}, "
+            "chain=dispatch_v2->dynamic_quant->grouped_matmul->dequant_swiglu_quant->grouped_matmul->combine_v2)"
+        )
+
+
+def _log_moe_mc2_fallback(reason: str) -> None:
+    global _moe_mc2_fallback_logged
+    if _moe_mc2_fallback_logged:
+        return
+    _moe_mc2_fallback_logged = True
+    logger.warning(
+        f"the MC2 decode path is unavailable for the target ({reason}); using the portable grouped-expert path"
+    )
+
+
+def _moe_mc2_draft_veto_applies(moe: Any) -> bool:
+    return bool(getattr(moe, "_moe_is_dspark_draft", False))
+
+
+def _log_moe_mc2_draft_fallback(reason: str) -> None:
+    global _moe_mc2_draft_fallback_logged
+    if _moe_mc2_draft_fallback_logged:
+        return
+    _moe_mc2_draft_fallback_logged = True
+    logger.warning(
+        "the MC2 decode path is unavailable for the DSpark "
+        f"draft (Fix-1, target keeps MC2): {reason}; using the portable "
+        "grouped-expert path"
+    )
+
+
+def _log_moe_mc2_collective(ep_rank: int, ep_size: int) -> None:
+    global _moe_mc2_collective_warned
+    if not _moe_mc2_collective_warned:
+        _moe_mc2_collective_warned = True
+        logger.warning(
+            "the MC2 decode path engages an all-to-all *collective* expert path: every rank of the "
+            f"moe_ep group must run it unconditionally and in lockstep (ep_rank={ep_rank} "
+            f"ep_size={ep_size}); a rank that skips a layer will hang the dispatch/combine kernels"
+        )
 
 
 def _hc_split_sinkhorn(
@@ -436,25 +581,164 @@ def _hc_split_sinkhorn(
     return pre, post, comb
 
 
+def _get_hc_post_op() -> Any:
+    from xllm.python.kernels_npu import hyper_connection
+
+    return hyper_connection.hc_post_va
+
+
+def _hc_post_npu_supported(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_mult: int,
+) -> bool:
+    hidden = x.size(-1)
+    return (
+        x.device.type in ("npu", "privateuseone")
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and x.dim() == 2
+        and residual.dim() == 3
+        and post.dim() == 2
+        and comb.dim() == 3
+        and hc_mult == 4
+        and residual.size(1) == hc_mult
+        and residual.size(2) == hidden
+        and post.size(1) == hc_mult
+        and comb.size(1) == hc_mult
+        and comb.size(2) == hc_mult
+        and post.dtype == torch.float32
+        and comb.dtype == torch.float32
+        and residual.dtype == x.dtype
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and post.is_contiguous()
+        and hidden % 64 == 0
+    )
+
+
+def _hc_post_fused_supported(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_mult: int,
+) -> bool:
+    return (
+        _hc_post_npu_supported(x, residual, post, comb, hc_mult)
+        and x.dtype == torch.bfloat16
+        and _get_hc_post_op() is not None
+    )
+
+
+_fused_hc_post_active_logged = False
+_fused_hc_post_fallback_logged = False
+
+
+def _log_fused_hc_post_active() -> None:
+    global _fused_hc_post_active_logged
+    if not _fused_hc_post_active_logged:
+        _fused_hc_post_active_logged = True
+        logger.info("hc_post fused path active")
+
+
+def _log_fused_hc_post_fallback(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_mult: int,
+) -> None:
+    global _fused_hc_post_fallback_logged
+    if _fused_hc_post_fallback_logged:
+        return
+    _fused_hc_post_fallback_logged = True
+    logger.warning(
+        "the fused hc_post op is unavailable "
+        f"(device={x.device.type} dtype={x.dtype} x_dim={x.dim()} residual_dim={residual.dim()} "
+        f"post_dtype={post.dtype} comb_dtype={comb.dtype} hc_mult={hc_mult} "
+        f"op_registered={_get_hc_post_op() is not None}); staying on the eager path"
+    )
+
+
+_HC_PRE_MODE_EAGER = "eager"
+_HC_PRE_MODE_FUSED = "fused"
+
+
+def _get_hc_pre_fused_op() -> Any:
+    from xllm.python.kernels_npu import hyper_connection
+
+    return hyper_connection.hc_pre_va
+
+
+def _hc_pre_fused_guards(dtype: torch.dtype, device: torch.device, hc_mult: int) -> bool:
+    device_type = torch.device(device).type
+    return hc_mult == 4 and dtype == torch.bfloat16 and device_type in ("npu", "privateuseone")
+
+
+def _hc_pre_mode_decision(dtype: torch.dtype, device: torch.device, hc_mult: int) -> str:
+    if _hc_pre_fused_guards(dtype, device, hc_mult) and _get_hc_pre_fused_op() is not None:
+        return _HC_PRE_MODE_FUSED
+    return _HC_PRE_MODE_EAGER
+
+
+_fused_hc_pre_active_logged = False
+_fused_hc_pre_fallback_logged = False
+
+
+def _log_fused_hc_pre_active() -> None:
+    global _fused_hc_pre_active_logged
+    if not _fused_hc_pre_active_logged:
+        _fused_hc_pre_active_logged = True
+        logger.info("hc_pre fused path active (native pre vector and external pre_mix)")
+
+
+def _log_fused_hc_pre_fallback(dtype: torch.dtype, device: torch.device, hc_mult: int) -> None:
+    global _fused_hc_pre_fallback_logged
+    if _fused_hc_pre_fallback_logged:
+        return
+    if not _hc_pre_fused_guards(dtype, device, hc_mult):
+        return
+    _fused_hc_pre_fallback_logged = True
+    logger.warning(
+        "the fused hc_pre op is unavailable "
+        f"(device={torch.device(device).type} dtype={dtype} hc_mult={hc_mult} "
+        f"op_available={_get_hc_pre_fused_op() is not None}); staying on the eager sinkhorn path"
+    )
+
+
+def _log_hc_pre_mode(dtype: torch.dtype, device: torch.device, hc_mult: int, mode: str) -> None:
+    if mode == _HC_PRE_MODE_FUSED:
+        _log_fused_hc_pre_active()
+        return
+    _log_fused_hc_pre_fallback(dtype, device, hc_mult)
+
+
+def _merged_attn_quant_supported(x: torch.Tensor) -> bool:
+    return x.device.type in ("npu", "privateuseone") and x.dim() == 2
+
+
 class DeepseekV41HyperConnection(nn.Module):
-    """Single-pass Mega-mHC hyper-connections (semantics doc section 7).
-
-    Reference mHC mixing and pre-reduction with shared fused ``hc_post``
-    expansion: ``hc_mixes`` projects the flattened hc*dim stream
-    (normalized AFTER projection), ``hc_pre`` collapses the hc copies with a
-    per-token coefficient vector, and ``hc_post`` expands a sublayer output
-    back mixing the residual through the doubly-stochastic ``comb``.
-    """
-
-    def __init__(self, cfg: DeepseekV41Config, device: torch.device) -> None:
+    def __init__(
+        self,
+        cfg: DeepseekV41Config,
+        device: torch.device,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.hc_mult = cfg.hc_mult
         self.hc_eps = cfg.hc_eps
         self.norm_eps = cfg.rms_norm_eps
         self.sinkhorn_iters = cfg.hc_sinkhorn_iters
+        self._hc_pre_mode = (
+            _hc_pre_mode_decision(dtype, device, cfg.hc_mult) if dtype is not None else _HC_PRE_MODE_EAGER
+        )
+        if dtype is not None:
+            _log_hc_pre_mode(dtype, device, cfg.hc_mult, self._hc_pre_mode)
         mix_hc = (2 + cfg.hc_mult) * cfg.hc_mult
         hc_dim = cfg.hc_mult * cfg.hidden_size
-        # hc_fn/scale/base per sub-block, fp32 as in the checkpoint.
         for part in ("attn", "ffn"):
             self.register_parameter(
                 f"hc_{part}_fn",
@@ -481,6 +765,30 @@ class DeepseekV41HyperConnection(nn.Module):
         mixes = F.linear(flattened, hc_fn) * rsqrt
         return _hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.sinkhorn_iters, self.hc_eps)
 
+    def hc_pre_fused(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if pre_mix is None:
+            pre_mix = self.make_identity_pre_mix(x, self.hc_mult)
+        # PrivateUse1 dispatch drops keyword arguments; all nine operands must be positional.
+        y, post, comb, pre = _get_hc_pre_fused_op()(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            pre_mix,
+            self.hc_mult,
+            self.sinkhorn_iters,
+            self.norm_eps,
+            self.hc_eps,
+        )
+        return y, pre, post, comb
+
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
         """Collapse the hc copies: ``sum_j pre[j] * x[j]`` (model.py:957-960)."""
         y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=-2)
@@ -493,51 +801,40 @@ class DeepseekV41HyperConnection(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ) -> torch.Tensor:
-        """Expand back: ``out[j] = post[j] * x + sum_k comb[j, k] * res[k]``."""
         if x.numel() == 0:
-            # The native kernel requires non-empty dimensions; empty DP
-            # ranks still participate in the surrounding collectives.
+            # Empty DP ranks must skip this kernel while still joining surrounding collectives.
             return residual
-        if self.hc_mult != 4 or x.size(-1) % 64 != 0:
-            # The shared NPU kernel tiles 64 hidden elements and four streams.
-            # Keep small synthetic models exact without changing its fast path.
-            expanded = post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
-            mixed = torch.einsum("tjk,tkd->tjd", comb.float(), residual.float())
-            return (expanded + mixed).to(x.dtype)
-        # The shared kernel multiplies residual @ comb; V4.1 stores the
-        # opposite matrix orientation. Transpose only this small hc x hc
-        # matrix, retaining the fused FP32 accumulation for hidden states.
-        return kernels.hc_post(
-            x.unsqueeze(0),
-            residual.unsqueeze(0),
-            post.unsqueeze(0),
-            comb.transpose(-2, -1).contiguous().unsqueeze(0),
-        ).squeeze(0)
+        if _hc_post_fused_supported(x, residual, post, comb, self.hc_mult):
+            # The kernel consumes comb as comb^T @ residual and expects [bs, seq, ...] operands.
+            comb4d = comb.transpose(-2, -1).contiguous().unsqueeze(0)
+            out = _get_hc_post_op()(
+                x.unsqueeze(0),
+                residual.unsqueeze(0),
+                post.unsqueeze(0),
+                comb4d,
+            )
+            _log_fused_hc_post_active()
+            return out.squeeze(0)
+        if _hc_post_npu_supported(x, residual, post, comb, self.hc_mult):
+            return kernels.hc_post(
+                x.unsqueeze(0),
+                residual.unsqueeze(0),
+                post.unsqueeze(0),
+                comb.transpose(-2, -1).contiguous().unsqueeze(0),
+            ).squeeze(0)
+        _log_fused_hc_post_fallback(x, residual, post, comb, self.hc_mult)
+        y = post.unsqueeze(-1) * x.float().unsqueeze(-2)
+        y = y + torch.einsum("tjk,tkd->tjd", comb.float(), residual.float())
+        return y.to(x.dtype)
 
     @staticmethod
     def make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
-        """Initial one-hot mix on copy 0 (model.py:1159-1163)."""
         pre_mix = torch.zeros(x.size(0), hc_mult, dtype=torch.float32, device=x.device)
         pre_mix[:, 0] = 1.0
         return pre_mix
 
 
-# ---------------------------------------------------------------------------
-# Indexer weights
-# ---------------------------------------------------------------------------
-
-
 class DeepseekV41Indexer(nn.Module):
-    """DeepSeek-V4.1 CSA2 indexer weights (semantics doc section 5).
-
-    ``wq_b`` projects the shared q-lora latent; ``weights_proj`` produces the
-    per-head score weights; kv-source layers additionally own the key path
-    ``wk`` + ``k_norm`` -- ``wk`` acts on the 512-d compressor latent, NOT on
-    hidden states (checkpoint ``layers.N.attn.indexer.*``). There is no
-    Hadamard transform and no INT8 quant in V4.1: Q/K are FP4-E2M1 QDQ and
-    the scoring runs through einsum in the backend.
-    """
-
     def __init__(
         self,
         cfg: DeepseekV41Config,
@@ -696,20 +993,21 @@ class DeepseekV41Attention(Attention):
             runtime = get_dsa_cp_runtime(num_tokens, self.cfg.tp_size, self.cfg.tp_rank)
             cp_context = runtime.plan
             query_positions = cp_context.shard(positions)
-        # Q path: qr = q_norm(wq_a(x)); q = wq_b(qr) (no norm after wq_b);
-        # RoPE on the last rope dims at token positions (model.py:770-772).
-        qr = self.q_a_layernorm(self.q_a_proj(hidden))
+        if self.quant_mode == V41_QUANT_ASCEND and _merged_attn_quant_supported(hidden):
+            hidden_int8, hidden_pertoken = kernels.dynamic_quant(hidden)
+            q_a = self.q_a_proj.forward_quantized(hidden_int8, hidden_pertoken)
+            kv = self.kv_a_layernorm(self.kv_proj.forward_quantized(hidden_int8, hidden_pertoken))
+        else:
+            q_a = self.q_a_proj(hidden)
+            kv = self.kv_a_layernorm(self.kv_proj(hidden))
+        qr = self.q_a_layernorm(q_a)
         query_qr = cp_context.shard(qr) if cp_context is not None else qr
         if query_qr.size(0) == 0:
             q = hidden.new_empty((0, self.num_heads_local, self.head_dim))
         else:
             q = self.q_b_proj(query_qr).view(-1, self.num_heads_local, self.head_dim)
             q = apply_interleaved_rope(q, query_positions, cos_sin_cache)
-        # SWA KV path: kv_norm -> RoPE -> FP8 QDQ over the whole post-RoPE
-        # vector (model.py:700-720).
-        kv = self.kv_a_layernorm(self.kv_proj(hidden))
         kv = apply_interleaved_rope(kv, positions, cos_sin_cache)
-        kv = fp8_act_qdq(kv, 32)
         self._csa2_ctx = Csa2LayerContext(
             x=hidden,
             qr=qr,
@@ -751,24 +1049,26 @@ class DeepseekV41Attention(Attention):
         k = self.indexer.wk(latent)
         return self.indexer.k_norm(k)
 
-    def indexer_query(self, qr: torch.Tensor) -> torch.Tensor:
-        """Indexer Q from the shared q-lora latent: wq_b(qr)."""
-        return self.indexer.wq_b(qr).view(-1, self.indexer.n_heads, self.indexer.head_dim)
+    def indexer_query(self, qr: torch.Tensor, qr_scale: torch.Tensor | None = None) -> torch.Tensor:
+        """Indexer Q from the shared q-lora latent: wq_b(qr).
+
+        Under the fused q norm+quant path the latent arrives already
+        per-token INT8-quantized (``qr_scale`` present); the indexer then
+        reuses those codes/scales through ``forward_quantized`` instead of
+        re-quantizing -- the DSV4 production shape (deepseek_v4.py:826-830).
+        """
+        if qr_scale is not None:
+            q = self.indexer.wq_b.forward_quantized(qr, qr_scale)
+        else:
+            q = self.indexer.wq_b(qr)
+        return q.view(-1, self.indexer.n_heads, self.indexer.head_dim)
 
     def indexer_weights(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-head scoring weights: weights_proj(x) * (ihd^-0.5 * nh^-0.5)."""
         scale = self.indexer.head_dim**-0.5 * self.indexer.n_heads**-0.5
         return self.indexer.weights_proj(x) * scale
 
 
-# ---------------------------------------------------------------------------
-# MoE (torch) + dense MLP + W8A8 MoE (ascend)
-# ---------------------------------------------------------------------------
-
-
 class DeepseekV41TorchMLP(nn.Module):
-    """Dense SwiGLU FFN with the reference clamps (fp8/none checkpoint modes)."""
-
     def __init__(
         self,
         cfg: DeepseekV41Config,
@@ -874,7 +1174,14 @@ class DeepseekV41MoE(nn.Module):
             bias = torch.where(image_mask.unsqueeze(-1), self.gate_bias_vl, self.e_score_correction_bias)
         return scores + bias, scores
 
-    def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        post_norm: nn.Module | None = None,
+    ) -> torch.Tensor:
+        if post_norm is not None:
+            hidden = post_norm(hidden)
         shape = hidden.shape
         x = hidden.reshape(-1, self.cfg.hidden_size)
         logits, scores = self._selection_logits(x, input_ids)
@@ -909,14 +1216,60 @@ class DeepseekV41MoE(nn.Module):
         return _swiglu_clamped(x, self.shared_w1(x), self.shared_w3(x), self.shared_w2, self.swiglu_limit)
 
 
-class DeepseekV41W8A8MoE(DeepseekV4MoE):
-    """Ascend W8A8-export MoE (existing V4 kernel path, NPU-only).
+class DeepseekV41SharedMLP(DeepseekV3MLP):
+    def forward(self, hidden: torch.Tensor, tp_reduce_add: torch.Tensor | None = None) -> torch.Tensor:
+        limit = float(self.swiglu_limit)
+        if _fused_shared_act_supported(hidden, self, limit):
+            _log_fused_shared_act_active()
+            return self.forward_dequant_swiglu_quant(hidden, tp_reduce_add, clamp_limit=limit, grouped_activation=True)
+        _log_fused_shared_act_fallback(hidden, self, limit)
+        return super().forward(hidden, tp_reduce_add)
 
-    Keeps the bias-based ``moe_gating_top_k_hash`` routing and the grouped
-    W8A8 expert GEMMs; the visual-token ``bias_vl`` selection bias of the
-    official checkpoint is loaded but only applied by the torch MoE (the
-    multimodal path lands with the vision phase).
-    """
+    def forward_dequant_swiglu_quant(
+        self,
+        x: torch.Tensor,
+        tp_reduce_add: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
+        *,
+        clamp_limit: float = 0.0,
+        grouped_activation: bool = False,
+    ) -> torch.Tensor:
+        x_int8, pertoken = kernels.dynamic_quant(x)
+        gate_up = self.gate_up_proj.forward_accumulated(x_int8)
+        if grouped_activation:
+            # The grouped activation takes one row count per group, rather than cumulative offsets.
+            rows = gate_up.shape[0]
+            if get_forward_context_or_none() is None:
+                group_index = torch.tensor([rows], dtype=torch.int64, device=gate_up.device)
+            else:
+                group_index = get_execution_buffer(
+                    ("SHARED_ACT_GROUP_INDEX", gate_up.device, rows),
+                    lambda: torch.tensor([rows], dtype=torch.int64, device=gate_up.device),
+                )
+            act_int8, act_scale = kernels.dequant_swiglu_quant(
+                gate_up,
+                self.gate_up_proj.weight_scale.reshape(1, -1),
+                pertoken,
+                group_index=group_index,
+                clamp_limit=clamp_limit,
+            )
+        else:
+            act_int8, act_scale = kernels.dequant_swiglu_quant(
+                gate_up,
+                self.gate_up_proj.weight_scale,
+                pertoken,
+                clamp_limit=clamp_limit,
+            )
+        if output is None:
+            out = self.down_proj.forward_quantized(act_int8, act_scale)
+        else:
+            out = self.down_proj.forward_quantized_out(act_int8, act_scale, output)
+        return self._reduce_output(out, tp_reduce_add)
+
+
+class DeepseekV41W8A8MoE(DeepseekV4MoE):
+    _SHARED_MLP_CLS = DeepseekV41SharedMLP
+    _GATE_BEFORE_DP = True
 
     def __init__(
         self,
@@ -928,9 +1281,19 @@ class DeepseekV41W8A8MoE(DeepseekV4MoE):
         if cfg.n_hash_layers != 0:
             raise ValueError("DeepSeek-V4.1 removed hash routing; n_hash_layers must be 0")
         super().__init__(cfg, layer_id, dtype, device)
-        # Deferred until the vision phase: the W8A8 expert path never reads
-        # image_token_id or gate_bias_vl; both are staged for the torch-MoE
-        # multimodal path only (see the class docstring).
+        self.enable_fused_mc2 = cfg.enable_fused_mc2
+        soc = current_platform.get_ascend_soc_generation()
+        self._mc2_capacity = 512 if soc == "a3" else 256
+        if self.enable_fused_mc2 and soc == "a3" and self._mc2_ep_size() > 1:
+            self._mc2_capacity = Eplv2CommPolicy.from_geometry(
+                cfg.hidden_size,
+                cfg.n_routed_experts,
+                self._mc2_ep_size(),
+                cfg.num_experts_per_tok,
+                int(os.getenv("HCCL_BUFFSIZE", "200")),
+                shared_experts=cfg.n_shared_experts,
+            ).mc2_capacity
+        self._mc2_ep_group_info = cfg.mc2_group_info
         self.image_token_id = cfg.image_token_id
         self.gate_bias_vl = nn.Parameter(
             torch.empty(cfg.n_routed_experts, dtype=torch.float32, device=device),
@@ -938,20 +1301,249 @@ class DeepseekV41W8A8MoE(DeepseekV4MoE):
         )
         self.gate_bias_vl_loaded = False
 
+    def _apply_post_norm(
+        self,
+        hidden: torch.Tensor,
+        post_norm: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = post_norm.weight
+        if _rms_norm_cast_supported(hidden, weight):
+            _log_rms_norm_cast_active()
+            return _get_rms_norm_cast_op()(hidden, weight, post_norm.eps)
+        _log_rms_norm_cast_fallback(hidden, weight)
+        return super()._apply_post_norm(hidden, post_norm)
 
-# ---------------------------------------------------------------------------
-# Decoder layer + model
-# ---------------------------------------------------------------------------
+    def _mc2_ep_size(self) -> int:
+        return self.cfg.ep_size if self.cfg.ep_size > 0 else self.cfg.tp_size
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        post_norm: nn.Module | None = None,
+    ) -> torch.Tensor:
+        if self.enable_fused_mc2:
+            reason = self._mc2_guard_reason(hidden)
+            if reason is None:
+                return self._forward_mc2_decode(hidden, post_norm)
+            if _moe_mc2_draft_veto_applies(self):
+                _log_moe_mc2_draft_fallback(reason)
+            else:
+                _log_moe_mc2_fallback(reason)
+        return super().forward(hidden, input_ids, post_norm)
+
+    def _mc2_guard_reason(self, hidden: torch.Tensor) -> str | None:
+        if _moe_mc2_draft_veto_applies(self):
+            return "DSpark draft MoE (uneven per-rank rows break global_bs=0)"
+        ctx = get_forward_context_or_none()
+        metadata = ctx.metadata if ctx is not None else None
+        if self.dp_size > 1:
+            if not _moe_mc2_all_dp_ranks_decode(metadata):
+                return "not all DP ranks are decode"
+        elif not _moe_mc2_decode_step():
+            return "not a (non-dummy) decode step"
+        if self.hash_layer:
+            return "hash-routed layer"
+        if self.w4a8_dynamic:
+            return "W4A8 expert path"
+        if self.moe_tp_size != 1:
+            return f"moe_tp_size={self.moe_tp_size} (MC2 requires 1)"
+        ep_size = self._mc2_ep_size()
+        if ep_size <= 1:
+            return f"ep_size={ep_size} (MC2 needs a multi-rank EP group)"
+        if self.dp_size > 1:
+            # Use host-planned DP metadata so all ranks dispatch or fall back together.
+            token_counts = getattr(metadata, "dp_execution_token_counts", None)
+            if not token_counts or len(token_counts) != self.dp_size:
+                return "DP token counts unavailable"
+            # An empty DP replica must make every rank fall back; the native operator rejects bs=0.
+            if any(int(count) <= 0 for count in token_counts):
+                return "an empty DP rank is present"
+            capacity = min(self._mc2_capacity, _MOE_MC2_MAX_LOCAL_TOKENS)
+            if any(int(count) > capacity for count in token_counts):
+                return f"a DP rank exceeds the {capacity}-token MC2 capacity"
+            # Unequal DP rows give global_bs=0 incompatible window strides and can corrupt memory.
+            row_max = max(int(count) for count in token_counts)
+            row_min = min(int(count) for count in token_counts)
+            if row_max != row_min:
+                return f"uneven DP rows ({row_max} vs {row_min}) break global_bs=0"
+        if hidden.dim() != 2:
+            return f"hidden shape {tuple(hidden.shape)}"
+        if self.dp_size == 1 and hidden.numel() == 0:
+            return f"hidden shape {tuple(hidden.shape)}"
+        if hidden.dtype != torch.bfloat16:
+            return f"hidden dtype {hidden.dtype}"
+        if not _moe_mc2_device_supported(hidden):
+            return f"device {hidden.device.type}"
+        if not _moe_mc2_ops_available():
+            return "npu_moe_distribute_{dispatch,combine}_v2 unavailable"
+        if self.dp_size == 1 and hidden.shape[0] > self._mc2_capacity:
+            return f"local rows exceed the {self._mc2_capacity}-token MC2 capacity"
+        if self._mc2_ep_group_info is None:
+            return "dedicated MC2 HCCL group unavailable"
+        if self._mc2_ep_group_info[2] != ep_size:
+            return "MC2 group size does not match the expert partition"
+        return None
+
+    def _forward_mc2_decode(
+        self,
+        hidden: torch.Tensor,
+        post_norm: nn.Module | None = None,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        ep_size = self._mc2_ep_size()
+        if self._mc2_ep_group_info is None:
+            raise RuntimeError("MC2 decode path entered without a dedicated HCCL group")
+        group_ep, ep_rank, _ = self._mc2_ep_group_info
+        _log_moe_mc2_collective(ep_rank, ep_size)
+        _log_moe_mc2_active(ep_rank, ep_size)
+
+        # 0) Batch layout. ``dp == 1`` keeps the established single-replica call:
+        #    the whole batch is local and C++ derives the global batch as
+        #    ``local_bs * ep_world_size`` (an explicit value, ``fused_moe.cpp``
+        #    :2652). Under ``dp > 1`` we do NOT pad/all-gather: like the C++
+        #    mode-0 EP2 branch (``fused_moe.cpp:2853-2874``) each rank dispatches
+        #    exactly its own rows, and ``global_bs = 0`` (auto) matches C++
+        #    (``fused_moe.cpp:2653-2659``), which prefers the operator's inferred
+        #    global batch over an explicit sum that is wrong for uneven DP
+        #    batches. No ``x_active_mask`` is passed: every dispatched row is a
+        #    real local token, and C++ only sets the mask for EPLB
+        #    (``fused_moe.cpp:2635-2645``), which this path does not use.
+        global_bs = hidden.shape[0] * ep_size if self.dp_size == 1 else 0
+        x_active_mask: torch.Tensor | None = None
+
+        # 1) FFN RMSNorm on this rank's rows (``_apply_post_norm`` is the V4.1
+        #    fused RMSNorm+cast; the guard already vetted the input). The base
+        #    class runs it after its DP gather, but the norm is row-wise, so on
+        #    the local rows it is identical while feeding the dispatch directly.
+        if post_norm is not None:
+            hidden, gate_input = self._apply_post_norm(hidden, post_norm)
+        else:
+            gate_input = hidden.to(torch.float32)
+
+        # 2) Gate + top-k exactly as the portable path. There is NO EP-local
+        #    weighting: dispatch routes unconsumed (token, expert) pairs away.
+        logits = self.gate(gate_input)
+        norm_type = {"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}.get(self.scoring_func, 2)
+        renorm = 0 if norm_type == 2 else 1
+        bias = getattr(self, "e_score_correction_bias", None)
+        topk_weights, topk_idx, _ = kernels.moe_gating_top_k_hash(
+            x=logits,
+            k=self.topk,
+            bias=bias,
+            input_ids=None,
+            tid2eid=None,
+            k_group=1,
+            group_count=1,
+            routed_scaling_factor=self.routed_scaling,
+            eps=1e-20,
+            group_select_mode=1,
+            renorm=renorm,
+            norm_type=norm_type,
+            out_flag=False,
+        )
+        expert_ids = topk_idx.to(torch.int32)
+        expert_scales = topk_weights.to(torch.float32)
+
+        (
+            expand_x,
+            dynamic_scales,
+            assist_info_for_combine,
+            expert_token_nums,
+            ep_send_counts,
+            tp_send_counts,
+            expand_scales,
+        ) = torch_npu.npu_moe_distribute_dispatch_v2(
+            x=hidden,
+            expert_ids=expert_ids,
+            expert_scales=expert_scales,
+            x_active_mask=x_active_mask,
+            group_ep=group_ep,
+            ep_world_size=ep_size,
+            ep_rank_id=ep_rank,
+            moe_expert_num=self.num_total_experts,
+            group_tp="",
+            tp_world_size=1,
+            tp_rank_id=0,
+            expert_shard_type=0,
+            shared_expert_num=int(self.cfg.n_shared_experts),
+            shared_expert_rank_num=0,
+            quant_mode=0,
+            global_bs=global_bs,
+            expert_token_nums_type=1,
+        )
+        del dynamic_scales
+        sorted_hidden_i8, pertoken_scale = kernels.dynamic_quant(expand_x)
+        group_list = expert_token_nums[: self.num_experts_per_rank].to(torch.int64)
+        # Keep dispatch counts on device; reading their sum synchronizes every eager decode step.
+        gemm1_out = torch.ops.npu.npu_grouped_matmul(
+            x=[sorted_hidden_i8],
+            weight=[self.experts_w13],
+            scale=None,
+            per_token_scale=None,
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+            group_list=group_list,
+            output_dtype=torch.int32,
+        )[0]
+        act_i8, act_pt = kernels.dequant_swiglu_quant(
+            x=gemm1_out,
+            weight_scale=self.experts_w13_scale,
+            activation_scale=pertoken_scale,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=group_list,
+            activate_left=True,
+            quant_mode=1,
+            swiglu_mode=1,
+            clamp_limit=self.cfg.swiglu_limit,
+            glu_alpha=1.0,
+            glu_bias=0.0,
+        )
+        local_out = torch.ops.npu.npu_grouped_matmul(
+            x=[act_i8],
+            weight=[self.experts_w2],
+            scale=[self.experts_w2_scale],
+            per_token_scale=[act_pt],
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+            group_list=group_list,
+            output_dtype=hidden.dtype,
+        )[0]
+        routed_out = torch_npu.npu_moe_distribute_combine_v2(
+            expand_x=local_out,
+            expert_ids=expert_ids,
+            assist_info_for_combine=assist_info_for_combine,
+            ep_send_counts=ep_send_counts,
+            expert_scales=expert_scales,
+            x_active_mask=x_active_mask,
+            group_ep=group_ep,
+            ep_world_size=ep_size,
+            ep_rank_id=ep_rank,
+            moe_expert_num=self.num_total_experts,
+            tp_send_counts=tp_send_counts,
+            expand_scales=expand_scales,
+            group_tp="",
+            tp_world_size=1,
+            tp_rank_id=0,
+            expert_shard_type=0,
+            shared_expert_num=int(self.cfg.n_shared_experts),
+            shared_expert_rank_num=0,
+            global_bs=global_bs,
+        )
+
+        shared_out = self.shared_experts(hidden)
+        if self.shared_expert_gate_is_loaded:
+            shared_gate = torch.sigmoid(self.shared_expert_gate(hidden))
+            shared_out = shared_gate * shared_out
+        return routed_out + shared_out
 
 
 class DeepseekV41DecoderLayer(nn.Module):
-    """DeepSeek-V4.1 decoder layer with the single-pass mHC shift.
-
-    Attention collapses with the PREVIOUS block's ``ffn_pre`` and the FFN
-    with THIS block's ``attn_pre``; the block returns its ``ffn_pre`` for the
-    next block's attention (model.py:968-994).
-    """
-
     def __init__(
         self,
         cfg: DeepseekV41Config,
@@ -970,7 +1562,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.mode = mode
-        self.hc = DeepseekV41HyperConnection(cfg, device)
+        self.hc = DeepseekV41HyperConnection(cfg, device, dtype=dtype)
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
         self.self_attn = DeepseekV41Attention(cfg, layer_id, dtype, device, mode, quant_mode)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
@@ -1030,23 +1622,41 @@ class DeepseekV41DecoderLayer(nn.Module):
                 engram_mask,
             )
         residual = hidden
-        attn_pre, attn_post, attn_comb = self.hc.hc_mixes(
-            hidden, self.hc.hc_attn_fn, self.hc.hc_attn_scale, self.hc.hc_attn_base
-        )
-        x = self.hc.hc_pre(hidden, pre_mix)
+        if self.hc._hc_pre_mode == _HC_PRE_MODE_FUSED:
+            x, attn_pre, attn_post, attn_comb = self.hc.hc_pre_fused(
+                hidden, self.hc.hc_attn_fn, self.hc.hc_attn_scale, self.hc.hc_attn_base, pre_mix
+            )
+        else:
+            attn_pre, attn_post, attn_comb = self.hc.hc_mixes(
+                hidden, self.hc.hc_attn_fn, self.hc.hc_attn_scale, self.hc.hc_attn_base
+            )
+            x = self.hc.hc_pre(hidden, pre_mix)
         x = self.input_layernorm(x)
         x = self.self_attn(x, positions, cos_sin_cache)
         hidden = self.hc.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden
-        ffn_pre, ffn_post, ffn_comb = self.hc.hc_mixes(
-            hidden, self.hc.hc_ffn_fn, self.hc.hc_ffn_scale, self.hc.hc_ffn_base
-        )
-        x = self.hc.hc_pre(hidden, attn_pre)
-        x = self.post_attention_layernorm(x)
-        if isinstance(self.mlp, (DeepseekV41MoE, DeepseekV41W8A8MoE)):
-            x = self.mlp(x, input_ids)
+        if self.hc._hc_pre_mode == _HC_PRE_MODE_FUSED:
+            x, ffn_pre, ffn_post, ffn_comb = self.hc.hc_pre_fused(
+                hidden, self.hc.hc_ffn_fn, self.hc.hc_ffn_scale, self.hc.hc_ffn_base, attn_pre
+            )
         else:
+            ffn_pre, ffn_post, ffn_comb = self.hc.hc_mixes(
+                hidden, self.hc.hc_ffn_fn, self.hc.hc_ffn_scale, self.hc.hc_ffn_base
+            )
+            x = self.hc.hc_pre(hidden, attn_pre)
+        post_norm = self.post_attention_layernorm
+        if isinstance(self.mlp, (DeepseekV41MoE, DeepseekV41W8A8MoE)):
+            # Delegate the FFN RMSNorm to the MoE. ``DeepseekV4MoE.forward``
+            # pads+all-gathers ``hidden`` across DP BEFORE it takes the
+            # gate/expert input, so the norm must run there for the fused op's
+            # fp32 routing input to describe the gathered rows. The MoE applies
+            # it exactly once (fused RMSNorm+cast when available, eager norm
+            # otherwise) and never double-normalises.
+            x = self.mlp(x, input_ids, post_norm=post_norm)
+        else:
+            # Dense FFN keeps the eager RMSNorm and its single-argument MLP.
+            x = post_norm(x)
             x = self.mlp(x)
         hidden = self.hc.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden, ffn_pre
@@ -1171,7 +1781,6 @@ class DeepseekV41Model(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-
         if self.engram_offload_active:
             assert self.engram_hash is not None
             self.execution_metadata_builders = (
@@ -1272,7 +1881,9 @@ class DeepseekV41Model(nn.Module):
         if failures:
             raise RuntimeError("engram host-table close failed for " + "; ".join(failures))
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
         context = get_forward_context()
@@ -1790,25 +2401,6 @@ class DeepseekV41ForCausalLM(PyModelBase):
         )
 
 
-# ---------------------------------------------------------------------------
-# Pure-torch quantization helpers for the official checkpoint
-#
-# Reference recipes from the official DeepSeek-V4.1 Flash inference/kernel.py:
-# ue8m0 scale decoding, 32x32-block FP8 E4M3 weight dequant, MXFP4
-# (E2M1 + per-32 ue8m0 group scale) expert dequant, and the dynamic FP8/FP4
-# activation QDQ variants of the reference inference/kernel.py. Leaf section:
-# depends only on torch and the stdlib (imported once at the module head),
-# device-agnostic (CPU and NPU).
-# ---------------------------------------------------------------------------
-
-_FP8_E4M3_MAX = 448.0
-_FP4_E2M1_MAX = 6.0
-_FP8_AMAX_FLOOR = 1e-4
-_FP4_E8M0_AMAX_FLOOR = 6.0 * (2.0**-126)
-_FP4_E4M3_AMAX_FLOOR = 6.0 * (2.0**-9)
-
-# IEEE 754 bits of the float32 subnormal 2**-127 (ue8m0 byte 0x00).
-
 _FP4_NIBBLE_VALUES = (
     0.0,
     0.5,
@@ -1827,11 +2419,6 @@ _FP4_NIBBLE_VALUES = (
     -4.0,
     -6.0,
 )
-_E2M1_POSITIVE_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-_E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
-# Round-half-to-even index on the positive grid for each exact midpoint
-# (0.75 -> 1.0, 1.75 -> 2.0, 3.5 -> 4.0, ... : ties go to the even mantissa).
-_E2M1_MIDPOINT_EVEN_INDEX = (0, 2, 2, 4, 4, 6, 6)
 
 
 def dequant_fp8_block(
@@ -1899,101 +2486,3 @@ def dequant_fp4_group(
     scale = ue8m0_to_scale(scale_u8)
     scale = scale.repeat_interleave(group, dim=-1)[..., :in_dim]
     return (unpacked * scale).to(torch.bfloat16)
-
-
-def fp8_act_qdq(x: torch.Tensor, group: int = 32) -> torch.Tensor:
-    orig_dtype = x.dtype
-    grouped = _grouped(x.float().contiguous(), group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(_FP8_AMAX_FLOOR)
-    scale = _pow2(_log2_ceil(amax * (1.0 / _E4M3_MAX)))
-    normalized = torch.clamp(grouped / scale.unsqueeze(-1), -_E4M3_MAX, _E4M3_MAX)
-    y = _round_e4m3(normalized) * scale.unsqueeze(-1)
-    return y.flatten(-2).to(orig_dtype)
-
-
-def fp4_act_qdq_e8m0(x: torch.Tensor, group: int = 32) -> torch.Tensor:
-    orig_dtype = x.dtype
-    grouped = _grouped(x.float().contiguous(), group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(_FP4_E8M0_AMAX_FLOOR)
-    scale = _pow2(_log2_ceil(amax * (1.0 / _FP4_E2M1_MAX)))
-    normalized = torch.clamp(grouped / scale.unsqueeze(-1), -_FP4_E2M1_MAX, _FP4_E2M1_MAX)
-    y = _round_e2m1(normalized) * scale.unsqueeze(-1)
-    return y.flatten(-2).to(orig_dtype)
-
-
-def fp4_act_qdq_e4m3_scale(x: torch.Tensor, group: int = 16) -> torch.Tensor:
-    orig_dtype = x.dtype
-    grouped = _grouped(x.float().contiguous(), group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(_FP4_E4M3_AMAX_FLOOR)
-    scale = _round_e4m3(amax / _FP4_E2M1_MAX)
-    normalized = torch.clamp(grouped / scale.unsqueeze(-1), -_FP4_E2M1_MAX, _FP4_E2M1_MAX)
-    y = _round_e2m1(normalized) * scale.unsqueeze(-1)
-    return y.flatten(-2).to(orig_dtype)
-
-
-def _log2_ceil(x: torch.Tensor) -> torch.Tensor:
-    bits = x.contiguous().view(torch.int32)
-    exponent = (bits >> 23) & 0xFF
-    has_mantissa = (bits & 0x7FFFFF) != 0
-    return exponent - 127 + has_mantissa.to(torch.int32)
-
-
-def _pow2(exponent: torch.Tensor) -> torch.Tensor:
-    bits = (exponent + 127) << 23
-    return bits.contiguous().view(torch.float32)
-
-
-def _grouped(x: torch.Tensor, group: int) -> torch.Tensor:
-    if group <= 0:
-        raise ValueError(f"group must be positive, got {group}")
-    if x.size(-1) % group != 0:
-        raise ValueError(f"last dim {x.size(-1)} is not divisible by group {group}")
-    return x.unflatten(-1, (-1, group))
-
-
-_E2M1_TABLE_CACHE: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-
-
-def _e2m1_tables(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Cache per device: building rounding tables during ACL capture would issue synchronous H2D."""
-    cached = _E2M1_TABLE_CACHE.get(device)
-    if cached is None:
-        cached = (
-            torch.tensor(_E2M1_POSITIVE_VALUES, dtype=torch.float32, device=device),
-            torch.tensor(_E2M1_MIDPOINTS, dtype=torch.float32, device=device),
-            torch.tensor(_E2M1_MIDPOINT_EVEN_INDEX, dtype=torch.int64, device=device),
-        )
-        _E2M1_TABLE_CACHE[device] = cached
-    return cached
-
-
-def _round_e2m1(x: torch.Tensor) -> torch.Tensor:
-    positive, midpoints, even_index = _e2m1_tables(x.device)
-    magnitude = x.abs().clamp(max=_FP4_E2M1_MAX)
-    index = torch.searchsorted(midpoints, magnitude, right=False)
-    clipped = index.clamp(max=len(_E2M1_MIDPOINTS) - 1)
-    is_tie = magnitude == midpoints[clipped]
-    rounded_index = torch.where(is_tie, even_index[clipped], index)
-    rounded = positive[rounded_index]
-    return torch.where(x < 0, -rounded, rounded)
-
-
-_E4M3_MAX = 448.0
-_E4M3_SUBNORMAL_THRESHOLD = 2.0**-6
-
-
-def _round_e4m3(x: torch.Tensor) -> torch.Tensor:
-    """Round arithmetically: native NPU float8 casts fail; overflow saturates at +/-448."""
-    magnitude = x.abs().clamp(max=_E4M3_MAX)
-    # NPU has no frexp kernel; bit inspection avoids a synchronous CPU fallback during capture.
-    bits = magnitude.view(torch.int32)
-    exp_field = (bits >> 23) & 0xFF
-    exponent = torch.where(exp_field > 0, exp_field - 126, 0).to(magnitude.dtype)
-    step = torch.exp2(exponent - 4.0)
-    q = torch.round(magnitude / step)
-    normal_val = q * step
-    q_sub = torch.round(magnitude / _E4M3_SUBNORMAL_STEP)
-    sub_val = q_sub * _E4M3_SUBNORMAL_STEP
-    val = torch.where(magnitude < _E4M3_SUBNORMAL_THRESHOLD, sub_val, normal_val)
-    # NPU lacks copysign; signed zero differences disappear on the E4M3 grid.
-    return torch.where(x < 0, -val, val)

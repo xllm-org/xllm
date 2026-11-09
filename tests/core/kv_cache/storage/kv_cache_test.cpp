@@ -781,15 +781,25 @@ TEST(KVCacheTest, DeepSeekV41TokenGroupsUseModelDtypeIndexCache) {
   EXPECT_EQ(shape_vec(caches[2].get_swa_cache()),
             dsv4_block_shape(kSwaCount, kBlockSize, 1, kHeadDim));
   EXPECT_EQ(shape_vec(caches[2].get_compress_kv_state()),
-            (std::vector<int64_t>{kSwaCount, kBlockSize, kHeadDim}));
+            (std::vector<int64_t>{
+                kSwaCount, xllm::kDsv41CompressStateRows, kHeadDim}));
   EXPECT_EQ(shape_vec(caches[2].get_compress_score_state()),
-            (std::vector<int64_t>{kSwaCount, kBlockSize, kHeadDim}));
+            (std::vector<int64_t>{
+                kSwaCount, xllm::kDsv41CompressStateRows, kHeadDim}));
   EXPECT_EQ(caches[2].get_compress_kv_state().dtype(), torch::kFloat32);
   EXPECT_EQ(caches[2].get_compress_score_state().dtype(), torch::kFloat32);
-  EXPECT_EQ(caches[2].get_index_cache().dtype(), torch::kBFloat16);
+  EXPECT_EQ(caches[2].get_index_cache().dtype(),
+            get_dsv4_cache_policy(options.dtype()).index_dtype);
   EXPECT_EQ(caches[2].get_k_cache().dtype(), torch::kBFloat16);
+  const std::optional<torch::Tensor> c2_indexer_scale =
+      caches[2].get_indexer_cache_scale();
+  if (c2_indexer_scale.has_value()) {
+    EXPECT_EQ(shape_vec(c2_indexer_scale.value()),
+              (std::vector<int64_t>{kC2Count, kBlockSize, 1}));
+    EXPECT_EQ(c2_indexer_scale->dtype(),
+              get_dsv4_cache_policy(options.dtype()).scale_dtype);
+  }
 
-  // Ratio-1 kv-source layer (4): TOKEN(1) tensors, no states.
   EXPECT_EQ(shape_vec(caches[4].get_k_cache()),
             dsv4_block_shape(kC1Count, kBlockSize, 1, kHeadDim));
   EXPECT_EQ(shape_vec(caches[4].get_index_cache()),
@@ -798,7 +808,16 @@ TEST(KVCacheTest, DeepSeekV41TokenGroupsUseModelDtypeIndexCache) {
             dsv4_block_shape(kSwaCount, kBlockSize, 1, kHeadDim));
   EXPECT_FALSE(caches[4].get_compress_kv_state().defined());
   EXPECT_FALSE(caches[4].get_compress_score_state().defined());
-  EXPECT_EQ(caches[4].get_index_cache().dtype(), torch::kBFloat16);
+  EXPECT_EQ(caches[4].get_index_cache().dtype(),
+            get_dsv4_cache_policy(options.dtype()).index_dtype);
+  const std::optional<torch::Tensor> c1_indexer_scale =
+      caches[4].get_indexer_cache_scale();
+  if (c1_indexer_scale.has_value()) {
+    EXPECT_EQ(shape_vec(c1_indexer_scale.value()),
+              (std::vector<int64_t>{kC1Count, kBlockSize, 1}));
+    EXPECT_EQ(c1_indexer_scale->dtype(),
+              get_dsv4_cache_policy(options.dtype()).scale_dtype);
+  }
 
   ExpectTensorGroup(caches[2], KVCacheTensorRole::WINDOW, BlockType::SWA);
   ExpectTensorGroup(caches[2], KVCacheTensorRole::KEY, BlockType::C2);

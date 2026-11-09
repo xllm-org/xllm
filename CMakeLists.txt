@@ -63,6 +63,26 @@ if(USE_NPU)
     message(FATAL_ERROR "ASCEND_OPP_PATH is not initialized for NPU build.")
   endif()
 
+  set(XLLM_OPS_PATCH_DIR "${CMAKE_SOURCE_DIR}/patches/xllm_ops")
+  file(GLOB XLLM_OPS_PATCHES CONFIGURE_DEPENDS "${XLLM_OPS_PATCH_DIR}/*.patch")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${XLLM_OPS_PATCHES})
+  set(_xllm_ops_patch_hashes "")
+  foreach(xllm_ops_patch IN LISTS XLLM_OPS_PATCHES)
+    file(SHA256 "${xllm_ops_patch}" _patch_hash)
+    string(APPEND _xllm_ops_patch_hashes "${_patch_hash}")
+  endforeach()
+  string(SHA256 XLLM_OPS_PATCH_HASH "${_xllm_ops_patch_hashes}")
+  set(XLLM_OPS_PATCH_HASH_CACHED "")
+  set(_patch_marker "$ENV{ASCEND_OPP_PATH}/vendors/xllm/.xllm_ops_patch_hash")
+  if(EXISTS "$ENV{ASCEND_OPP_PATH}/vendors/custom_xllm_math/op_api/include/aclnnop")
+    set(_patch_marker
+      "$ENV{ASCEND_OPP_PATH}/vendors/custom_xllm_math/.xllm_ops_patch_hash")
+  endif()
+  if(EXISTS "${_patch_marker}")
+    file(STRINGS "${_patch_marker}" XLLM_OPS_PATCH_HASH_CACHED LIMIT_COUNT 1)
+  endif()
+
   if(DEFINED ENV{XLLM_OPS_GIT_HEAD_CACHED})
     set(XLLM_OPS_GIT_HEAD_CACHED "$ENV{XLLM_OPS_GIT_HEAD_CACHED}")
   endif()
@@ -73,18 +93,22 @@ if(USE_NPU)
     set(XLLM_OPS_BUILD_DIR "${CMAKE_SOURCE_DIR}/third_party/xllm_ops/build")
   endif()
 
-  if(NOT DEFINED XLLM_OPS_GIT_HEAD_CACHED OR NOT XLLM_OPS_GIT_HEAD STREQUAL XLLM_OPS_GIT_HEAD_CACHED)
-    message(STATUS "xllm_ops git HEAD changed; running precompile via execute_process")
+  if(NOT DEFINED XLLM_OPS_GIT_HEAD_CACHED
+      OR NOT XLLM_OPS_GIT_HEAD STREQUAL XLLM_OPS_GIT_HEAD_CACHED
+      OR NOT XLLM_OPS_PATCH_HASH STREQUAL XLLM_OPS_PATCH_HASH_CACHED)
+    message(STATUS "xllm_ops revision or patches changed; "
+      "running precompile via execute_process")
     execute_process(
       COMMAND ${CMAKE_COMMAND} -E env "XLLM_OPS_BUILD_DIR=${XLLM_OPS_BUILD_DIR}"
-              bash "${CMAKE_SOURCE_DIR}/third_party/xllm_ops/build.sh"
+              bash "${CMAKE_SOURCE_DIR}/scripts/build_support/build_xllm_ops.sh"
+              "${CMAKE_SOURCE_DIR}/third_party/xllm_ops" "${XLLM_OPS_PATCH_DIR}"
       WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/third_party/xllm_ops"
       RESULT_VARIABLE XLLM_OPS_RESULT
     )
     if(NOT XLLM_OPS_RESULT EQUAL 0)
       message(FATAL_ERROR
         "Failed to precompile xllm ops, error code: ${XLLM_OPS_RESULT}.\n"
-        "This precompile ran because the xllm_ops git HEAD changed "
+        "This precompile ran because the xllm_ops revision or patches changed "
         "(e.g. after switching commits/branches or updating the submodule).\n"
         "A common cause of failure here is a stale incremental build cache: "
         "removed or renamed operators leave dangling CMake targets and opc "
@@ -108,9 +132,12 @@ if(USE_NPU)
     get_filename_component(XLLM_OPS_MARKER_DIR "${XLLM_OPS_MARKER_PATH}" DIRECTORY)
     file(MAKE_DIRECTORY "${XLLM_OPS_MARKER_DIR}")
     file(WRITE "${XLLM_OPS_MARKER_PATH}" "${XLLM_OPS_GIT_HEAD}\n")
+    file(WRITE "${XLLM_OPS_MARKER_DIR}/.xllm_ops_patch_hash"
+      "${XLLM_OPS_PATCH_HASH}\n")
     message(STATUS "xllm ops precompiled and HEAD cache updated")
   else()
-    message(STATUS "xllm_ops git HEAD unchanged; skipping precompile")
+    message(STATUS "xllm_ops revision and patches unchanged; "
+      "skipping precompile")
   endif()
 endif()
 

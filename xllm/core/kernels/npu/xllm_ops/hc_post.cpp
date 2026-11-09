@@ -158,4 +158,14 @@ at::Tensor hc_post(const at::Tensor& x,
   return out;
 }
 
+at::Tensor hc_post_va(const at::Tensor& x,
+                      const at::Tensor& residual,
+                      const at::Tensor& post,
+                      const at::Tensor& comb) {
+  check_hc_post_shape_and_dtype(x, residual, post, comb);
+  at::Tensor out = construct_hc_post_output_tensor(residual);
+  EXEC_NPU_CMD(aclnnHcPostVa, x, residual, post, comb, out);
+  return out;
+}
+
 }  // namespace xllm::kernel::npu

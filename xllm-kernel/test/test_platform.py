@@ -125,11 +125,16 @@ def test_acl_soc_name_resolves_the_chip_and_its_generation(
     assert Platform.get_ascend_soc_generation() == expected_generation
 
 
-def test_smi_chip_wins_over_acl(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=SMI_910B2_OUTPUT))
-    _fake_acl(monkeypatch, "Ascend910_93")
+@pytest.mark.parametrize(
+    ("smi_chip", "acl_soc", "expected"),
+    [("910B2", "Ascend910_93", "910b2"), ("Ascend910", "Ascend910_9382", "910_9382"), ("Ascend910", "", "910")],
+)
+def test_smi_chip_resolution(monkeypatch: pytest.MonkeyPatch, smi_chip: str, acl_soc: str, expected: str) -> None:
+    output = SMI_910B2_OUTPUT.replace("910B2", smi_chip)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=output))
+    _fake_acl(monkeypatch, acl_soc)
 
-    assert Platform.get_npu_chip() == "910b2"
+    assert Platform.get_npu_chip() == expected
 
 
 @pytest.mark.parametrize("expected", [PlatformEnum.NPU, PlatformEnum.CUDA, PlatformEnum.CPU])

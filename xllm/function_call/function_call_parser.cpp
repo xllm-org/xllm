@@ -24,6 +24,7 @@ limitations under the License.
 #include "core/util/uuid.h"
 #include "deepseekv32_detector.h"
 #include "deepseekv3_detector.h"
+#include "deepseekv41_detector.h"
 #include "glm45_detector.h"
 #include "glm47_detector.h"
 #include "kimik2_detector.h"
@@ -71,8 +72,7 @@ const std::unordered_map<std::string,
         {"deepseekv3", [] { return std::make_unique<DeepSeekV3Detector>(); }},
         {"deepseekv32", [] { return std::make_unique<DeepSeekV32Detector>(); }},
         {"deepseekv4", [] { return std::make_unique<DeepSeekV4Detector>(); }},
-        // deepseek_v41 uses the same tool-call format as deepseek_v4
-        {"deepseekv41", [] { return std::make_unique<DeepSeekV4Detector>(); }},
+        {"deepseekv41", [] { return std::make_unique<DeepSeekV41Detector>(); }},
         {"glm45", [] { return std::make_unique<Glm45Detector>(); }},
         {"glm47", [] { return std::make_unique<Glm47Detector>(); }},
         // glm5 use glm47 detector

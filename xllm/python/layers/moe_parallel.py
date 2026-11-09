@@ -122,6 +122,7 @@ class Eplv2CommPolicy:
         buffer_mb: int,
         token_limit: int = 512,
         mode: str = "auto",
+        shared_experts: int = 1,
     ) -> Eplv2CommPolicy:
         if mode not in ("auto", "mc2", "alltoall"):
             raise ValueError("EPLv2 communication mode must be auto, mc2 or alltoall")
@@ -129,14 +130,14 @@ class Eplv2CommPolicy:
             raise ValueError("EPLv2 requires positive HCCL buffer MB and a MC2 token limit in [1, 512]")
         if ep_size <= 1 or num_experts <= 0 or num_experts % ep_size or not 0 < topk <= num_experts:
             raise ValueError("Invalid EPLv2 expert geometry")
-        # A3 fullmesh/default EP window bound, including the default shared
-        # slot. CANN specifies the window layout using two-byte activations
+        # A3 fullmesh/default EP window bound, including shared
+        # slots. CANN specifies the window layout using two-byte activations
         # even when dispatch quantization is enabled; traffic compression does
         # not halve this allocation requirement.
         local_experts = num_experts // ep_size
         dispatch_row = ((2 * hidden_size + 64 + 511) // 512) * 512
         combine_row = ((2 * hidden_size + 511) // 512) * 512
-        row_bytes = 2 * (local_experts * ep_size * dispatch_row + (topk + 1) * combine_row)
+        row_bytes = 2 * (local_experts * ep_size * dispatch_row + (topk + shared_experts) * combine_row)
         capacity = min(token_limit, buffer_mb * 1024 * 1024 // row_bytes)
         if not 1024 <= hidden_size <= 8192 or topk > 16:
             capacity = 0

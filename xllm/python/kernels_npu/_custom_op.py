@@ -677,6 +677,106 @@ def _quant_lightning_indexer_fake(
     return indices, values
 
 
+def _quant_lightning_indexer_v2_va_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    query_dequant_scale: torch.Tensor,
+    key_dequant_scale: torch.Tensor,
+    topk: int,
+    quant_mode: int,
+    candidate_topk_index: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    cmp_residual_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    output_idx_offset: torch.Tensor | None = None,
+    metadata: torch.Tensor | None = None,
+    max_seqlen_q: int = -1,
+    layout_q: str = "TND",
+    layout_k: str = "PA_BBND",
+    mask_mode: int = 3,
+    cmp_ratio: int = 1,
+    candidate_mode: int = 3,
+    candidate_topk_blocks: int = 2048,
+    candidate_block_size: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del (
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        quant_mode,
+        candidate_topk_index,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        cmp_residual_k,
+        block_table,
+        output_idx_offset,
+        metadata,
+        max_seqlen_q,
+        mask_mode,
+        cmp_ratio,
+        candidate_block_size,
+    )
+    key_head_num = key.size(1) if layout_k == "TND" else key.size(2)
+    if layout_q == "BSND":
+        output_shape = (query.size(0), query.size(1), key_head_num, topk)
+    else:
+        output_shape = (query.size(0), key_head_num, topk)
+    indices = query.new_zeros(output_shape, dtype=torch.int32)
+    # With return_value=False, the native values output is empty BF16, not INT32.
+    values = query.new_zeros((0,), dtype=torch.bfloat16)
+    if candidate_mode == 1:
+        candidate_shape = (*output_shape[:-1], candidate_topk_blocks)
+        candidate_out = query.new_zeros(candidate_shape, dtype=torch.int32)
+    else:
+        candidate_out = query.new_zeros((0,), dtype=torch.int32)
+    return indices, values, candidate_out
+
+
+def _quant_lightning_indexer_v2_metadata_va_fake(
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    topk: int,
+    quant_mode: int,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    cmp_residual_k: torch.Tensor | None = None,
+    batch_size: int = 0,
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
+    layout_q: str = "TND",
+    layout_k: str = "PA_BBND",
+    mask_mode: int = 3,
+    cmp_ratio: int = 1,
+    device: str = "npu",
+) -> torch.Tensor:
+    del (
+        num_heads_q,
+        num_heads_k,
+        head_dim,
+        topk,
+        quant_mode,
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        layout_q,
+        layout_k,
+        mask_mode,
+        cmp_ratio,
+    )
+    for tensor in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k):
+        if tensor is not None:
+            return tensor.new_empty((_DSA_METADATA_BUFFER_ELEMENTS,), dtype=torch.int32)
+    return torch.empty((_DSA_METADATA_BUFFER_ELEMENTS,), dtype=torch.int32, device=device)
+
+
 def _quant_lightning_indexer_metadata_fake(
     num_heads_q: int,
     num_heads_k: int,
@@ -812,6 +912,11 @@ def _rms_norm_dynamic_quant_fake(
     return input.new_empty(input.shape, dtype=torch.int8), input.new_empty(input.shape[:-1], dtype=torch.float32)
 
 
+def _rms_norm_cast_va_fake(x: torch.Tensor, gamma: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    del gamma, eps
+    return x.new_empty(x.shape, dtype=x.dtype), x.new_empty(x.shape, dtype=torch.float32)
+
+
 def _npu_inplace_partial_rotary_mul_fake(
     x: torch.Tensor,
     r1: torch.Tensor,
@@ -845,6 +950,21 @@ def _hc_pre_fake(
     post = x.new_empty(post_shape, dtype=torch.float32)
     comb = x.new_empty(comb_shape, dtype=torch.float32)
     return attn_input, post, comb
+
+
+def _hc_pre_va_fake(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    pre_mix: torch.Tensor | None,
+    hc_mult: int,
+    hc_sinkhorn_iters: int,
+    norm_eps: float,
+    hc_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    y, post, comb = _hc_pre_fake(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps)
+    return y, post, comb, torch.empty_like(post)
 
 
 def _hc_post_fake(
@@ -1371,10 +1491,19 @@ register_fake(
     "xllm_ops::quant_lightning_indexer_metadata",
     _quant_lightning_indexer_metadata_fake,
 )
+register_fake(
+    "xllm_ops::quant_lightning_indexer_v2_va",
+    _quant_lightning_indexer_v2_va_fake,
+)
+register_fake(
+    "xllm_ops::quant_lightning_indexer_v2_metadata_va",
+    _quant_lightning_indexer_v2_metadata_va_fake,
+)
 register_fake("xllm_ops::lightning_indexer", _lightning_indexer_fake)
 register_fake("xllm_ops::lightning_indexer_out", _lightning_indexer_out_fake)
 register_fake("xllm_ops::scatter_nd_update", _scatter_nd_update_fake)
 register_fake("xllm_ops::rms_norm_dynamic_quant", _rms_norm_dynamic_quant_fake)
+register_fake("xllm_ops::rms_norm_cast_va", _rms_norm_cast_va_fake)
 register_fake(
     "xllm_ops::npu_inplace_partial_rotary_mul",
     _npu_inplace_partial_rotary_mul_fake,
@@ -1383,7 +1512,9 @@ register_fake("xllm_ops::compressor", _compressor_fake)
 register_fake("xllm_ops::moe_gating_top_k_hash", _moe_gating_top_k_hash_fake)
 register_fake("xllm_ops::dequant_swiglu_quant", _dequant_swiglu_quant_fake)
 register_fake("xllm_ops::hc_pre", _hc_pre_fake)
+register_fake("xllm_ops::hc_pre_va", _hc_pre_va_fake)
 register_fake("xllm_ops::hc_post", _hc_post_fake)
+register_fake("xllm_ops::hc_post_va", _hc_post_fake)
 register_fake("xllm_ops::sparse_attn_sharedkv", _sparse_attn_sharedkv_fake)
 register_fake("xllm_ops::sparse_attn_sharedkv_metadata", _sparse_attn_sharedkv_metadata_fake)
 register_fake("xllm_ops::sparse_flash_attention_lse", _sparse_flash_attention_lse_fake)

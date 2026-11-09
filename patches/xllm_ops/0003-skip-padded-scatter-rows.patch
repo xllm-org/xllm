@@ -1,0 +1,15 @@
+--- a/xllm_ops/moe/scatter_nd_update_v2/op_kernel/scatter_nd_update_small_fast_path.h
++++ b/xllm_ops/moe/scatter_nd_update_v2/op_kernel/scatter_nd_update_small_fast_path.h
+@@ -159,7 +159,11 @@
+     {
+         DataCopyExtParams outParams{1, static_cast<uint32_t>(scatterLength_ * sizeof(T)), 0, 0, 0};
+         for (uint64_t r = 0; r < indexRow_; ++r) {
+-            uint64_t outOffset = static_cast<uint64_t>(linearLocal_.GetValue(r));
++            int64_t linearIndex = linearLocal_.GetValue(r);
++            if (linearIndex < 0) {
++                continue;
++            }
++            uint64_t outOffset = static_cast<uint64_t>(linearIndex);
+             DataCopyPad(outputGm_[outOffset], updLocal_[r * scatterAlignLength_], outParams);
+         }
+         PipeMte3ToS();

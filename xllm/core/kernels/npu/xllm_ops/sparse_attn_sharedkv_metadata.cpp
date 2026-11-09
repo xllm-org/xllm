@@ -20,17 +20,6 @@ limitations under the License.
 
 namespace xllm::kernel::npu {
 
-namespace {
-
-auto get_valid_tensor = [](const c10::optional<at::Tensor>& tensor_opt,
-                           at::Device device) {
-  return tensor_opt.has_value()
-             ? tensor_opt
-             : torch::empty({0}, torch::dtype(torch::kInt32).device(device));
-};
-
-}  // namespace
-
 at::Tensor sparse_attn_sharedkv_metadata(
     int64_t num_heads_q,
     int64_t num_heads_kv,
@@ -70,13 +59,16 @@ at::Tensor sparse_attn_sharedkv_metadata(
   at::Tensor output =
       torch::zeros({kDsaMetadataBufferElements},
                    torch::dtype(torch::kInt32).device(output_device));
-  auto cu_seqlens_q_val = get_valid_tensor(cu_seqlens_q, output_device);
+  auto cu_seqlens_q_val =
+      detail::materialize_int32_metadata(cu_seqlens_q, output_device);
   auto cu_seqlens_ori_kv_val =
-      get_valid_tensor(cu_seqlens_ori_kv, output_device);
+      detail::materialize_int32_metadata(cu_seqlens_ori_kv, output_device);
   auto cu_seqlens_cmp_kv_val =
-      get_valid_tensor(cu_seqlens_cmp_kv, output_device);
-  auto seqused_q_val = get_valid_tensor(seqused_q, output_device);
-  auto seqused_kv_val = get_valid_tensor(seqused_kv, output_device);
+      detail::materialize_int32_metadata(cu_seqlens_cmp_kv, output_device);
+  auto seqused_q_val =
+      detail::materialize_int32_metadata(seqused_q, output_device);
+  auto seqused_kv_val =
+      detail::materialize_int32_metadata(seqused_kv, output_device);
 
   // convert str
   std::string layout_q_str = std::string(layout_q);

@@ -309,6 +309,12 @@ inline void* get_op_api_func_addr(const char* api_name) {
       op_api_handler, get_op_api_lib_name(), api_name);
 }
 
+inline bool has_op_api(const std::string& op_name) {
+  const std::string workspace_api = op_name + "GetWorkspaceSize";
+  return get_op_api_func_addr(workspace_api.c_str()) != nullptr &&
+         get_op_api_func_addr(op_name.c_str()) != nullptr;
+}
+
 template <typename Func>
 inline Func get_op_api_func(const char* api_name) {
   return reinterpret_cast<Func>(get_op_api_func_addr(api_name));

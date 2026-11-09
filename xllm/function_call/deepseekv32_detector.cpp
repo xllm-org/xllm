@@ -28,6 +28,61 @@ limitations under the License.
 namespace xllm {
 namespace function_call {
 
+namespace {
+
+struct InvocationRegexes {
+  std::string invoke_start;
+  std::string invoke_end;
+  std::string parameter_end;
+  std::regex invoke;
+  std::regex parameter;
+  std::regex partial_parameter;
+  std::regex streaming_invoke;
+
+  InvocationRegexes(const std::string& invoke_tag,
+                    const std::string& parameter_tag) {
+    const std::string prefix = "<｜DSML｜";
+    const std::string suffix = "</｜DSML｜";
+    invoke_start = prefix + invoke_tag;
+    invoke_end = suffix + invoke_tag + ">";
+    const std::string parameter_start = prefix + parameter_tag;
+    parameter_end = suffix + parameter_tag + ">";
+    invoke = std::regex(
+        invoke_start + "\\s+name=\"([^\"]+)\"\\s*>([\\s\\S]*?)" + invoke_end,
+        std::regex_constants::ECMAScript);
+    parameter = std::regex(
+        parameter_start +
+            "\\s+name=\"([^\"]+)\"\\s+string=\"([^\"]+)\"\\s*>([\\s\\S]*?)" +
+            parameter_end,
+        std::regex_constants::ECMAScript);
+    partial_parameter = std::regex(
+        parameter_start +
+            "\\s+name=\"([^\"]+)\"\\s+string=\"([^\"]+)\"\\s*>([\\s\\S]*)$",
+        std::regex_constants::ECMAScript);
+    streaming_invoke =
+        std::regex(invoke_start + "\\s+name=\"([^\"]+)\"\\s*>([\\s\\S]*?)(" +
+                       invoke_end + "|$)",
+                   std::regex_constants::ECMAScript);
+  }
+};
+
+InvocationRegexes invocation_regexes(const std::string& invoke_tag,
+                                     const std::string& parameter_tag) {
+  // Regex copies share immutable compiled programs; streaming state remains per
+  // detector.
+  if (invoke_tag == "invoke" && parameter_tag == "parameter") {
+    static const InvocationRegexes patterns("invoke", "parameter");
+    return patterns;
+  }
+  if (invoke_tag == " invoke" && parameter_tag == " parameter") {
+    static const InvocationRegexes patterns(" invoke", " parameter");
+    return patterns;
+  }
+  return InvocationRegexes(invoke_tag, parameter_tag);
+}
+
+}  // namespace
+
 DeepSeekV32Detector::DeepSeekV32Detector()
     : DeepSeekV32Detector("<｜DSML｜function_calls>",
                           "</｜DSML｜function_calls>") {}
@@ -35,41 +90,32 @@ DeepSeekV32Detector::DeepSeekV32Detector()
 DeepSeekV32Detector::DeepSeekV32Detector(
     const std::string& tool_calls_start_token,
     const std::string& tool_calls_end_token)
-    : BaseFormatDetector() {
+    : DeepSeekV32Detector(tool_calls_start_token,
+                          tool_calls_end_token,
+                          "invoke",
+                          "parameter") {}
+
+DeepSeekV32Detector::DeepSeekV32Detector(
+    const std::string& tool_calls_start_token,
+    const std::string& tool_calls_end_token,
+    const std::string& invoke_tag,
+    const std::string& parameter_tag,
+    bool defer_partial_nonstring)
+    : BaseFormatDetector(), defer_partial_nonstring_(defer_partial_nonstring) {
   bot_token_ = tool_calls_start_token;
   eot_token_ = tool_calls_end_token;
-  invoke_end_token_ = "</｜DSML｜invoke>";
 
   // Regex patterns for DeepSeek-V3.2 DSML format
   function_calls_regex_ = std::regex(bot_token_ + "([\\s\\S]*?)" + eot_token_,
                                      std::regex_constants::ECMAScript);
-  // Note: For streaming, we need to match even without closing tag
-  // The third group will be empty if no closing tag is found
-  // Use non-greedy match for content, but ensure we match the closing tag if
-  // present The pattern matches: <｜DSML｜invoke name="..."
-  // >content</｜DSML｜invoke> Updated: Make closing tag required for
-  // detect_and_parse, but use lookahead for better matching
-  invoke_regex_ = std::regex(
-      "<｜DSML｜invoke\\s+name=\"([^\"]+)\"\\s*>([\\s\\S]*?)</"
-      "｜DSML｜invoke>",
-      std::regex_constants::ECMAScript);
-  parameter_regex_ = std::regex(
-      "<｜DSML｜parameter\\s+name=\"([^\"]+)\"\\s+string=\"([^\"]+)\"\\s*>(["
-      "\\s\\S]*?)</｜DSML｜parameter>",
-      std::regex_constants::ECMAScript);
-  partial_parameter_regex_ = std::regex(
-      "<｜DSML｜parameter\\s+name=\"([^\"]+)\"\\s+string=\"([^\"]+)\"\\s*>(["
-      "\\s\\S]*)$",
-      std::regex_constants::ECMAScript);
-
-  prefix_parameter_end_call_ = {"</", "｜DSML｜", "parameter"};
-
-  // Streaming: one regex that matches with or without closing tag (like Python
-  // r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)')
-  streaming_invoke_regex_ = std::regex(
-      "<｜DSML｜invoke\\s+name=\"([^\"]+)\"\\s*>([\\s\\S]*?)(</"
-      "｜DSML｜invoke>|$)",
-      std::regex_constants::ECMAScript);
+  auto patterns = invocation_regexes(invoke_tag, parameter_tag);
+  invoke_start_token_ = std::move(patterns.invoke_start);
+  invoke_end_token_ = std::move(patterns.invoke_end);
+  parameter_end_token_ = std::move(patterns.parameter_end);
+  invoke_regex_ = std::move(patterns.invoke);
+  parameter_regex_ = std::move(patterns.parameter);
+  partial_parameter_regex_ = std::move(patterns.partial_parameter);
+  streaming_invoke_regex_ = std::move(patterns.streaming_invoke);
   utf8_buffer_.clear();
 }
 
@@ -117,21 +163,18 @@ std::pair<std::string, std::string> DeepSeekV32Detector::split_incomplete_utf8(
   return {str.substr(0, start_pos), str.substr(start_pos)};
 }
 
-// Dump parameters to JSON string with sorted keys for stable prefix comparison
-// across streaming chunks (unordered_map iteration order is undefined).
-static std::string params_to_json_sorted(
-    const std::unordered_map<std::string, nlohmann::json>& params) {
-  std::vector<std::string> keys;
-  keys.reserve(params.size());
-  for (const auto& p : params) {
-    keys.push_back(p.first);
+// Keep XML encounter order so later fields cannot move bytes already streamed
+// to the client.
+static std::string params_to_json_ordered(
+    const std::unordered_map<std::string, nlohmann::json>& params,
+    const std::vector<std::string>& parameter_order) {
+  nlohmann::ordered_json result = nlohmann::ordered_json::object();
+  auto& object = result.get_ref<nlohmann::ordered_json::object_t&>();
+  object.reserve(parameter_order.size());
+  for (const auto& key : parameter_order) {
+    object.emplace_back(key, params.at(key));
   }
-  std::sort(keys.begin(), keys.end());
-  nlohmann::json j = nlohmann::json::object();
-  for (const auto& k : keys) {
-    j[k] = params.at(k);
-  }
-  return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::ignore);
+  return result.dump(-1, ' ', false, nlohmann::json::error_handler_t::ignore);
 }
 
 static std::string strip_trailing_markdown_fence(const std::string& text) {
@@ -361,7 +404,7 @@ std::string DeepSeekV32Detector::trim_whitespace(std::string_view str) const {
 bool DeepSeekV32Detector::has_tool_call(const std::string& text) {
   // Check for DSML format first (primary format)
   if (text.find(bot_token_) != std::string::npos ||
-      text.find("<｜DSML｜invoke") != std::string::npos) {
+      text.find(invoke_start_token_) != std::string::npos) {
     return true;
   }
 
@@ -395,8 +438,15 @@ bool DeepSeekV32Detector::has_tool_call(const std::string& text) {
 std::unordered_map<std::string, nlohmann::json>
 DeepSeekV32Detector::parse_parameters_from_xml(
     const std::string& invoke_content,
-    bool allow_partial) const {
+    bool allow_partial,
+    std::vector<std::string>* parameter_order) const {
   std::unordered_map<std::string, nlohmann::json> parameters;
+  const auto note_order = [&](const std::string& name) {
+    if (parameter_order != nullptr &&
+        parameters.find(name) == parameters.end()) {
+      parameter_order->push_back(name);
+    }
+  };
 
   // First, try to parse as direct JSON (Format 2)
   std::string invoke_content_stripped = trim_whitespace(invoke_content);
@@ -409,6 +459,9 @@ DeepSeekV32Detector::parse_parameters_from_xml(
       if (parsed.is_object()) {
         // Convert JSON object to map
         for (auto& [key, value] : parsed.items()) {
+          if (parameter_order != nullptr) {
+            parameter_order->push_back(key);
+          }
           parameters[key] = value;
         }
         return parameters;
@@ -432,6 +485,7 @@ DeepSeekV32Detector::parse_parameters_from_xml(
       // For string type parameters, preserve the original value including
       // whitespace For non-string types, we may need to trim for JSON parsing
       std::string param_value = match[3].str();
+      note_order(param_name);
       last_match_end = match.position() + match.length();
 
       // Convert value based on type
@@ -453,17 +507,16 @@ DeepSeekV32Detector::parse_parameters_from_xml(
   if (allow_partial) {
     std::string remaining_content = invoke_content.substr(last_match_end);
 
-    // Remove incomplete parameter_end_call prefix in case they are captured
-    for (auto it = prefix_parameter_end_call_.rbegin();
-         it != prefix_parameter_end_call_.rend();
-         ++it) {
-      const std::string& token = *it;
-      while (!remaining_content.empty() &&
-             remaining_content.size() >= token.size() &&
-             remaining_content.substr(remaining_content.size() -
-                                      token.size()) == token) {
-        remaining_content = remaining_content.substr(
-            0, remaining_content.size() - token.size());
+    // An incomplete closing tag can still be literal text; retain it until
+    // distinguishable.
+    const size_t tag_start = remaining_content.rfind('<');
+    if (tag_start != std::string::npos) {
+      const std::string_view suffix(remaining_content.data() + tag_start,
+                                    remaining_content.size() - tag_start);
+      if (suffix.size() < parameter_end_token_.size() &&
+          std::string_view(parameter_end_token_).substr(0, suffix.size()) ==
+              suffix) {
+        remaining_content.resize(tag_start);
       }
     }
 
@@ -474,18 +527,20 @@ DeepSeekV32Detector::parse_parameters_from_xml(
       if (partial_match.size() >= 4) {
         std::string param_name = trim_whitespace(partial_match[1].str());
         std::string param_type = trim_whitespace(partial_match[2].str());
-        std::string param_value = trim_whitespace(partial_match[3].str());
-
         if (param_type == "true") {
-          parameters[param_name] = param_value;
-        } else {
-          if (param_value.empty()) {
-            return parameters;
+          note_order(param_name);
+          parameters[param_name] = partial_match[3].str();
+        }
+        // V4.1 waits for non-string closing tags: a partial number can change
+        // its JSON type.
+        if (param_type != "true" && !defer_partial_nonstring_) {
+          const auto value = trim_whitespace(partial_match[3].str());
+          if (!value.empty()) {
+            auto [parsed, unused] = partial_json::partial_json_loads(
+                value, partial_json::Allow::ALL);
+            note_order(param_name);
+            parameters[param_name] = std::move(parsed);
           }
-          // Use partial_json::partial_json_loads for non-string types
-          auto [parsed_value, _] = partial_json::partial_json_loads(
-              param_value, partial_json::Allow::ALL);
-          parameters[param_name] = parsed_value;
         }
       }
     }
@@ -685,13 +740,13 @@ StreamingParseResult DeepSeekV32Detector::detect_and_parse(
 
   // Check if we have function_calls tag or just invoke tags
   bool has_function_calls_tag = (idx != std::string::npos);
-  bool has_invoke_tag = (text.find("<｜DSML｜invoke") != std::string::npos);
+  bool has_invoke_tag = (text.find(invoke_start_token_) != std::string::npos);
 
   // Extract normal_text: before function_calls tag or before first invoke tag
   if (has_function_calls_tag) {
     normal_text = sanitize_text_before_tool_block(text.substr(0, idx));
   } else if (has_invoke_tag) {
-    size_t invoke_pos = text.find("<｜DSML｜invoke");
+    size_t invoke_pos = text.find(invoke_start_token_);
     normal_text = sanitize_text_before_tool_block(text.substr(0, invoke_pos));
   } else {
     normal_text = text;
@@ -1097,10 +1152,11 @@ StreamingParseResult DeepSeekV32Detector::parse_streaming_increment(
       }
 
       // 2. Parse current parameters (partial or complete)
-      auto current_params =
-          parse_parameters_from_xml(invoke_content, !is_tool_end);
-      // Use sorted-key dump so the common prefix is stable across chunks
-      std::string current_args_json = params_to_json_sorted(current_params);
+      std::vector<std::string> parameter_order;
+      auto current_params = parse_parameters_from_xml(
+          invoke_content, !is_tool_end, &parameter_order);
+      std::string current_args_json =
+          params_to_json_ordered(current_params, parameter_order);
 
       // 3. Calculate and send incremental arguments
       size_t sent_len = streamed_args_for_tool_[current_tool_id_].length();
@@ -1119,10 +1175,10 @@ StreamingParseResult DeepSeekV32Detector::parse_streaming_increment(
               prev_tool_call_arr_[current_tool_id_]["arguments"];
 
           if (current_args_json != prev_args_json) {
-            std::string prefix(absl::FindLongestCommonPrefix(
-                prev_args_json, current_args_json));
+            const auto prefix = absl::FindLongestCommonPrefix(
+                prev_args_json, current_args_json);
             if (prefix.length() > sent_len) {
-              argument_diff = prefix.substr(sent_len);
+              argument_diff = std::string(prefix.substr(sent_len));
             }
           }
         }

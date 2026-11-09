@@ -334,6 +334,8 @@ BlockTypeTensorMap DeepSeekV4KVCacheImpl::get_block_type_tensors(
         tensor_map.emplace(KVCacheTensorRole::SWA, swa_cache_);
       }
       break;
+    case BlockType::C1:
+    case BlockType::C2:
     case BlockType::C4:
       if (key_cache_.defined() && key_cache_.numel() > 0 &&
           index_cache_.defined() && index_cache_.numel() > 0) {
@@ -350,16 +352,6 @@ BlockTypeTensorMap DeepSeekV4KVCacheImpl::get_block_type_tensors(
       if (key_cache_.defined() && key_cache_.numel() > 0 &&
           (!index_cache_.defined() || index_cache_.numel() == 0)) {
         tensor_map.emplace(KVCacheTensorRole::KEY, key_cache_);
-      }
-      break;
-    case BlockType::C1:
-    case BlockType::C2:
-      // V4.1 TOKEN groups: key + index (both model dtype, no index scale).
-      // Only reached by PD / kvcache-store transfer paths today.
-      if (key_cache_.defined() && key_cache_.numel() > 0 &&
-          index_cache_.defined() && index_cache_.numel() > 0) {
-        tensor_map.emplace(KVCacheTensorRole::KEY, key_cache_);
-        tensor_map.emplace(KVCacheTensorRole::INDEX, index_cache_);
       }
       break;
     default:
@@ -441,12 +433,6 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
         dims, torch::dtype(dtype).device(create_options.device())));
   };
 
-  // DeepSeek V4.1 (contract §2): the pool vector is positional
-  // [swa_count, c2_count, c1_count]; only kv-source layers allocate TOKEN
-  // group tensors (key + index, both in the model dtype — the V4.1 indexer
-  // cache is bf16, NOT cache_policy.index_dtype), all other layers are SWA
-  // only. Ratio-2 kv sources additionally own the fp32 compressor states,
-  // which live in the SWA group (ring slot = pos % block_size).
   if (util::is_deepseek_v41_model_type(create_options.model_type())) {
     const int64_t c2_count = pool_counts[1];
     const int64_t c1_count = pool_counts[2];
@@ -472,7 +458,13 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
           KVCacheTensorRole::INDEX,
           dsv4_block_shape(
               compressed_count, block_size, index_n_heads, index_head_dim),
-          create_options.dtype());
+          cache_policy.index_dtype);
+      if (cache_policy.has_indexer_cache_scale) {
+        tensors.indexer_cache_scale =
+            allocate_tensor(KVCacheTensorRole::INDEX_SCALE,
+                            {compressed_count, block_size, 1},
+                            cache_policy.scale_dtype);
+      }
     }
     tensors.swa_cache = allocate_tensor(
         KVCacheTensorRole::WINDOW,
@@ -481,11 +473,11 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
     if (is_c2_source) {
       tensors.compress_kv_state =
           allocate_tensor(KVCacheTensorRole::KV_STATE,
-                          {swa_count, block_size, head_dim},
+                          {swa_count, kDsv41CompressStateRows, head_dim},
                           torch::kFloat32);
       tensors.compress_score_state =
           allocate_tensor(KVCacheTensorRole::SCORE_STATE,
-                          {swa_count, block_size, head_dim},
+                          {swa_count, kDsv41CompressStateRows, head_dim},
                           torch::kFloat32);
     }
     return tensors;

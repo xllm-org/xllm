@@ -21,7 +21,12 @@ applies the post-attention/FFN recombination (post * x + comb^T @ residual).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
+
+from xllm.python.kernels_npu.op_api import has_op_api
+from xllm.python.platform import current_platform
 
 try:
     hc_pre = torch.ops.xllm_ops.hc_pre
@@ -33,7 +38,37 @@ try:
 except (AttributeError, RuntimeError):
     hc_post = None
 
+
+# Resolve lazily because Torch operators may be registered after this module loads.
+_hc_pre_va_: Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
+
+
+def _resolve_hc_pre_va() -> Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None:
+    global _hc_pre_va_
+    if _hc_pre_va_ is not None:
+        return _hc_pre_va_
+    va_op = getattr(torch.ops.xllm_ops, "hc_pre_va", None)
+    if va_op is not None and current_platform.get_ascend_soc_generation() == "a3" and has_op_api("aclnnHcPreVa"):
+        _hc_pre_va_ = va_op
+        return _hc_pre_va_
+    return None
+
+
+def __getattr__(
+    name: str,
+) -> Callable[..., torch.Tensor] | Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None:
+    if name == "hc_pre_va":
+        return _resolve_hc_pre_va()
+    if name == "hc_post_va":
+        if has_op_api("aclnnHcPostVa"):
+            return getattr(torch.ops.xllm_ops, "hc_post_va", None)
+        return None
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "hc_pre",
+    "hc_pre_va",  # noqa: F822
     "hc_post",
+    "hc_post_va",  # noqa: F822
 ]

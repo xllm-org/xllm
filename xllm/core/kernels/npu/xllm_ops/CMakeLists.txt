@@ -25,6 +25,8 @@ cc_library(
     hc_pre_sinkhorn.cpp
     hc_pre.cpp
     quant_lightning_indexer_metadata.cpp
+    quant_lightning_indexer_v2_metadata.cpp
+    quant_lightning_indexer_v2.cpp
     sparse_attn_sharedkv_metadata.cpp
     npu_inplace_partial_rotary_mul.cpp
     scatter_nd_update.cpp
@@ -40,6 +42,7 @@ cc_library(
     npu_mega_gdn_mtp_decode.cpp
     layer_norm_fwd.cpp
     gamma_add_rms_norm.cpp
+    rms_norm_cast.cpp
     engram_int8_lookup_cpu.cpp
   INCLUDES
     ${PROJECT_SOURCE_DIR}/third_party/xllm_ops/build/autogen

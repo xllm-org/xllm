@@ -43,6 +43,13 @@ class DeepSeekV32Detector : public BaseFormatDetector {
       const std::string& new_text,
       const std::vector<JsonTool>& tools) override;
 
+ protected:
+  DeepSeekV32Detector(const std::string& tool_calls_start_token,
+                      const std::string& tool_calls_end_token,
+                      const std::string& invoke_tag,
+                      const std::string& parameter_tag,
+                      bool defer_partial_nonstring = false);
+
  private:
   std::regex function_calls_regex_;
   std::regex invoke_regex_;
@@ -52,9 +59,11 @@ class DeepSeekV32Detector : public BaseFormatDetector {
   std::regex parameter_regex_;
   std::regex partial_parameter_regex_;
 
+  std::string invoke_start_token_;
   std::string invoke_end_token_;
-  std::vector<std::string> prefix_parameter_end_call_;
+  std::string parameter_end_token_;
   std::string utf8_buffer_;
+  bool defer_partial_nonstring_;
 
   std::string trim_whitespace(std::string_view str) const;
 
@@ -63,7 +72,8 @@ class DeepSeekV32Detector : public BaseFormatDetector {
 
   std::unordered_map<std::string, nlohmann::json> parse_parameters_from_xml(
       const std::string& invoke_content,
-      bool allow_partial = false) const;
+      bool allow_partial = false,
+      std::vector<std::string>* parameter_order = nullptr) const;
 
   std::vector<ToolCallItem> parse_json_tool_calls(
       const std::string& text,

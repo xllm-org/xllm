@@ -862,6 +862,7 @@ def test_moe_dp_rejects_metadata_token_count_mismatch(monkeypatch: pytest.Monkey
         dp_rank=0,
         gate=MagicMock(side_effect=AssertionError("gate should not run")),
         input_ids=None,
+        _GATE_BEFORE_DP=False,
     )
     metadata = SimpleNamespace(dp_execution_token_counts=[3, 4])
     ctx = ForwardContext(

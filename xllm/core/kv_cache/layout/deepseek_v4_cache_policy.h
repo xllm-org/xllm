@@ -21,6 +21,10 @@ limitations under the License.
 
 namespace xllm {
 
+// The compressor needs only the trailing partial group; its state ring stays
+// fixed at 32 rows.
+constexpr int64_t kDsv41CompressStateRows = 32;
+
 struct DeepSeekV4CachePolicy {
   torch::ScalarType index_dtype = torch::kInt8;
   int64_t index_dtype_size = 1;

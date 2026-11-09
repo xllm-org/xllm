@@ -418,6 +418,12 @@ py::dict PyCausalLM::build_config_dict(const ModelContext& context) const {
   d["enable_mmrs_fusion"] = flash_comm1_options.enable_mmrs_fusion;
   d["mmrs_comm_mode"] = flash_comm1_options.mmrs_comm_mode;
   d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
+  if (parallel_args.mc2_group_ != nullptr) {
+    d["mc2_group_info"] =
+        py::make_tuple(parallel_args.mc2_group_->hccl_comm_name(),
+                       parallel_args.mc2_group_->rank(),
+                       parallel_args.mc2_group_->world_size());
+  }
   // Classify the constructed model, including explicit overrides, rather than
   // only the target name.
   const auto& python_model_type = python_model_name_.empty()
@@ -682,6 +688,21 @@ void PyCausalLM::moe_ep_all_reduce(torch::Tensor& tensor) {
   if (moe_ep_group_ != nullptr) {
     moe_ep_group_->allreduce(tensor);
   }
+}
+
+std::optional<std::tuple<std::string, int64_t, int64_t>>
+PyCausalLM::moe_ep_hccl_info(int64_t device_index) {
+#if defined(USE_NPU)
+  if (moe_ep_group_ != nullptr &&
+      moe_ep_group_->device().type() == torch::kPrivateUse1 &&
+      (device_index < 0 || moe_ep_group_->device().index() == device_index) &&
+      moe_ep_group_->world_size() > 1) {
+    return std::make_tuple(moe_ep_group_->hccl_comm_name(/*init_comm=*/true),
+                           static_cast<int64_t>(moe_ep_group_->rank()),
+                           static_cast<int64_t>(moe_ep_group_->world_size()));
+  }
+#endif
+  return std::nullopt;
 }
 
 void PyCausalLM::eplb_batch_isend_irecv(const py::list& operation_types,

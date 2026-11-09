@@ -305,9 +305,9 @@ StreamingParseResult BaseFormatDetector::parse_streaming_increment(
           if (prev_args_it != prev_tool_call_arr_[current_tool_id_].end()) {
             std::string prev_args_json = prev_args_it->second;
             if (cur_args_json != prev_args_json) {
-              std::string prefix(
-                  absl::FindLongestCommonPrefix(prev_args_json, cur_args_json));
-              argument_diff = prefix.substr(sent);
+              const auto prefix =
+                  absl::FindLongestCommonPrefix(prev_args_json, cur_args_json);
+              argument_diff = std::string(prefix.substr(sent));
             }
           }
         }

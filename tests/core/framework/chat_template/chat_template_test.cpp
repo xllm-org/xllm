@@ -20,9 +20,11 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "framework/chat_template/chat_template_factory.h"
 #include "framework/chat_template/deepseek_v32_cpp_template.h"
+#include "framework/chat_template/deepseek_v41_cpp_template.h"
 #include "framework/chat_template/deepseek_v4_cpp_template.h"
 #include "framework/chat_template/jinja_chat_template.h"
 #include "framework/tokenizer/tokenizer_args.h"
+#include "function_call/function_call_parser.h"
 
 namespace xllm {
 namespace {
@@ -81,6 +83,26 @@ TEST(ChatTemplateFactory, DeepseekV4UsesCppTemplateWhenFlagEnabled) {
   EXPECT_NE(dynamic_cast<DeepseekV4CppTemplate*>(impl.get()), nullptr);
 }
 
+TEST(ChatTemplateFactory, DeepseekV41UsesCppTemplateWhenEnabled) {
+  ScopedUseCppChatTemplate scoped_flag(true);
+  auto impl = ChatTemplateFactory::create(TokenizerArgs{}, "deepseek_v41");
+  ASSERT_NE(impl, nullptr);
+  ASSERT_NE(dynamic_cast<DeepseekV41CppTemplate*>(impl.get()), nullptr);
+  EXPECT_EQ(dynamic_cast<DeepseekV4CppTemplate*>(impl.get()), nullptr);
+  const auto prompt = impl->apply({{"user", "hello"}});
+  ASSERT_TRUE(prompt.has_value());
+  EXPECT_NE(prompt->find("<｜System｜>Reasoning Effort: 50"),
+            std::string::npos);
+}
+
+TEST(ChatTemplateFactory, DeepseekV41UsesJinjaWhenDisabled) {
+  ScopedUseCppChatTemplate scoped_flag(false);
+  auto impl = ChatTemplateFactory::create(TokenizerArgs{}, "deepseek_v41");
+  ASSERT_NE(impl, nullptr);
+  EXPECT_NE(dynamic_cast<JinjaChatTemplate*>(impl.get()), nullptr);
+  EXPECT_EQ(dynamic_cast<DeepseekV41CppTemplate*>(impl.get()), nullptr);
+}
+
 TEST(ChatTemplateFactory, NonDeepseekModelUsesJinjaWhenFlagEnabled) {
   ScopedUseCppChatTemplate scoped_flag(/*enabled=*/true);
   TokenizerArgs args;
@@ -93,6 +115,36 @@ TEST(ChatTemplateFactory, NonDeepseekModelUsesJinjaWhenFlagEnabled) {
   EXPECT_NE(dynamic_cast<JinjaChatTemplate*>(impl.get()), nullptr);
   EXPECT_EQ(dynamic_cast<DeepseekV32CppTemplate*>(impl.get()), nullptr);
   EXPECT_EQ(dynamic_cast<DeepseekV4CppTemplate*>(impl.get()), nullptr);
+}
+
+TEST(ChatTemplateFactory, DeepseekToolDialectMatchesAutoParser) {
+  ScopedUseCppChatTemplate scoped_flag(true);
+  for (const auto& model :
+       {std::string("deepseek_v4"), std::string("deepseek_v41")}) {
+    SCOPED_TRACE(model);
+    auto encoder = ChatTemplateFactory::create(TokenizerArgs{}, model);
+    ASSERT_NE(encoder, nullptr);
+    Message message("assistant", "");
+    Message::ToolCall call;
+    call.id = "lookup-call";
+    call.type = "function";
+    call.function.name = "lookup";
+    call.function.arguments = R"({"city":"北京","days":2})";
+    message.tool_calls = Message::ToolCallVec{call};
+    const auto prompt = encoder->apply({message}, {}, {{"thinking", false}});
+    ASSERT_TRUE(prompt.has_value());
+    const std::vector<JsonTool> tools{JsonTool(
+        "function", JsonFunction("lookup", "Lookup", {{"type", "object"}}))};
+    function_call::FunctionCallParser parser(
+        tools,
+        function_call::FunctionCallParser::get_parser_auto("auto", model));
+    ASSERT_TRUE(parser.has_tool_call(*prompt));
+    const auto [text, calls] = parser.parse_non_stream(*prompt);
+    ASSERT_EQ(calls.size(), 1);
+    EXPECT_EQ(*calls[0].name, "lookup");
+    EXPECT_EQ(nlohmann::json::parse(calls[0].parameters),
+              nlohmann::json::parse(call.function.arguments));
+  }
 }
 
 }  // namespace

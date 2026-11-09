@@ -35,6 +35,31 @@ limitations under the License.
 namespace xllm::kernel::npu {
 inline constexpr int64_t kDsaMetadataBufferElements = 1024;
 
+namespace detail {
+
+inline torch::Tensor materialize_int32_metadata(
+    const std::optional<torch::Tensor>& tensor,
+    const torch::Device& device) {
+  return tensor.has_value()
+             ? tensor.value()
+             : torch::empty({0}, torch::dtype(torch::kInt32).device(device));
+}
+
+inline at::SmallVector<int64_t, 8> qli_output_size(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    int64_t last_dim,
+    const std::string& query_layout,
+    const std::string& key_layout) {
+  const int64_t key_heads = key.size(key_layout == "TND" ? 1 : 2);
+  if (query_layout == "BSND") {
+    return {query.size(0), query.size(1), key_heads, last_dim};
+  }
+  return {query.size(0), key_heads, last_dim};
+}
+
+}  // namespace detail
+
 namespace op_infer {
 constexpr int32_t N = 32;
 // npu tensor max size
@@ -149,6 +174,11 @@ at::Tensor hc_post(const at::Tensor& x,
                    const at::Tensor& post,
                    const at::Tensor& comb);
 
+torch::Tensor hc_post_va(const torch::Tensor& x,
+                         const torch::Tensor& residual,
+                         const torch::Tensor& post,
+                         const torch::Tensor& comb);
+
 std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -210,6 +240,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gamma_add_rms_norm(
     double epsilon,
     bool add_gamma_offset);
 
+std::tuple<torch::Tensor, torch::Tensor> rms_norm_cast_va(
+    const torch::Tensor& x,
+    const torch::Tensor& gamma,
+    double epsilon);
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_sinkhorn(
     const at::Tensor& mixes,
     const at::Tensor& rsqrt,
@@ -229,6 +264,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre(
     int64_t hc_sinkhorn_iters,
     double norm_eps,
     double hc_eps);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+hc_pre_va(const torch::Tensor& hidden,
+          const torch::Tensor& hc_fn,
+          const torch::Tensor& hc_scale,
+          const torch::Tensor& hc_base,
+          const std::optional<torch::Tensor>& pre_mix,
+          int64_t hc_mult,
+          int64_t hc_sinkhorn_iters,
+          double norm_eps,
+          double hc_eps);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
     const at::Tensor& x,
@@ -438,6 +484,53 @@ at::Tensor quant_lightning_indexer_metadata(
     int64_t next_tokens,
     int64_t cmp_ratio,
     const c10::string_view device);
+
+torch::Tensor quant_lightning_indexer_v2_metadata_va(
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t topk,
+    int64_t quant_mode,
+    const std::optional<torch::Tensor>& cu_seqlens_q,
+    const std::optional<torch::Tensor>& cu_seqlens_k,
+    const std::optional<torch::Tensor>& seqused_q,
+    const std::optional<torch::Tensor>& seqused_k,
+    const std::optional<torch::Tensor>& cmp_residual_k,
+    int64_t batch_size,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
+    int64_t cmp_ratio,
+    c10::string_view device);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+quant_lightning_indexer_v2_va(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& weights,
+    const torch::Tensor& query_dequant_scale,
+    const torch::Tensor& key_dequant_scale,
+    int64_t topk,
+    int64_t quant_mode,
+    const std::optional<torch::Tensor>& candidate_topk_index,
+    const std::optional<torch::Tensor>& cu_seqlens_q,
+    const std::optional<torch::Tensor>& cu_seqlens_k,
+    const std::optional<torch::Tensor>& seqused_q,
+    const std::optional<torch::Tensor>& seqused_k,
+    const std::optional<torch::Tensor>& cmp_residual_k,
+    const std::optional<torch::Tensor>& block_table,
+    const std::optional<torch::Tensor>& output_idx_offset,
+    const std::optional<torch::Tensor>& metadata,
+    int64_t max_seqlen_q,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
+    int64_t cmp_ratio,
+    int64_t candidate_mode,
+    int64_t candidate_topk_blocks,
+    int64_t candidate_block_size);
 
 at::Tensor sparse_attn_sharedkv_metadata(
     int64_t num_heads_q,

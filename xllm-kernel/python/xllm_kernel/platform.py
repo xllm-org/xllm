@@ -255,12 +255,9 @@ class Platform:
         ``acl``.
         """
         chip = _npu_chip_from_smi()
-        if chip is not None:
+        if chip is not None and chip != "910":
             return chip
-        chip = _npu_chip_from_acl()
-        if chip is not None:
-            return chip
-        return "unknown"
+        return _npu_chip_from_acl() or chip or "unknown"
 
     @classmethod
     @functools.lru_cache(maxsize=1)

@@ -1240,6 +1240,9 @@ class DeepseekV4MoE(nn.Module):
     FusedMoEImpl::forward_with_selected_experts.
     """
 
+    _SHARED_MLP_CLS = DeepseekV3MLP
+    _GATE_BEFORE_DP = False
+
     def __init__(self, cfg: DeepseekV4Config, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
@@ -1315,7 +1318,7 @@ class DeepseekV4MoE(nn.Module):
         # Shared expert uses the orthogonal MoE TP group, matching C++
         # FusedMoEImpl. skip_tp_reduce keeps collective ordering in this class.
         shared_cfg = replace(cfg, tp_size=self.moe_tp_size, tp_rank=self.moe_tp_rank)
-        self.shared_experts = DeepseekV3MLP(
+        self.shared_experts = self._SHARED_MLP_CLS(
             shared_cfg,
             cfg.moe_intermediate_size * cfg.n_shared_experts,
             dtype,
@@ -1376,8 +1379,28 @@ class DeepseekV4MoE(nn.Module):
         self.shared_experts.gate_up_proj.process_weights_after_loading()
         self.shared_experts.down_proj.process_weights_after_loading()
 
-    def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def _apply_post_norm(self, hidden: torch.Tensor, post_norm: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized = post_norm(hidden)
+        return normalized, normalized.to(torch.float32)
+
+    def _prepare_moe_gate(self, hidden: torch.Tensor, post_norm: nn.Module | None) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._GATE_BEFORE_DP and hidden.size(0) == 0:
+            return hidden, hidden.new_empty((0, self.num_total_experts), dtype=torch.float32)
+        if post_norm is None:
+            gate_input = hidden.to(torch.float32)
+        else:
+            hidden, gate_input = self._apply_post_norm(hidden, post_norm)
+        return hidden, self.gate(gate_input)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        post_norm: nn.Module | None = None,
+    ) -> torch.Tensor:
         local_tokens = hidden.shape[0]
+        if self._GATE_BEFORE_DP:
+            hidden, logits = self._prepare_moe_gate(hidden, post_norm)
         hidden, scatter_state = dp_gather_tokens(hidden, self.dp_size, self.dp_rank)
 
         # Prepare input_ids: reshape to 1D + move to hidden's device (C++ :202-216).
@@ -1397,8 +1420,11 @@ class DeepseekV4MoE(nn.Module):
                 gate_input_ids, _ = dp_gather_tokens(ids_for_gate, self.dp_size, self.dp_rank)
 
         # 1) Gate: compute logits + moe_gating_top_k_hash.
-        gate_input = hidden.to(torch.float32)
-        logits = self.gate(gate_input)
+        if self._GATE_BEFORE_DP:
+            if self.dp_size > 1:
+                logits, _ = dp_gather_tokens(logits, self.dp_size, self.dp_rank)
+        else:
+            hidden, logits = self._prepare_moe_gate(hidden, post_norm)
         norm_type = {"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}.get(self.scoring_func, 2)
         renorm = 0 if norm_type == 2 else 1
 

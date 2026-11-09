@@ -21,8 +21,10 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <torch/csrc/distributed/c10d/Work.hpp>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -130,6 +132,8 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
       const std::vector<int32_t>& execution_token_counts);
   void moe_tp_all_reduce(torch::Tensor& tensor);
   void moe_ep_all_reduce(torch::Tensor& tensor);
+  std::optional<std::tuple<std::string, int64_t, int64_t>> moe_ep_hccl_info(
+      int64_t device_index);
   void eplb_batch_isend_irecv(const pybind11::list& operation_types,
                               const pybind11::list& tensors,
                               const pybind11::list& remote_ranks);

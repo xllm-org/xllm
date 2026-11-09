@@ -20,17 +20,6 @@ limitations under the License.
 
 namespace xllm::kernel::npu {
 
-namespace {
-
-auto get_valid_tensor = [](const c10::optional<at::Tensor>& tensor_opt,
-                           at::Device device) {
-  return tensor_opt.has_value()
-             ? tensor_opt
-             : torch::empty({0}, torch::dtype(torch::kInt32).device(device));
-};
-
-}  // namespace
-
 at::Tensor quant_lightning_indexer_metadata(
     int64_t num_heads_q,
     int64_t num_heads_k,
@@ -60,10 +49,10 @@ at::Tensor quant_lightning_indexer_metadata(
   at::Tensor output =
       torch::zeros({kDsaMetadataBufferElements},
                    torch::dtype(torch::kInt32).device(output_device));
-  auto actual_seq_lengths_query_val =
-      get_valid_tensor(actual_seq_lengths_query, output_device);
+  auto actual_seq_lengths_query_val = detail::materialize_int32_metadata(
+      actual_seq_lengths_query, output_device);
   auto actual_seq_lengths_key_val =
-      get_valid_tensor(actual_seq_lengths_key, output_device);
+      detail::materialize_int32_metadata(actual_seq_lengths_key, output_device);
 
   // convert str
   std::string layout_query_str = std::string(layout_query);

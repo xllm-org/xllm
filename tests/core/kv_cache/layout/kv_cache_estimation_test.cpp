@@ -40,6 +40,13 @@ namespace {
 
 class DcpIndexerEstimationTest : public test::DcpIndexerConfigTest {};
 
+constexpr int64_t kDsv41SwaBlockBytes = 6 * 128 * 16 * 4 + 2 * 32 * 16 * 4;
+#if defined(USE_MLU)
+constexpr int64_t kDsv41TokenBlockBytes = 128 * (16 * 4 + 8 * 4);
+#else
+constexpr int64_t kDsv41TokenBlockBytes = 128 * (16 * 4 + 8 + 2);
+#endif
+
 class VirtualMemoryPrefixEstimationTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -1896,16 +1903,12 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV41Pools) {
       .compress_ratios({0, 0, 2, 2, 1, 1})
       .kv_source_layer_ids({2, 4});
 
-  // Cost model (see estimate_dsv41_kv_cache_cost): every layer pays
-  // 128 * 16 * 4 = 8192 B of SWA window per block and the single ratio-2
-  // kv source adds 2 * 128 * 16 * 4 = 16384 B of fp32 kv/score state, so
-  // swa_bytes_per_block = 5 * 8192 + (8192 + 16384) = 65536 B. One TOKEN
-  // block is 128 * (16 + 8) * 4 = 12288 B; a 2-engine-block unit holds one
-  // c2 block plus two c1 blocks = 36864 B.
+  // Keep the expected byte counts independent of the estimator helpers.
   KVCacheEstimateOptions options;
   options.dtype = torch::kFloat32;
   options.kv_cache_dtype = "auto";
-  options.cache_size_in_bytes = /*swa=*/27 * 65536 + /*ten units=*/10 * 36864;
+  options.cache_size_in_bytes =
+      27 * kDsv41SwaBlockBytes + 10 * 3 * kDsv41TokenBlockBytes;
   options.block_size = 128;
   options.max_seqs_per_batch = 4;
   options.max_tokens_per_batch = 2176;
@@ -1962,7 +1965,8 @@ TEST(KVCacheEstimationTest, DeepSeekV41RejectsBudgetWithoutTokenCacheUnit) {
   KVCacheEstimateOptions options;
   options.dtype = torch::kFloat32;
   options.kv_cache_dtype = "auto";
-  options.cache_size_in_bytes = /*swa=*/27 * 65536 + /*remaining_bytes=*/1;
+  options.cache_size_in_bytes =
+      27 * kDsv41SwaBlockBytes + 3 * kDsv41TokenBlockBytes - 1;
   options.block_size = 128;
   options.max_seqs_per_batch = 4;
   options.max_tokens_per_batch = 2176;
@@ -1971,6 +1975,14 @@ TEST(KVCacheEstimationTest, DeepSeekV41RejectsBudgetWithoutTokenCacheUnit) {
       estimate_kv_cache_capacity(model_args, options),
       "minimum DSV4 SWA cache leaves insufficient memory for one compressed "
       "cache unit");
+
+  ++options.cache_size_in_bytes;
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(capacity.swa_count(), 27);
+  EXPECT_EQ(capacity.c2_count(), 1);
+  EXPECT_EQ(capacity.c1_count(), 2);
+  EXPECT_EQ(capacity.n_blocks(), 2);
 }
 
 #if defined(USE_NPU)

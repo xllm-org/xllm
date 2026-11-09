@@ -451,14 +451,31 @@ def moe_ep_all_reduce(x: torch.Tensor) -> None:
 def moe_ep_hccl_info(device: torch.device | str) -> tuple[str, int, int]:
     """Return the initialized expert group's HCCL name, rank and size."""
     device_obj = torch.device(device)
-    group = get_process_group(device_obj, "moe_ep")
-    rank, world_size = group.rank(), group.size()
+    group = _groups.get(("moe_ep", str(device_obj)))
+    if group is None:
+        native_info = None
+        if device_obj.type == "npu":
+            try:
+                import xllm_runtime
+            except ImportError:
+                pass
+            else:
+                query = getattr(xllm_runtime, "moe_ep_hccl_info", None)
+                if query is not None:
+                    native_info = query(device_obj.index if device_obj.index is not None else -1)
+        if native_info is None:
+            group = get_process_group(device_obj, "moe_ep")
+        else:
+            comm_name, rank, world_size = native_info
+    if group is not None:
+        rank, world_size = group.rank(), group.size()
     if world_size <= 1 or not 0 <= rank < world_size:
         raise RuntimeError(f"MoE EP dispatch requires an initialized multi-rank group: rank {rank}/{world_size}")
-    get_comm_name = getattr(group._get_backend(device_obj), "get_hccl_comm_name", None)
-    if get_comm_name is None:
-        raise RuntimeError("MoE EP dispatch requires an HCCL process group")
-    comm_name = get_comm_name(rank)
+    if group is not None:
+        get_comm_name = getattr(group._get_backend(device_obj), "get_hccl_comm_name", None)
+        if get_comm_name is None:
+            raise RuntimeError("MoE EP dispatch requires an HCCL process group")
+        comm_name = get_comm_name(rank)
     if not isinstance(comm_name, str) or not comm_name:
         raise RuntimeError("MoE EP dispatch requires a nonempty HCCL communication name")
     return comm_name, rank, world_size

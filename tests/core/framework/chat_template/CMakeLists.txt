@@ -8,10 +8,12 @@ cc_test (
     chat_template_test.cpp
   DEPS
     :config
+    :function_call
     :chat_template_factory
     :jinja_chat_template
     :deepseek_v32_cpp_template
     :deepseek_v4_cpp_template
+    :deepseek_v41_cpp_template
     GTest::gtest_main
 )
 
@@ -45,5 +47,16 @@ cc_test (
     deepseek_v4_cpp_template_test.cpp
   DEPS
     :deepseek_v4_cpp_template
+    GTest::gtest_main
+)
+
+cc_test (
+  CPU_ONLY
+  NAME
+    deepseek_v41_cpp_template_test
+  SRCS
+    deepseek_v41_cpp_template_test.cpp
+  DEPS
+    :deepseek_v41_cpp_template
     GTest::gtest_main
 )

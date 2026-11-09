@@ -86,7 +86,6 @@ def test_sparse_tail_matches_global_query_reference(monkeypatch: pytest.MonkeyPa
     backend.scale = width**-0.5
     backend._kv_caches = [SimpleNamespace(swa=None)]
     backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
-    backend._smla_fallback_reason = lambda *_: "switch off"
     layer = SimpleNamespace(
         mode=SimpleNamespace(compress_ratio=0), layer_id=0, attn_sink=torch.randn(heads), _csa2_ctx=None
     )
@@ -142,7 +141,6 @@ def test_cp_execution_keeps_full_layer_context_and_passes_query_plan(monkeypatch
     backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
     backend._current_forward_metadata = lambda: metadata
     backend._shared_runtime = CSA2SharedRuntime
-    backend._smla_fallback_reason = lambda *_: "switch off"
     reference = backend._csa2_attention(q, kv, layer, dsa, q_lens, lengths, None, CSA2SharedRuntime())
     calls = []
 
@@ -268,7 +266,6 @@ def test_compressed_picks_use_global_chunk_offset(
     backend._kv_caches = [SimpleNamespace(swa=None)]
     backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
     backend._current_forward_metadata = lambda: SimpleNamespace(dsa_metadata=global_dsa)
-    backend._smla_fallback_reason = lambda *_: "switch off"
     if not graph_mode:
         backend._committed_capacity = lambda *_: capacity
     backend._gather_cache_rows = lambda cache, table, seq, count, size: compressed[seq]

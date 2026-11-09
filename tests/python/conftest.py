@@ -148,6 +148,7 @@ def _model_cpu_normalization(request: pytest.FixtureRequest, monkeypatch: pytest
         "test_glm5_next_dsa",
         "test_glm53flash_rms_norm",
         "test_deepseek_v41_model",
+        "test_deepseek_v41_rms_norm",
     }:
         return
     from xllm.python import kernels

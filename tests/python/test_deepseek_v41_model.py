@@ -28,6 +28,7 @@ import torch.nn as nn
 
 from tests.python._engram_reference import _engram_test_layout, _engram_test_token_map, _tiny_engram_hash_state
 from xllm.python import distributed
+from xllm.python.attention import csa2_attention
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa2_attention import (
     Csa2AttentionBackend,
@@ -36,7 +37,9 @@ from xllm.python.attention.csa2_attention import (
     _derive_graph_token_capacity_granularity,
     _indexer_score,
     _indexer_topk,
+    _quantize_indexer_rows_int8,
     _select_candidate_blocks,
+    _v41_compressor_swa_gate,
     _window_visible_idxs,
     apply_interleaved_rope,
 )
@@ -44,6 +47,7 @@ from xllm.python.attention.dsa_metadata import (
     DSA_CACHE_SLIDING_WINDOW,
     DSA_CACHE_TOKEN,
     DsaMetadata,
+    DsaMetadataBuilder,
     build_cache_specs_v41,
 )
 from xllm.python.layers import moe_parallel
@@ -67,7 +71,6 @@ from xllm.python.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
     DeepseekV41MoE,
-    fp4_act_qdq_e8m0,
 )
 from xllm.python.models.deepseek_v41_engram import (
     ENGRAM_IMAGE_SENTINEL_BASE_ID,
@@ -75,17 +78,12 @@ from xllm.python.models.deepseek_v41_engram import (
     Engram,
     EngramEmbedding,
     EngramLayout,
-    build_compressed_token_map_from_texts,
     load_quarot_gate_unrotate,
-    normalize_token_text,
 )
 from xllm.python.platform import current_platform
 from xllm.python.registry import get_model_class
 
 
-# DeepSeek-V4.1 is NPU-only: ModelExecutor binds the CSA2 attention backend,
-# which has no CPU/CUDA implementation. Tests that drive the executor skip on
-# hosts without an NPU instead of monkeypatching a backend in.
 def _npu_available() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
@@ -355,7 +353,6 @@ def test_dsa_cp_all_batch_types_match_original_tp(monkeypatch: pytest.MonkeyPatc
     backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
     backend._current_forward_metadata = lambda: context.metadata
     backend._shared_runtime = CSA2SharedRuntime
-    backend._smla_fallback_reason = lambda *_: "switch off"
     reference = None
     exchange_calls = 0
 
@@ -399,7 +396,6 @@ def test_dsa_cp_all_batch_types_match_original_tp(monkeypatch: pytest.MonkeyPatc
         received[:tokens] = reference[:, rank * heads : (rank + 1) * heads]
         return received
 
-    monkeypatch.setattr(dq, "fp8_act_qdq", lambda x, *_: x)
     monkeypatch.setattr(distributed, "all_to_all", _exchange, raising=False)
     monkeypatch.setattr(distributed, "tp_all_reduce", lambda x: x)
     metadata = SimpleNamespace(
@@ -637,16 +633,17 @@ def test_moe_expert_stack_is_one_storage_with_read_only_halves() -> None:
         moe.experts_w1 = torch.empty(0)
 
 
-def test_registry_resolves_deepseek_v41() -> None:
-    """V4.1 is registered, and NPU-gated: non-NPU platforms fail fast."""
-    names = ("deepseek_v41", "DeepseekV41ForCausalLM")
-    if _npu_available():
-        for name in names:
+@pytest.mark.parametrize("platform", ["npu", "cuda", "mlu", "cpu"])
+def test_registry_resolves_deepseek_v41(monkeypatch: pytest.MonkeyPatch, platform: str) -> None:
+    import xllm.python.registry as registry
+
+    monkeypatch.setattr(registry, "current_platform", SimpleNamespace(device_type=lambda: platform))
+    for name in ("deepseek_v41", "DeepseekV41ForCausalLM"):
+        if platform == "npu":
             assert get_model_class(name).__name__ == "DeepseekV41ForCausalLM"
-        return
-    for name in names:
-        with pytest.raises(NotImplementedError, match="supported platforms: \\['npu'\\]"):
-            get_model_class(name)
+        else:
+            with pytest.raises(NotImplementedError, match="supported platforms: \\['npu'\\]"):
+                get_model_class(name)
 
 
 def test_attention_backend_rejects_v41_off_npu(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1021,65 +1018,7 @@ def test_ascend_load_requires_constructed_compressor_and_indexer(
         lm.load_weights([_FakeStateDict(tensors)], 0, 1)
 
 
-# V4.1 quant kernels, inlined in deepseek_v41 (semantics doc sections 2.1-2.5)
-# ---------------------------------------------------------------------------
-
-_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-def _round_e2m1_slow(value: float) -> float:
-    """Independent slow E2M1 rounding: nearest value, ties to even mantissa."""
-    magnitude = abs(value)
-    below = max((g for g in _E2M1_GRID if g <= magnitude), default=0.0)
-    above = min((g for g in _E2M1_GRID if g >= magnitude), default=6.0)
-    if magnitude - below < above - magnitude:
-        nearest = below
-    elif magnitude - below > above - magnitude:
-        nearest = above
-    else:
-        nearest = below if _E2M1_GRID.index(below) % 2 == 0 else above
-    return -nearest if value < 0 else nearest
-
-
-def _expected_fp8_act_qdq(x: torch.Tensor, group: int) -> torch.Tensor:
-    shape = x.shape
-    grouped = x.float().reshape(-1, group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(1e-4)
-    t = amax * torch.tensor(1.0 / 448.0, dtype=torch.float32)
-    scale = torch.exp2(torch.ceil(torch.log2(t.double()))).float()
-    normalized = (grouped / scale.unsqueeze(-1)).clamp(-448.0, 448.0)
-    return (normalized.to(torch.float8_e4m3fn).float() * scale.unsqueeze(-1)).reshape(shape)
-
-
-def _expected_fp4_e8m0(x: torch.Tensor, group: int) -> torch.Tensor:
-    shape = x.shape
-    grouped = x.float().reshape(-1, group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(6.0 * 2.0**-126)
-    t = amax * torch.tensor(1.0 / 6.0, dtype=torch.float32)
-    scale = torch.exp2(torch.ceil(torch.log2(t.double()))).float()
-    normalized = (grouped / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
-    rounded = torch.tensor(
-        [_round_e2m1_slow(v) for v in normalized.flatten().tolist()],
-        dtype=torch.float32,
-    ).reshape(normalized.shape)
-    return (rounded * scale.unsqueeze(-1)).reshape(shape)
-
-
-def _expected_fp4_e4m3(x: torch.Tensor, group: int) -> torch.Tensor:
-    shape = x.shape
-    grouped = x.float().reshape(-1, group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(6.0 * 2.0**-9)
-    scale = (amax / 6.0).to(torch.float8_e4m3fn).float()
-    normalized = (grouped / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
-    rounded = torch.tensor(
-        [_round_e2m1_slow(v) for v in normalized.flatten().tolist()],
-        dtype=torch.float32,
-    ).reshape(normalized.shape)
-    return (rounded * scale.unsqueeze(-1)).reshape(shape)
-
-
 def _make_block_quantized(out_dim: int, in_dim: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Builds a synthetic 32x32-block FP8 weight that round-trips exactly."""
     blocks_out = -(-out_dim // 32)
     blocks_in = -(-in_dim // 32)
     exponents = torch.randint(-8, 9, (blocks_out, blocks_in))
@@ -1140,85 +1079,14 @@ def test_dequant_fp4_group_known_scales() -> None:
     torch.manual_seed(3)
     n, k = 8, 96
     packed = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8).view(torch.int8)
-    # Group scales 2^0, 2^1, 2^-2 for column blocks [0:32), [32:64), [64:96).
     scale_bytes = torch.tensor([[0x7F, 0x80, 0x7D]] * n, dtype=torch.uint8)
     out = dq.dequant_fp4_group(packed, scale_bytes)
     unpacked = dq.unpack_fp4(packed, dtype=torch.float32)
     scales = torch.tensor([1.0, 2.0, 0.25]).repeat_interleave(32)
     assert out.dtype == torch.bfloat16 and out.shape == (n, k)
     assert torch.equal(out, (unpacked * scales).to(torch.bfloat16))
-    # Zero scale bytes decode to 2**-127 (16 packed bytes = 32 elements = one group).
     zero_out = dq.dequant_fp4_group(packed[:, :16], torch.zeros(n, 1, dtype=torch.uint8))
     assert torch.equal(zero_out, (unpacked[:, :32] * 2.0**-127).to(torch.bfloat16))
-
-
-def test_fp8_act_qdq_known_and_reference() -> None:
-    # amax = 448 gives scale exactly 1: values round straight through the e4m3
-    # grid (100 -> 96, 300 -> 288, round-to-nearest-even; 449 saturates).
-    x = torch.tensor([[448.0, 224.0, 1.0, 0.0, -448.0, 100.0, 0.5, 300.0]])
-    expected = torch.tensor([[448.0, 224.0, 1.0, 0.0, -448.0, 96.0, 0.5, 288.0]])
-    assert torch.equal(dq.fp8_act_qdq(x, group=8), expected)
-    assert torch.all(dq.fp8_act_qdq(torch.full((1, 32), 449.0), group=32) == 448.0)
-    torch.manual_seed(6)
-    xr = (torch.randn(4, 128) * 7).to(torch.bfloat16)
-    xr[:, :5] = 0
-    out = dq.fp8_act_qdq(xr, group=32)
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out.float(), _expected_fp8_act_qdq(xr, 32))
-    assert torch.all(out[:, :5] == 0)
-
-
-def test_fp4_act_qdq_e8m0_known_and_reference() -> None:
-    # amax = 12 -> s = 2; includes every tie case, which must round to the
-    # even E2M1 neighbor (0.75 -> 1, 1.25 -> 1, 1.75 -> 2, 2.5 -> 2 after /s).
-    x = torch.tensor(
-        [[6.0, 3.0, 1.5, 0.75, 0.25, 0.0, -6.0, -0.75, 12.0, 5.0, 2.5, 3.5, 0.5, 1.0, 4.0, 0.26]],
-        dtype=torch.bfloat16,
-    )
-    expected = torch.tensor([[6, 3, 2, 1, 0, 0, -6, -1, 12, 4, 2, 4, 0, 1, 4, 0]], dtype=torch.bfloat16)
-    assert torch.equal(dq.fp4_act_qdq_e8m0(x, group=16), expected)
-    torch.manual_seed(8)
-    xr = (torch.randn(4, 128) * 3).to(torch.bfloat16)
-    xr[:, :5] = 0
-    out = dq.fp4_act_qdq_e8m0(xr, group=32)
-    assert torch.equal(out.float(), _expected_fp4_e8m0(xr, 32))
-    # All-zero group stays zero.
-    assert torch.all(dq.fp4_act_qdq_e8m0(torch.zeros(2, 32, dtype=torch.bfloat16), group=32) == 0)
-
-
-def test_fp4_act_qdq_e4m3_scale_known_and_reference() -> None:
-    # s = e4m3(amax / 6) is NOT a power of two (e.g. 1 -> 0.171875).
-    cases = [
-        (6.0, 6.0),  # s = e4m3(1) = 1
-        (1.0, 1.03125),  # s = e4m3(1/6) = 0.171875
-        (0.0234375, 0.0234375),  # 6 * 2**-8: s = 2**-8 exactly
-        (5.0, 4.875),  # s = e4m3(5/6) = 0.8125; 5/0.8125 rounds to 6
-        (0.0, 0.0),  # all-zero group: amax floor 6 * 2**-9
-    ]
-    for value, expected in cases:
-        out = dq.fp4_act_qdq_e4m3_scale(torch.tensor([value]), group=1)
-        assert out.item() == expected, (value, out.item(), expected)
-    torch.manual_seed(9)
-    xr = (torch.randn(4, 128) * 2).to(torch.bfloat16)
-    xr[:, :3] = 0
-    out = dq.fp4_act_qdq_e4m3_scale(xr, group=16)
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out.float(), _expected_fp4_e4m3(xr, 16))
-
-
-def test_qdq_rejects_indivisible_group() -> None:
-    x = torch.randn(2, 40)
-    with pytest.raises(ValueError):
-        dq.fp8_act_qdq(x, group=32)
-    with pytest.raises(ValueError):
-        dq.fp4_act_qdq_e8m0(x, group=32)
-    with pytest.raises(ValueError):
-        dq.fp4_act_qdq_e4m3_scale(x, group=16)
-
-
-# ---------------------------------------------------------------------------
-# Cache layout (adaptation contract section 2)
-# ---------------------------------------------------------------------------
 
 
 def test_build_cache_specs_v41() -> None:
@@ -1320,19 +1188,12 @@ def _graph_admission_cfg() -> DeepseekV41Config:
     [(V41_QUANT_ASCEND, True), (V41_QUANT_FP8, False), (V41_QUANT_NONE, False)],
 )
 def test_csa2_marks_moe_graph_capability_from_quant_mode(quant_mode: str, expected: bool) -> None:
-    """Only the W8A8 (ascend) export has an ACL-graph-capturable MoE chain."""
     backend = _make_csa2_backend(_graph_admission_cfg(), torch.device("cpu"), quant_mode=quant_mode)
     assert backend.quant_mode == quant_mode
     assert backend.moe_graph_capturable is expected
 
 
-def test_csa2_acl_graph_capacity_is_checked_at_construction(monkeypatch: pytest.MonkeyPatch) -> None:
-    """C: fail at startup, not at the first captured forward.
-
-    A derivable ``max_model_len`` or an explicit env value satisfies the check;
-    a non-capturable quant mode never reaches it (graph is disabled anyway).
-    """
-    monkeypatch.delenv("XLLM_V41_GRAPH_CAPACITY_GRANULARITY", raising=False)
+def test_csa2_acl_graph_capacity_is_checked_at_construction() -> None:
     cfg = _graph_admission_cfg()
 
     derived = _make_csa2_backend(
@@ -1360,17 +1221,6 @@ def test_csa2_acl_graph_capacity_is_checked_at_construction(monkeypatch: pytest.
         acl_graph_enabled=True,
         max_model_len=0,
     )
-
-    # An explicit env value overrides the derivation and satisfies the check.
-    monkeypatch.setenv("XLLM_V41_GRAPH_CAPACITY_GRANULARITY", "8192")
-    explicit = _make_csa2_backend(
-        cfg,
-        torch.device("cpu"),
-        quant_mode=V41_QUANT_ASCEND,
-        acl_graph_enabled=True,
-        max_model_len=0,
-    )
-    assert explicit.graph_token_capacity_granularity == 8192
 
 
 def test_graph_token_capacity_granularity_caps_the_serving_bound() -> None:
@@ -1404,6 +1254,7 @@ def _allocate_v41_layer_caches(
     device: torch.device | None = None,
     *,
     reserve_token_sink: bool = False,
+    reserve_swa_sink: bool = False,
 ) -> list[LayerCache]:
     """LayerCache tensors for the contract-section-2 layout.
 
@@ -1415,7 +1266,13 @@ def _allocate_v41_layer_caches(
     device = device or torch.device("cpu")
 
     def swa(dtype_: torch.dtype = dtype) -> torch.Tensor:
-        return torch.zeros(_SWA_RING_BLOCKS * n_seqs, cfg.window_size, cfg.head_dim, dtype=dtype_, device=device)
+        return torch.zeros(
+            _SWA_RING_BLOCKS * n_seqs + int(reserve_swa_sink),
+            cfg.window_size,
+            cfg.head_dim,
+            dtype=dtype_,
+            device=device,
+        )
 
     token_blocks = n_seqs + 1 if reserve_token_sink else n_seqs
     caches: list[LayerCache] = []
@@ -1429,10 +1286,27 @@ def _allocate_v41_layer_caches(
             LayerCache(
                 key=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, cfg.head_dim, dtype=dtype, device=device),
                 value=None,
-                index=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, cfg.index_head_dim, dtype=dtype, device=device),
+                index=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, cfg.index_head_dim, dtype=torch.int8, device=device),
                 swa=swa(),
-                compress_kv_state=swa(torch.float32) if states else None,
-                compress_score_state=swa(torch.float32) if states else None,
+                compress_kv_state=torch.zeros(
+                    _SWA_RING_BLOCKS * n_seqs + int(reserve_swa_sink),
+                    32,
+                    cfg.head_dim,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if states
+                else None,
+                compress_score_state=torch.zeros(
+                    _SWA_RING_BLOCKS * n_seqs + int(reserve_swa_sink),
+                    32,
+                    cfg.head_dim,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if states
+                else None,
+                indexer_scale=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, 1, dtype=torch.float16, device=device),
             )
         )
     return caches
@@ -1459,13 +1333,15 @@ class _V41ForwardHarness:
         self.n_seqs = n_seqs
         self.dtype = dtype
         self.device = device or torch.device("cpu")
-        self.swa_bt = torch.arange(_SWA_RING_BLOCKS * n_seqs, dtype=torch.int32, device=self.device).view(n_seqs, -1)
+        self.swa_bt = (torch.arange(_SWA_RING_BLOCKS * n_seqs, dtype=torch.int32, device=self.device) + 1).view(
+            n_seqs, -1
+        )
         # Block 0 of the TOKEN pools is a reserved zero padding sink, so real
         # per-sequence blocks are addressed 1-based (matching production).
         self.tok2_bt = (torch.arange(n_seqs, dtype=torch.int32, device=self.device) + 1).view(n_seqs, 1)
         self.tok1_bt = (torch.arange(n_seqs, dtype=torch.int32, device=self.device) + 1).view(n_seqs, 1)
         self.layer_caches = _allocate_v41_layer_caches(
-            self.cfg, n_seqs, dtype, device=self.device, reserve_token_sink=True
+            self.cfg, n_seqs, dtype, device=self.device, reserve_token_sink=True, reserve_swa_sink=True
         )
         self.executor = ModelExecutor(lm, dict(config), max_seqs_per_batch=n_seqs)
         self.executor.bind_kv_caches(list(self.layer_caches))
@@ -1509,6 +1385,23 @@ def _make_forward_lm(
     return lm
 
 
+def _chunked_dsa(
+    backend: Csa2AttentionBackend, kv_len: int, q_len: int, start: int, *, swa_blocks: int = 1
+) -> DsaMetadata:
+    return backend._builder.build(
+        multi_block_tables=[torch.arange(n, dtype=torch.int32).unsqueeze(0) for n in (swa_blocks, 1, 1)],
+        kv_seq_lens=[kv_len],
+        q_seq_lens=[q_len],
+        positions=torch.arange(start, start + q_len, dtype=torch.int64),
+        is_prefill=False,
+        is_chunked_prefill=True,
+    )
+
+
+def _expected_key_row(cos_sin: torch.Tensor, latent: torch.Tensor, position: int) -> torch.Tensor:
+    return apply_interleaved_rope(latent.unsqueeze(0), torch.tensor([position]), cos_sin)[0]
+
+
 def test_compressor_math() -> None:
     lm = _make_forward_lm(torch.float32, seed=11)
     cfg = lm.cfg
@@ -1520,30 +1413,11 @@ def test_compressor_math() -> None:
     mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
     cos_sin = model.compress_rotary.cos_sin_cache
 
-    def build_dsa(kv_len: int, q_len: int, start: int) -> DsaMetadata:
-        return backend._builder.build(
-            multi_block_tables=[
-                torch.tensor([[0, 1]], dtype=torch.int32),
-                torch.tensor([[0]], dtype=torch.int32),
-                torch.tensor([[0]], dtype=torch.int32),
-            ],
-            kv_seq_lens=[kv_len],
-            q_seq_lens=[q_len],
-            positions=torch.arange(start, start + q_len, dtype=torch.int64),
-            is_prefill=False,
-            is_chunked_prefill=True,
-        )
-
-    def expected_key_row(latent: torch.Tensor, position: int) -> torch.Tensor:
-        rotated = apply_interleaved_rope(latent.unsqueeze(0), torch.tensor([position]), cos_sin)
-        return _expected_fp4_e4m3(rotated, 16)[0]
-
-    def expected_index_rows(latent: torch.Tensor, starts: list[int]) -> torch.Tensor:
+    def expected_index_rows(latent: torch.Tensor, starts: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
         index_k = layer.indexer_key(latent)
-        return fp4_act_qdq_e8m0(apply_interleaved_rope(index_k, torch.tensor(starts), cos_sin), 32)
+        index_k = apply_interleaved_rope(index_k, torch.tensor(starts), cos_sin)
+        return _quantize_indexer_rows_int8(index_k)
 
-    # Step 1: 3 tokens (positions 0-2). Group (0, 1) commits; position 2 is
-    # parked in the state ring.
     x1 = torch.randn(3, cfg.hidden_size)
     ctx1 = Csa2LayerContext(
         x=x1,
@@ -1553,7 +1427,14 @@ def test_compressor_math() -> None:
     )
     shared = CSA2SharedRuntime()
     backend._run_compressor(
-        layer, ctx1, build_dsa(3, 3, 0), layer_caches[2], mapping, [3], torch.tensor([3], dtype=torch.int64), shared
+        layer,
+        ctx1,
+        _chunked_dsa(backend, 3, 3, 0, swa_blocks=2),
+        layer_caches[2],
+        mapping,
+        [3],
+        torch.tensor([3], dtype=torch.int64),
+        shared,
     )
 
     kv1, score1 = layer.compress_kv_score(x1)
@@ -1561,10 +1442,10 @@ def test_compressor_math() -> None:
     pooled0 = (kv1[:2] * gate0).sum(dim=0)
     latent0 = layer.compress_rmsnorm(pooled0.unsqueeze(0))[0]
     key_cache = layer_caches[2].key
-    assert torch.allclose(key_cache[0, 0], expected_key_row(latent0, 0), atol=1e-6)
-    assert torch.allclose(layer_caches[2].index[0, 0], expected_index_rows(latent0.unsqueeze(0), [0])[0], atol=1e-6)
-    # One committed row after 3 tokens (ctx // ratio); the partial group's
-    # members are parked in the state ring at their SWA slots.
+    assert torch.allclose(key_cache[0, 0], _expected_key_row(cos_sin, latent0, 0), atol=1e-6)
+    exp_codes0, exp_scales0 = expected_index_rows(latent0.unsqueeze(0), [0])
+    assert torch.equal(layer_caches[2].index[0, 0], exp_codes0[0])
+    assert torch.allclose(layer_caches[2].indexer_scale[0, 0, 0].float(), exp_scales0[0].float())
     assert (key_cache[0, : 3 // 2].abs().sum(dim=-1) > 0).all()
     assert (key_cache[0, 3 // 2 :] == 0).all()
     state_kv = layer_caches[2].compress_kv_state.view(-1, cfg.head_dim)
@@ -1580,7 +1461,14 @@ def test_compressor_math() -> None:
         cos_sin_cache=cos_sin,
     )
     backend._run_compressor(
-        layer, ctx2, build_dsa(6, 3, 3), layer_caches[2], mapping, [3], torch.tensor([6], dtype=torch.int64), shared
+        layer,
+        ctx2,
+        _chunked_dsa(backend, 6, 3, 3, swa_blocks=2),
+        layer_caches[2],
+        mapping,
+        [3],
+        torch.tensor([6], dtype=torch.int64),
+        shared,
     )
 
     kv2, score2 = layer.compress_kv_score(x2)
@@ -1591,11 +1479,11 @@ def test_compressor_math() -> None:
     gate2 = score2[1:3].softmax(dim=0)
     pooled2 = (kv2[1:3] * gate2).sum(dim=0)
     latent2 = layer.compress_rmsnorm(pooled2.unsqueeze(0))[0]
-    # RMSNorm sits AFTER pooling; RoPE uses the group-start position.
-    assert torch.allclose(key_cache[0, 1], expected_key_row(latent1, 2), atol=1e-6)
-    assert torch.allclose(key_cache[0, 2], expected_key_row(latent2, 4), atol=1e-6)
-    expected_index = expected_index_rows(torch.stack((latent1, latent2)), [2, 4])
-    assert torch.allclose(layer_caches[2].index[0, 1:3], expected_index, atol=1e-6)
+    assert torch.allclose(key_cache[0, 1], _expected_key_row(cos_sin, latent1, 2), atol=1e-6)
+    assert torch.allclose(key_cache[0, 2], _expected_key_row(cos_sin, latent2, 4), atol=1e-6)
+    exp_codes, exp_scales = expected_index_rows(torch.stack((latent1, latent2)), [2, 4])
+    assert torch.equal(layer_caches[2].index[0, 1:3], exp_codes)
+    assert torch.allclose(layer_caches[2].indexer_scale[0, 1:3, 0].float(), exp_scales.float())
     assert (key_cache[0, : 6 // 2].abs().sum(dim=-1) > 0).all()
     assert (key_cache[0, 6 // 2 :] == 0).all()
 
@@ -1610,32 +1498,26 @@ def test_compressor_math() -> None:
     )
     shared4 = CSA2SharedRuntime()
     backend._run_compressor(
-        layer4, ctx, build_dsa(5, 5, 0), layer_caches[4], mapping4, [5], torch.tensor([5], dtype=torch.int64), shared4
+        layer4,
+        ctx,
+        _chunked_dsa(backend, 5, 5, 0, swa_blocks=2),
+        layer_caches[4],
+        mapping4,
+        [5],
+        torch.tensor([5], dtype=torch.int64),
+        shared4,
     )
     kv, _ = layer4.compress_kv_score(x)
     latent = layer4.compress_rmsnorm(kv)
-    expected = _expected_fp4_e4m3(apply_interleaved_rope(latent, torch.arange(5), cos_sin), 16)
+    expected = apply_interleaved_rope(latent, torch.arange(5), cos_sin)
     assert torch.allclose(layer_caches[4].key[0, :5], expected, atol=1e-6)
     assert (layer_caches[4].key[0, 5:] == 0).all()
-    # Ratio 1 keeps no pooling states and no gate.
     assert not hasattr(layer4, "cmp_wgate")
     assert layer_caches[4].compress_kv_state is None
     assert layer_caches[4].compress_score_state is None
 
 
 def test_compressor_padded_row_uses_nonnegative_rope_position() -> None:
-    """A fully padded row (q_len=1, ctx_len=0) on a ratio-2 layer must not
-    drive the compressor RoPE position negative.
-
-    With ``ctx_len == 0`` the row is inert (``commit_mask`` all-False, every
-    slot mask ``-1``), but the ratio-2 branch still feeds
-    ``group_starts = (group_idx * ratio)`` to ``apply_interleaved_rope``, whose
-    ``cos_sin_cache.index_select(0, positions)`` rejects the negative
-    ``group_idx = floor(-1 / 2) = -1``. Only an upper clamp used to guard this,
-    so the row crashed before the mask could make it a no-op; the fix clamps
-    the group-start element to a valid non-negative position. The placeholder
-    latent is invalid, so it must stay out of the caches.
-    """
     lm = _make_forward_lm(torch.float32, seed=11)
     cfg = lm.cfg
     model = lm.model
@@ -1668,23 +1550,181 @@ def test_compressor_padded_row_uses_nonnegative_rope_position() -> None:
     key_before = layer_caches[2].key.clone()
     index_before = layer_caches[2].index.clone()
 
-    # Pre-fix this raised IndexError inside apply_interleaved_rope (:758).
     backend._run_compressor(
         layer, ctx, dsa, layer_caches[2], mapping, [1], torch.tensor([0], dtype=torch.int64), CSA2SharedRuntime()
     )
 
-    # The padded row is unwritten: the key/index caches are byte-identical.
     assert torch.equal(layer_caches[2].key, key_before)
     assert torch.equal(layer_caches[2].index, index_before)
 
 
-# ---------------------------------------------------------------------------
-# Indexer scoring (semantics doc section 5)
-# ---------------------------------------------------------------------------
+def test_compressor_state_ring_read_before_write() -> None:
+    torch.manual_seed(7)
+    fwd_cfg = {**_DSV41_FORWARD_CONFIG, "window_size": 32, "sliding_window": 32}
+    lm = DeepseekV41ForCausalLM({**fwd_cfg, "device": "cpu", "dtype": torch.float32})
+    _random_init_v41(lm)
+    cfg = lm.cfg
+    assert cfg.window_size == 32
+    model = lm.model
+    backend = _make_csa2_backend(cfg)
+    layer_caches = _allocate_v41_layer_caches(cfg, n_seqs=1, dtype=torch.float32)
+    backend.bind_kv_caches(layer_caches)
+    layer = model.layers[2].self_attn
+    assert layer.mode.compress_ratio == 2
+    mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
+    cos_sin = model.compress_rotary.cos_sin_cache
+    state_rows = layer_caches[2].compress_kv_state.size(1)
+    assert state_rows == 32
+    state_kv = layer_caches[2].compress_kv_state.view(-1, cfg.head_dim)
+    state_score = layer_caches[2].compress_score_state.view(-1, cfg.head_dim)
+
+    shared = CSA2SharedRuntime()
+
+    x_a = torch.randn(1, cfg.hidden_size)
+    ctx_a = Csa2LayerContext(
+        x=x_a,
+        qr=torch.randn(1, cfg.q_lora_rank),
+        positions=torch.arange(1),
+        cos_sin_cache=cos_sin,
+    )
+    backend._run_compressor(
+        layer,
+        ctx_a,
+        _chunked_dsa(backend, 1, 1, 0),
+        layer_caches[2],
+        mapping,
+        [1],
+        torch.tensor([1], dtype=torch.int64),
+        shared,
+    )
+    kv_a, score_a = layer.compress_kv_score(x_a)
+    assert torch.allclose(state_kv[0], kv_a[0], atol=1e-6)
+    assert torch.allclose(state_score[0], score_a[0], atol=1e-6)
+
+    x_b = torch.randn(32, cfg.hidden_size)
+    ctx_b = Csa2LayerContext(
+        x=x_b,
+        qr=torch.randn(32, cfg.q_lora_rank),
+        positions=torch.arange(1, 33),
+        cos_sin_cache=cos_sin,
+    )
+    backend._run_compressor(
+        layer,
+        ctx_b,
+        _chunked_dsa(backend, 33, 32, 1),
+        layer_caches[2],
+        mapping,
+        [32],
+        torch.tensor([33], dtype=torch.int64),
+        shared,
+    )
+    kv_b, score_b = layer.compress_kv_score(x_b)
+
+    members = torch.stack((kv_a[0].clone(), kv_b[0]))
+    gates = torch.stack((score_a[0].clone(), score_b[0])).softmax(dim=0)
+    pooled0 = (members * gates).sum(dim=0)
+    latent0 = layer.compress_rmsnorm(pooled0.unsqueeze(0))[0]
+    assert torch.allclose(layer_caches[2].key[0, 0], _expected_key_row(cos_sin, latent0, 0), atol=1e-6)
+
+    buggy_members = torch.stack((kv_b[31], kv_b[0]))
+    buggy_gates = torch.stack((score_b[31], score_b[0])).softmax(dim=0)
+    buggy_latent = layer.compress_rmsnorm((buggy_members * buggy_gates).sum(dim=0).unsqueeze(0))[0]
+    assert not torch.allclose(layer_caches[2].key[0, 0], _expected_key_row(cos_sin, buggy_latent, 0), atol=1e-4)
+
+    assert torch.allclose(state_kv[0], kv_b[31], atol=1e-6)
+    assert torch.allclose(state_score[0], score_b[31], atol=1e-6)
+
+
+def test_compressor_state_park_tail_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    import xllm.python.attention.csa2_attention as csa2_mod
+
+    torch.manual_seed(13)
+    fwd_cfg = {**_DSV41_FORWARD_CONFIG, "window_size": 32, "sliding_window": 32}
+    lm = DeepseekV41ForCausalLM({**fwd_cfg, "device": "cpu", "dtype": torch.float32})
+    _random_init_v41(lm)
+    cfg = lm.cfg
+    model = lm.model
+    backend = _make_csa2_backend(cfg)
+    layer_caches = _allocate_v41_layer_caches(cfg, n_seqs=1, dtype=torch.float32)
+    backend.bind_kv_caches(layer_caches)
+    layer = model.layers[2].self_attn
+    mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
+    cos_sin = model.compress_rotary.cos_sin_cache
+    state_rows = layer_caches[2].compress_kv_state.size(1)
+    assert state_rows == 32
+    state_kv = layer_caches[2].compress_kv_state.view(-1, cfg.head_dim)
+
+    recorded: list[tuple[tuple[int, ...], torch.Tensor]] = []
+    orig_scatter = csa2_mod._scatter_by_slot
+
+    def spy(cache: torch.Tensor, slot_mapping: torch.Tensor, value: torch.Tensor) -> None:
+        if slot_mapping is not None and cache is not None:
+            recorded.append((tuple(cache.shape), slot_mapping.detach().reshape(-1).clone()))
+        return orig_scatter(cache, slot_mapping, value)
+
+    monkeypatch.setattr(csa2_mod, "_scatter_by_slot", spy)
+
+    shared = CSA2SharedRuntime()
+
+    x_a = torch.randn(1, cfg.hidden_size)
+    ctx_a = Csa2LayerContext(
+        x=x_a,
+        qr=torch.randn(1, cfg.q_lora_rank),
+        positions=torch.arange(1),
+        cos_sin_cache=cos_sin,
+    )
+    backend._run_compressor(
+        layer,
+        ctx_a,
+        _chunked_dsa(backend, 1, 1, 0),
+        layer_caches[2],
+        mapping,
+        [1],
+        torch.tensor([1], dtype=torch.int64),
+        shared,
+    )
+
+    q_len = 40
+    prev_ctx = 1
+    x_b = torch.randn(q_len, cfg.hidden_size)
+    ctx_b = Csa2LayerContext(
+        x=x_b,
+        qr=torch.randn(q_len, cfg.q_lora_rank),
+        positions=torch.arange(prev_ctx, prev_ctx + q_len),
+        cos_sin_cache=cos_sin,
+    )
+    recorded.clear()
+    backend._run_compressor(
+        layer,
+        ctx_b,
+        _chunked_dsa(backend, prev_ctx + q_len, q_len, prev_ctx),
+        layer_caches[2],
+        mapping,
+        [q_len],
+        torch.tensor([prev_ctx + q_len], dtype=torch.int64),
+        shared,
+    )
+
+    assert len(recorded) >= 2
+    state_shape = (_SWA_RING_BLOCKS * state_rows, cfg.head_dim)
+    park_scatters = [s for (shape, s) in recorded if shape == state_shape]
+    assert len(park_scatters) == 2
+    for slots in park_scatters:
+        valid = slots[slots >= 0].tolist()
+        assert len(valid) == len(set(valid)), f"duplicate park slot in one scatter: {valid}"
+
+    tail_rows = torch.arange(q_len - state_rows, q_len)
+    tail_positions = prev_ctx + tail_rows
+    tail_parked = tail_positions[(tail_positions + 1) % 2 != 0]
+    expected_slots = sorted(torch.unique(tail_parked % state_rows).tolist())
+    valid_union = sorted({int(s) for s in torch.cat(park_scatters).tolist() if s >= 0})
+    assert valid_union == expected_slots
+
+    kv_b, _ = layer.compress_kv_score(x_b)
+    assert torch.allclose(state_kv[(prev_ctx + q_len - 1) % state_rows], kv_b[q_len - 1], atol=1e-6)
 
 
 def test_indexer_scoring() -> None:
-    # relu-weighted einsum: score[s, t] = sum_h w[s, h] * relu(q[s, h] . k[t]).
     torch.manual_seed(21)
     q = torch.randn(4, 3, 32)
     index_k = torch.randn(6, 32)
@@ -1722,13 +1762,12 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     backend = _make_csa2_backend(cfg)
     cos_sin = lm.model.compress_rotary.cos_sin_cache
 
-    # Full layer 2 (ratio 2): fresh top-k over the shared index cache. Every
-    # valid pick must address a compressed group the query has fully passed
-    # (t < (p + 1) // ratio) and land inside the window-row offset.
     layer2 = lm.model.layers[2].self_attn
-    index_cache = torch.randn(1, _TOKEN_BLOCK_SIZE, cfg.index_head_dim) * 0.5
+    index_cache = torch.randint(-127, 128, (1, _TOKEN_BLOCK_SIZE, cfg.index_head_dim), dtype=torch.int8)
+    index_scale = (torch.rand(1, _TOKEN_BLOCK_SIZE, 1) + 0.1).to(torch.float16)
     shared = CSA2SharedRuntime(
         index_cache=index_cache,
+        index_scale=index_scale,
         index_block_table=torch.tensor([[0]], dtype=torch.int32),
         compress_ratio=2,
     )
@@ -1747,13 +1786,12 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
         valid = picks[picks >= 0] - offset
         assert ((valid >= 0) & (valid < visible)).all()
         assert valid.numel() == min(cfg.index_topk, visible)
-    # A Full layer before the candidate source does not build the pool.
     assert shared.candidates is None
 
-    # Candidate-source layer 4 publishes the per-sequence pool.
     layer4 = lm.model.layers[4].self_attn
     shared4 = CSA2SharedRuntime(
-        index_cache=torch.randn(1, _TOKEN_BLOCK_SIZE, cfg.index_head_dim) * 0.5,
+        index_cache=torch.randint(-127, 128, (1, _TOKEN_BLOCK_SIZE, cfg.index_head_dim), dtype=torch.int8),
+        index_scale=(torch.rand(1, _TOKEN_BLOCK_SIZE, 1) + 0.1).to(torch.float16),
         index_block_table=torch.tensor([[0]], dtype=torch.int32),
         compress_ratio=1,
     )
@@ -1766,6 +1804,7 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     pool[0, [1, 3, 4, 6]] = True
     shared5 = CSA2SharedRuntime(
         index_cache=shared4.index_cache,
+        index_scale=shared4.index_scale,
         index_block_table=shared4.index_block_table,
         compress_ratio=1,
         candidates=[pool],
@@ -1793,6 +1832,47 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     assert picks_wide.numel() == ctx_len
     assert (picks_wide[picks_wide >= 0] - (cfg.window_size + 1)).tolist() == [1, 3, 4, 6]
     assert (picks_wide == -1).sum().item() == ctx_len - 4
+
+
+@pytest.mark.parametrize("query_len", [1, 3, 9])
+def test_swa_chunk_reads_history_before_overwriting_ring(query_len: int) -> None:
+    window, previous = 4, 8
+    backend = object.__new__(Csa2AttentionBackend)
+    backend.window_size, backend.scale = window, 1.0
+    history = torch.arange(previous - window, previous, dtype=torch.float32).view(1, window, 1)
+    cache = history.clone()
+    backend._kv_caches = [SimpleNamespace(swa=cache)]
+    backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
+    backend._shared_runtime = CSA2SharedRuntime
+    positions = torch.arange(previous, previous + query_len)
+    slots = positions % window
+    slots = torch.where(torch.arange(query_len) >= max(0, query_len - window), slots, -1)
+    dsa = SimpleNamespace(
+        seq_lens_q=torch.tensor([query_len]),
+        seq_lens_q_host=[query_len],
+        seq_lens=torch.tensor([previous + query_len]),
+        is_acl_graph=False,
+        block_tables=[[torch.tensor([[0]])]],
+        slot_mappings=[[slots]],
+    )
+    metadata = SimpleNamespace(dsa_metadata=dsa)
+    backend._current_forward_metadata = lambda: metadata
+    layer = SimpleNamespace(
+        layer_id=0,
+        mode=CSA2LayerMode(0, CSA2_MODE_SWA, 0, -1),
+        attn_sink=torch.tensor([-100.0]),
+        _csa2_ctx=SimpleNamespace(x=torch.zeros(query_len, 1)),
+    )
+    q = torch.zeros(query_len, 1, 1)
+    kv = (100 + torch.arange(query_len, dtype=torch.float32)).view(query_len, 1)
+    context = ForwardContext(backend, torch.device("cpu"), metadata, [])
+    with forward_context(context):
+        actual = backend.execute_csa2_layer(q, kv, layer)
+    logical_kv = torch.cat((history.view(-1), kv.view(-1)))
+    expected = torch.stack([logical_kv[i + 1 : i + window + 1].mean() for i in range(query_len)])
+    torch.testing.assert_close(actual.flatten(), expected)
+    for i in range(max(0, query_len - window), query_len):
+        torch.testing.assert_close(cache[0, positions[i] % window], kv[i])
 
 
 def test_swa_window_lower_bound_is_per_query() -> None:
@@ -1927,18 +2007,14 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
     assert prefill_logits.shape == (n_seqs * prompt_len, cfg.vocab_size)
     assert torch.isfinite(prefill_logits).all()
 
-    # SWA ring writes: positions 0-7 fill the first ring block of each
-    # sequence; position 8 opens the second ring block.
     swa = harness.layer_caches[0].swa
-    assert (swa[0].abs().sum(dim=-1) > 0).all()
-    assert (swa[2].abs().sum(dim=-1) > 0).all()
-    assert swa[1, 0].abs().sum(dim=-1) > 0
-    assert (swa[1, 1:] == 0).all()
-    assert swa[3, 0].abs().sum(dim=-1) > 0
-    assert (swa[3, 1:] == 0).all()
+    assert (swa[1].abs().sum(dim=-1) > 0).all()
+    assert (swa[3].abs().sum(dim=-1) > 0).all()
+    assert swa[2, 0].abs().sum(dim=-1) > 0
+    assert (swa[2, 1:] == 0).all()
+    assert swa[4, 0].abs().sum(dim=-1) > 0
+    assert (swa[4, 1:] == 0).all()
 
-    # Committed compressed rows = ctx // ratio for both kv sources. Block 0 is
-    # the reserved zero padding sink, so sequence 0's real block is index 1.
     key2 = harness.layer_caches[2].key
     key4 = harness.layer_caches[4].key
     assert (key2[1, : prompt_len // 2].abs().sum(dim=-1) > 0).all()
@@ -1976,22 +2052,16 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
             )
         assert step_hidden.shape == (n_seqs, cfg.hidden_size)
         assert torch.isfinite(step_hidden.float()).all()
-    # Ring writes for positions 8-12 fill the second ring block rows 0-4
-    # (position 8 from the prefill, 9-12 from the decode steps).
     second_block_rows = prompt_len - cfg.window_size + decode_steps
-    assert (swa[1, :second_block_rows].abs().sum(dim=-1) > 0).all()
-    assert (swa[1, second_block_rows:] == 0).all()
-    assert (swa[3, :second_block_rows].abs().sum(dim=-1) > 0).all()
-    # Committed rows follow ctx // ratio at ctx = prompt_len + decode_steps.
-    # Block 0 is the reserved zero padding sink; sequence 0's block is index 1.
+    assert (swa[2, :second_block_rows].abs().sum(dim=-1) > 0).all()
+    assert (swa[2, second_block_rows:] == 0).all()
+    assert (swa[4, :second_block_rows].abs().sum(dim=-1) > 0).all()
     ctx_len = prompt_len + decode_steps
     assert (key2[1, : ctx_len // 2].abs().sum(dim=-1) > 0).all()
     assert (key2[1, ctx_len // 2 :] == 0).all()
     assert (key4[1, :ctx_len].abs().sum(dim=-1) > 0).all()
     assert (key4[1, ctx_len:] == 0).all()
 
-    # -- Consistency: the same prompt re-run token by token as decode steps
-    # with fresh caches reproduces the prefill logits.
     replay = _V41ForwardHarness(lm, _DSV41_FORWARD_CONFIG, n_seqs, torch.bfloat16, device=device)
     replay_logits = []
     for position in range(prompt_len):
@@ -2010,43 +2080,7 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
             diff = (replay_logits[position][seq] - expected).abs().max().item()
             assert diff < 2e-2, f"decode replay diverged at position {position} of sequence {seq}: {diff}"
 
-
-# ---------------------------------------------------------------------------
-# Engram (gated n-gram lookup, reference engram.py semantics)
-# ---------------------------------------------------------------------------
-
-
-def test_engram_layout_prime_buckets() -> None:
-    layout = EngramLayout(
-        layer_ids=[1, 14],
-        num_embeddings=[384006168, 384016682],
-        max_ngram_size=3,
-        n_heads=2,
-        head_dim=32,
-        vocab_size=64,
-        compressed_vocab_size=16,
-        pad_token_id=0,
-    )
-    # Primes are drawn from 63 upward, never reused across layers/heads.
-    assert layout.primes[0][0] == (67, 71)
-    assert layout.primes[0][1] == (73, 79)
-    # Layer 14 continues the shared search: 83, 89, 97, 101.
-    assert layout.primes[1][0] == (83, 89)
-    assert layout.primes[1][1] == (97, 101)
-    assert layout.n_hash_cols == 4
-    # Offsets are exclusive prefix sums of the flattened head sizes.
-    assert torch.equal(layout.offsets, torch.tensor([[0, 67, 138, 211], [0, 83, 172, 269]]))
-
-
-def test_engram_token_map_normalization_chain() -> None:
-    # Case / accent / whitespace folding collapses onto one compressed id.
-    lookup, size = build_compressed_token_map_from_texts(["The", "the", "THE", " thé ", "x", "y"])
-    assert size == 3
-    assert lookup[0] == lookup[1] == lookup[2] == lookup[3]
-    assert lookup[4] != lookup[5]
-    assert normalize_token_text("  A\tB\nC ") == "a b c"
-    # A lone space survives Strip via the private-use sentinel.
-    assert normalize_token_text(" ") == " "
+    assert torch.count_nonzero(swa[0]) == 0
 
 
 def test_engram_embedding_tp_sharding_nondivisible() -> None:
@@ -2437,7 +2471,7 @@ def test_compressor_cached_long_chunk_preserves_partial_group() -> None:
     members = torch.stack((old_kv[2], new_kv[0]))
     gates = torch.stack((old_score[2], new_score[0])).softmax(dim=0)
     latent = layer.compress_rmsnorm((members * gates).sum(dim=0, keepdim=True))
-    expected = _expected_fp4_e4m3(apply_interleaved_rope(latent, torch.tensor([2]), cos_sin), 16)[0]
+    expected = apply_interleaved_rope(latent, torch.tensor([2]), cos_sin)[0]
     run(prefix, 0)
     run(chunk, 3)
     assert caches[2].key is not None
@@ -2590,7 +2624,8 @@ def test_compressor_mixed_padding_preserves_live_rows(ctx_lens: list[int]) -> No
             for name in ("compress_kv_state", "compress_score_state"):
                 assert torch.equal(getattr(caches[2], name)[2 * seq : 2 * seq + 2], before[name][2 * seq : 2 * seq + 2])
         elif length % layer.mode.compress_ratio:
-            slot = 2 * seq * cfg.window_size + length - 1
+            state_rows = caches[2].compress_kv_state.size(1)
+            slot = 2 * seq * state_rows + (length - 1) % state_rows
             assert torch.allclose(caches[2].compress_kv_state.view(-1, cfg.head_dim)[slot], kv[seq], atol=1e-6)
             assert torch.allclose(caches[2].compress_score_state.view(-1, cfg.head_dim)[slot], scores[seq], atol=1e-6)
         else:
@@ -2824,7 +2859,6 @@ def test_empty_dp_attention_has_no_history_or_cache_writes(
         is_dummy=True,
         dsa_metadata=None,
         dsa_positions=torch.zeros(rows, dtype=torch.int64),
-        dsa_cos_sin=None,
         dsa_c4_cos_sin=None,
         dsa_c128_cos_sin=None,
         dsa_graph_mode=graph_mode,
@@ -3319,3 +3353,153 @@ def test_shared_engram_load_fences_its_own_process_group(monkeypatch: pytest.Mon
     storage.mark_loaded.assert_called_once_with()
     storage.mark_failed.assert_not_called()
     assert model._copy_engram_rows.call_count == (1 if rank == 0 else 0)
+
+
+def test_v41_compressor_swa_gate_uses_config_ring_blocks() -> None:
+    table = torch.tensor([[7], [9]], dtype=torch.int32)
+    wide = torch.tensor([[7, 0, 0, 0], [9, 0, 0, 0]], dtype=torch.int32)
+    block_table, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), 0, 0, 1)
+    assert block_table is table and reason is None
+    block_table, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[wide]]), 0, 0, 1)
+    assert block_table is wide and reason is None
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), 0, 0, 2)
+    assert reason == "swa ring blocks per sequence 2 != 1"
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), 0, 0)
+    assert reason == "swa ring blocks per sequence 0 != 1"
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), 0, 0, 0)
+    assert reason == "swa ring blocks per sequence 0 != 1"
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), -1, 0, 1)
+    assert reason == "no swa block table"
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[torch.empty(0)]]), 0, 0, 1)
+    assert reason == "no swa block table"
+
+
+def test_v41_compressor_swa_ring_blocks_derivation() -> None:
+    cfg = DeepseekV41Config.from_dict(_DSV41_FORWARD_CONFIG)
+    backend = _make_csa2_backend(cfg)
+    assert backend._swa_ring_blocks == 1
+    backend.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 128, 8))])
+    assert backend._swa_ring_blocks == 1
+
+    def with_window(window: int) -> Csa2AttentionBackend:
+        return _make_csa2_backend(SimpleNamespace(**{**vars(cfg), "window_size": window}))
+
+    wide_window = with_window(256)
+    wide_window.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 128, 8))])
+    assert wide_window._swa_ring_blocks == 2
+    wider_window = with_window(384)
+    wider_window.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 128, 8))])
+    assert wider_window._swa_ring_blocks == 3
+    small_block = with_window(128)
+    small_block.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 64, 8))])
+    assert small_block._swa_ring_blocks == 2
+
+
+def test_v41_compressor_gate_is_decode_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    lm = _make_forward_lm(torch.float32, seed=17)
+    cfg = lm.cfg
+    model = lm.model
+    backend = _make_csa2_backend(cfg)
+    layer_caches = _allocate_v41_layer_caches(cfg, n_seqs=1, dtype=torch.float32)
+    backend.bind_kv_caches(layer_caches)
+    layer = model.layers[2].self_attn
+    mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
+    dsa = backend._builder.build(
+        multi_block_tables=[
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            torch.tensor([[0]], dtype=torch.int32),
+            torch.tensor([[0]], dtype=torch.int32),
+        ],
+        kv_seq_lens=[3],
+        q_seq_lens=[3],
+        positions=torch.arange(3, dtype=torch.int64),
+        is_prefill=False,
+        is_chunked_prefill=True,
+    )
+    reasons: list[str] = []
+    op_calls: list[int] = []
+    monkeypatch.setattr(csa2_attention, "_v41_compressor_triton_reason", lambda *a, **k: None)
+    monkeypatch.setattr(csa2_attention, "_v41_compressor_pool_triton", lambda *a, **k: op_calls.append(1))
+    monkeypatch.setattr(csa2_attention, "_log_v41_compressor_fallback", reasons.append)
+    ctx = Csa2LayerContext(
+        x=torch.randn(3, cfg.hidden_size),
+        qr=torch.randn(3, cfg.q_lora_rank),
+        positions=torch.arange(3),
+        cos_sin_cache=model.compress_rotary.cos_sin_cache,
+    )
+    backend._run_compressor(
+        layer, ctx, dsa, layer_caches[2], mapping, [3], torch.tensor([3], dtype=torch.int64), CSA2SharedRuntime()
+    )
+    assert reasons == ["non-decode row"]
+    assert op_calls == []
+
+
+@pytest.mark.parametrize("position", [8, 15, 16, 23])
+def test_v41_compressor_uses_current_position_state_block(monkeypatch: pytest.MonkeyPatch, position: int) -> None:
+    lm = _make_forward_lm(torch.float32, seed=17)
+    cfg = lm.cfg
+    backend = _make_csa2_backend(cfg)
+    caches = _allocate_v41_layer_caches(cfg, n_seqs=2, dtype=torch.float32)
+    backend.bind_kv_caches(caches)
+    layer = lm.model.layers[2].self_attn
+    mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
+    dsa = backend._builder.build(
+        multi_block_tables=[
+            torch.tensor([[-1, 1, 2]], dtype=torch.int32),
+            torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        ],
+        kv_seq_lens=[position + 1],
+        q_seq_lens=[1],
+        positions=torch.tensor([position]),
+        is_prefill=False,
+        is_chunked_prefill=True,
+    )
+    blocks: list[int] = []
+
+    def pool(*args: object, block_id: torch.Tensor, **kwargs: object) -> None:
+        blocks.append(int(block_id))
+
+    monkeypatch.setattr(csa2_attention, "_v41_compressor_triton_reason", lambda *args: None)
+    monkeypatch.setattr(csa2_attention, "_v41_compressor_pool_triton", pool)
+    ctx = Csa2LayerContext(
+        x=torch.randn(1, cfg.hidden_size),
+        qr=torch.randn(1, cfg.q_lora_rank),
+        positions=torch.tensor([position]),
+        cos_sin_cache=lm.model.compress_rotary.cos_sin_cache,
+    )
+    backend._run_compressor(
+        layer, ctx, dsa, caches[2], mapping, [1], torch.tensor([position + 1], dtype=torch.int64), CSA2SharedRuntime()
+    )
+    assert blocks == [position // cfg.window_size]
+
+
+def test_v41_compressor_swa_table_column0_matches_across_widths() -> None:
+    caches_info, group_infos = build_cache_specs_v41(
+        compress_ratios=[0, 2],
+        kv_source_layer_ids=[1],
+        window_size=128,
+        n_layers=2,
+    )
+    builder = DsaMetadataBuilder(caches_info, group_infos)
+    ring = torch.tensor([[7], [9]], dtype=torch.int32)
+    cap = 16
+    wide = torch.zeros((2, cap), dtype=torch.int32)
+    wide[:, 0] = ring[:, 0]
+
+    def build(swa_bt: torch.Tensor, enable_graph: bool, capacity: int) -> DsaMetadata:
+        return builder.build(
+            multi_block_tables=[swa_bt, torch.zeros((2, 1), dtype=torch.int32)],
+            kv_seq_lens=[5, 5],
+            q_seq_lens=[1, 1],
+            positions=torch.arange(2, dtype=torch.int64) if enable_graph else torch.empty(0, dtype=torch.int64),
+            is_prefill=False,
+            is_chunked_prefill=True,
+            enable_graph=enable_graph,
+            graph_block_table_capacity_cols=capacity,
+        )
+
+    eager = build(ring, False, 0)
+    graph = build(wide, True, cap)
+    assert eager.block_tables[1][2][:, 0].tolist() == [7, 9]
+    assert graph.block_tables[1][2][:, 0].tolist() == [7, 9]

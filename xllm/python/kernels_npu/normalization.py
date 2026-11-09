@@ -25,6 +25,10 @@ fused_add_gemma_rms_norm = torch.ops.xllm_ops.fused_add_gemma_rms_norm
 _FUSED_ADD_RMS_NORM_DYNAMIC_QUANT = torch_npu.npu_add_rms_norm_dynamic_quant
 
 
+def rms_norm_cast_va(value: torch.Tensor, weight: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.xllm_ops.rms_norm_cast_va(value, weight, eps)
+
+
 def gemma_rms_norm(
     value: torch.Tensor,
     weight: torch.Tensor,
@@ -153,4 +157,5 @@ __all__ = [
     "rms_norm_gated",
     "rms_norm_sigmoid_gated",
     "fused_eh_norm",
+    "rms_norm_cast_va",
 ]

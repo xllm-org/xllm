@@ -17,10 +17,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
+import xllm.python.attention.csa2_attention as csa2
+from tests.python._deepseek_v41_fused_testkit import _rope_cache
 from xllm.python import kernels
 from xllm.python.attention import csa_attention as csa_attention_module
 from xllm.python.attention.backend import LayerCache
@@ -1075,3 +1078,98 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
     prepare_step(kv_len=3, q_len=1, is_prefill=False)
     backend.execute(torch.zeros(1, 8, 512), decode_kv, decode_kv, layer)
     assert torch.equal(calls[-1]["sinks"], layer.attn_sink)
+
+
+_TOL = 2**-6
+
+
+def _stub_partial_rotary() -> Any:
+    calls: list[tuple[bool, tuple[int, ...], int, int]] = []
+
+    def op(
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        rope_start_dim: int,
+        rope_head_dim: int,
+        inverse: bool = False,
+    ) -> None:
+        calls.append((bool(inverse), tuple(x.shape), int(rope_start_dim), int(rope_head_dim)))
+        start = int(rope_start_dim)
+        end = start + int(rope_head_dim)
+        signed_sin = -sin if inverse else sin
+        rope = x[..., start:end]
+        even = rope[..., 0::2].float()
+        odd = rope[..., 1::2].float()
+        cos_pair = cos[..., 0::2].float().unsqueeze(1)
+        sin_pair = signed_sin[..., 0::2].float().unsqueeze(1)
+        rotated = torch.stack(
+            (even * cos_pair - odd * sin_pair, even * sin_pair + odd * cos_pair),
+            dim=-1,
+        ).flatten(-2)
+        x[..., start:end] = rotated.to(x.dtype)
+
+    op.calls = calls  # type: ignore[attr-defined]
+    return op
+
+
+def _install_fused_stub(monkeypatch: Any) -> Any:
+    op = _stub_partial_rotary()
+    monkeypatch.setattr(csa2, "_get_partial_rotary_op", lambda: op)
+    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda x: True)
+    monkeypatch.setattr(csa2, "_log_fused_rope_inverse_active", lambda: None)
+    return op
+
+
+def _eager_reference(
+    monkeypatch: Any,
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    inverse: bool,
+) -> torch.Tensor:
+    with monkeypatch.context() as context:
+        context.setattr(csa2, "_rope_fused_device_supported", lambda x: False)
+        return csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=inverse)
+
+
+def test_fused_inverse_matches_eager(monkeypatch: Any) -> None:
+    op = _install_fused_stub(monkeypatch)
+
+    cache = _rope_cache(256, 64)
+    cases = [
+        (8, 4, 512),
+        (8, 1, 512),
+        (5, 128),
+    ]
+    for shape in cases:
+        torch.manual_seed(sum(shape) + 11)
+        x = (torch.randn(*shape) * 0.9).to(torch.bfloat16)
+        positions = torch.randint(0, 200, (shape[0],), dtype=torch.int32)
+
+        fused = csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=True)
+        eager = _eager_reference(monkeypatch, x, positions, cache, inverse=True)
+
+        assert op.calls[-1][0] is True, "the dispatcher must forward inverse=True"
+        assert fused.shape == eager.shape
+        diff = (fused.float() - eager.float()).abs()
+        budget = _TOL + _TOL * eager.float().abs()
+        assert (diff <= budget).all(), f"shape={shape} max_abs={diff.max().item():.3e}"
+        rope_width = cache.size(-1)
+        if shape[-1] > rope_width:
+            assert torch.equal(fused[..., : shape[-1] - rope_width], eager[..., : shape[-1] - rope_width])
+
+
+def test_fused_forward_unchanged_by_r2(monkeypatch: Any) -> None:
+    op = _install_fused_stub(monkeypatch)
+
+    cache = _rope_cache(128, 64)
+    torch.manual_seed(5)
+    x = (torch.randn(6, 3, 256) * 0.9).to(torch.bfloat16)
+    positions = torch.arange(6, dtype=torch.int32)
+
+    fused = csa2.apply_interleaved_rope(x.clone(), positions, cache)
+    eager = _eager_reference(monkeypatch, x, positions, cache, inverse=False)
+    assert op.calls[-1][0] is False
+    diff = (fused.float() - eager.float()).abs()
+    assert (diff <= _TOL + _TOL * eager.float().abs()).all()

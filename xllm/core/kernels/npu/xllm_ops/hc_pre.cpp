@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <acl/acl.h>
+#include <glog/logging.h>
 #include <torch/library.h>
 
 #include <cmath>
@@ -24,6 +25,28 @@ limitations under the License.
 #include "xllm_ops_api.h"
 
 namespace xllm::kernel::npu {
+
+namespace {
+constexpr int64_t kHcMult = 4;
+constexpr int64_t kHcFnRows = 24;
+constexpr int64_t kHcScaleRows = 3;
+constexpr int64_t kHcBaseRows = 24;
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> make_hc_pre_outputs(
+    const torch::Tensor& hidden,
+    int64_t hc_mult) {
+  auto output_shape = hidden.sizes().vec();
+  output_shape.erase(output_shape.end() - 2);
+  auto post_shape = hidden.sizes().vec();
+  post_shape.pop_back();
+  auto combination_shape = post_shape;
+  combination_shape.emplace_back(hc_mult);
+  return {
+      torch::empty(output_shape, hidden.options()),
+      torch::empty(post_shape, hidden.options().dtype(torch::kFloat32)),
+      torch::empty(combination_shape, hidden.options().dtype(torch::kFloat32))};
+}
+}  // namespace
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre(
     const torch::Tensor& x,
@@ -50,14 +73,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre(
       const char* soc_name = aclrtGetSocName();
       return soc_name != nullptr &&
              std::string_view(soc_name).starts_with("Ascend910_93") &&
-             aclnn::detail::get_op_api_func_addr(
-                 "aclnnHcPreVaGetWorkspaceSize") != nullptr &&
-             aclnn::detail::get_op_api_func_addr("aclnnHcPreVa") != nullptr;
+             aclnn::detail::has_op_api("aclnnHcPreVa");
     }();
-    if (has_fused_hc_pre && hc_mult == 4 && x_bf16.size(-2) == hc_mult &&
-        x_bf16.numel() > 0 && hc_fn.dim() == 2 && hc_fn.size(0) == 24 &&
+    if (has_fused_hc_pre && hc_mult == kHcMult && x_bf16.size(-2) == hc_mult &&
+        x_bf16.numel() > 0 && hc_fn.dim() == 2 && hc_fn.size(0) == kHcFnRows &&
         hc_fn.size(1) == hc_mult * x_bf16.size(-1) && hc_scale.dim() == 1 &&
-        hc_scale.numel() == 3 && hc_base.dim() == 1 && hc_base.numel() == 24 &&
+        hc_scale.numel() == kHcScaleRows && hc_base.dim() == 1 &&
+        hc_base.numel() == kHcBaseRows &&
         hc_fn.scalar_type() == torch::kFloat32 &&
         hc_scale.scalar_type() == torch::kFloat32 &&
         hc_base.scalar_type() == torch::kFloat32 &&
@@ -68,17 +90,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre(
         hc_base.is_contiguous() && hc_sinkhorn_iters > 0 &&
         std::isfinite(norm_eps) && norm_eps > 0 && std::isfinite(hc_eps) &&
         hc_eps > 0) {
-      auto output_shape = x_bf16.sizes().vec();
-      output_shape.erase(output_shape.end() - 2);
-      auto post_shape = x_bf16.sizes().vec();
-      post_shape.pop_back();
-      auto combination_shape = post_shape;
-      combination_shape.emplace_back(hc_mult);
-      auto output = torch::empty(output_shape, x_bf16.options());
-      auto post =
-          torch::empty(post_shape, x_bf16.options().dtype(torch::kFloat32));
-      auto combination = torch::empty(combination_shape,
-                                      x_bf16.options().dtype(torch::kFloat32));
+      auto [output, post, combination] = make_hc_pre_outputs(x_bf16, hc_mult);
       std::optional<torch::Tensor> pre_mix;
       std::optional<torch::Tensor> pre;
       EXEC_NPU_CMD(aclnnHcPreVa,
@@ -125,6 +137,76 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre(
 
   torch::Tensor y = std::get<0>(output).to(original_type);
   return std::make_tuple(y, std::get<1>(output), std::get<2>(output));
+}
+
+// pre_mix collapses the incoming stream; the returned pre feeds the next
+// sub-block.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+hc_pre_va(const torch::Tensor& hidden,
+          const torch::Tensor& hc_fn,
+          const torch::Tensor& hc_scale,
+          const torch::Tensor& hc_base,
+          const std::optional<torch::Tensor>& pre_mix,
+          int64_t hc_mult,
+          int64_t hc_sinkhorn_iters,
+          double norm_eps,
+          double hc_eps) {
+  CHECK(hidden.dim() == 3 || hidden.dim() == 4)
+      << "Fused HcPre requires a rank-3 or rank-4 input";
+  CHECK(hidden.device().type() == torch::kPrivateUse1 &&
+        hidden.scalar_type() == torch::kBFloat16)
+      << "Fused HcPre requires BF16 NPU input";
+  CHECK(hc_mult == kHcMult && hidden.size(-2) == hc_mult && hidden.numel() > 0)
+      << "Fused HcPre requires four nonempty hidden streams (V4.1 currently "
+         "requires hc_mult=4)";
+  CHECK(hc_fn.dim() == 2 && hc_fn.size(0) == kHcFnRows &&
+        hc_fn.size(1) == hc_mult * hidden.size(-1))
+      << "Fused HcPre weight must have shape [24, 4 * hidden_size]";
+  CHECK(hc_scale.dim() == 1 && hc_scale.numel() == kHcScaleRows &&
+        hc_base.dim() == 1 && hc_base.numel() == kHcBaseRows)
+      << "Fused HcPre scale/base must have shapes [3] and [24]";
+  CHECK(hc_fn.scalar_type() == torch::kFloat32 &&
+        hc_scale.scalar_type() == torch::kFloat32 &&
+        hc_base.scalar_type() == torch::kFloat32)
+      << "Fused HcPre requires prepared FP32 parameters";
+  CHECK(hc_fn.device() == hidden.device() &&
+        hc_scale.device() == hidden.device() &&
+        hc_base.device() == hidden.device())
+      << "Fused HcPre inputs must be on the same device";
+  CHECK(hidden.is_contiguous() && hc_fn.is_contiguous() &&
+        hc_scale.is_contiguous() && hc_base.is_contiguous())
+      << "Fused HcPre requires contiguous inputs";
+  if (pre_mix.has_value()) {
+    auto expected_shape = hidden.sizes().vec();
+    expected_shape.pop_back();
+    CHECK(pre_mix->sizes().vec() == expected_shape &&
+          pre_mix->scalar_type() == torch::kFloat32 &&
+          pre_mix->device() == hidden.device() && pre_mix->is_contiguous())
+        << "Fused HcPre external mix must be contiguous FP32 on the same "
+           "device with shape hidden.shape[:-1]";
+  }
+  CHECK(hc_sinkhorn_iters > 0 && std::isfinite(norm_eps) && norm_eps > 0 &&
+        std::isfinite(hc_eps) && hc_eps > 0)
+      << "Fused HcPre requires positive iterations and finite positive "
+         "epsilons";
+
+  auto [output, post, combination] = make_hc_pre_outputs(hidden, hc_mult);
+  auto pre = torch::empty_like(post);
+  EXEC_NPU_CMD(aclnnHcPreVa,
+               hidden,
+               hc_fn,
+               hc_scale,
+               hc_base,
+               pre_mix,
+               hc_mult,
+               hc_sinkhorn_iters,
+               hc_eps,
+               norm_eps,
+               output,
+               post,
+               combination,
+               pre);
+  return {output, post, combination, pre};
 }
 
 }  // namespace xllm::kernel::npu

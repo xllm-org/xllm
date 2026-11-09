@@ -1,0 +1,15 @@
+--- a/cmake/symbol.cmake
++++ b/cmake/symbol.cmake
+@@ -271,4 +271,12 @@
+     DESTINATION packages/vendors/${VENDOR_NAME}_xllm_math/op_impl/cpu/aicpu_kernel/impl
+     OPTIONAL
+   )
++  # The math vendor's metadata registration also resolves this basename.
++  # Keep the original name for operator manifests that still reference it.
++  install(
++    FILES ${ARM_SO_OUTPUT}
++    DESTINATION packages/vendors/${VENDOR_NAME}_xllm_math/op_impl/cpu/aicpu_kernel/impl
++    RENAME libmath_aicpu_kernels.so
++    OPTIONAL
++  )
+ endfunction()

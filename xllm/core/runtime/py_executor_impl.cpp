@@ -129,6 +129,12 @@ void register_xllm_runtime_module(py::module_& m) {
     }
     return tensor;
   });
+  m.def("moe_ep_hccl_info", [](int64_t device_index) {
+    auto* model = PyCausalLM::active_instance();
+    return model == nullptr
+               ? std::optional<std::tuple<std::string, int64_t, int64_t>>{}
+               : model->moe_ep_hccl_info(device_index);
+  });
   m.def("eplb_batch_isend_irecv",
         [](py::list operation_types, py::list tensors, py::list remote_ranks) {
           PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
