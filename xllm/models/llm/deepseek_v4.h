@@ -1994,16 +1994,7 @@ inline void load_deepseek_v4_model_args(const JsonReader& json,
   });
   LOAD_ARG_OR(hidden_act, "hidden_act", "silu");
   LOAD_ARG_OR_FUNC(intermediate_size, "intermediate_size", [&] {
-    if (args->intermediate_size() > 0) {
-      return args->intermediate_size();
-    }
-    if (args->moe_intermediate_size() > 0) {
-      return static_cast<int64_t>(args->moe_intermediate_size());
-    }
-    if (args->hidden_size() > 0) {
-      return args->hidden_size() * 4;
-    }
-    return int64_t{0};
+    return resolve_dense_intermediate_size(*args);
   });
 
   // Norm / RoPE
@@ -2135,8 +2126,6 @@ inline void normalize_deepseek_v4_args(ModelArgs* args) {
 
 inline void validate_deepseek_v4_args(const ModelArgs& args,
                                       const DeepseekV4ArgsPolicy& policy) {
-  CHECK(!policy.supported_compress_ratios.empty())
-      << "deepseek_v4 internal supported_compress_ratios must not be empty";
   CHECK(policy.supported_compress_ratios.count(policy.default_compress_ratio) >
         0)
       << "deepseek_v4 config default_compress_ratio("
