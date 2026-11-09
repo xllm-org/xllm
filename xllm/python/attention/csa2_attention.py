@@ -651,20 +651,106 @@ def _quantize_indexer_rows_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return _quantize_indexer_rows_int8_torch(x)
 
 
+_SMLA_CMP_TOPK_BLOCK = 512
+_SMLA_CMP_TOPK_MAX = 1024
+_SMLA_ORI_MASK_MODE = 4
+_SMLA_CMP_MASK_MODE = 3
+_SMLA_NO_MASK_MODE = 0
+_SMLA_SUPPORTED_RATIOS = (0, 1, 2)
+
+
+def _round_cmp_width(topk: int) -> int:
+    if topk <= 0:
+        return 0
+    return min((topk + _SMLA_CMP_TOPK_BLOCK - 1) // _SMLA_CMP_TOPK_BLOCK * _SMLA_CMP_TOPK_BLOCK, _SMLA_CMP_TOPK_MAX)
+
+
+_SMLA_HEADS_MAX = 128
+
+_smla_ops: tuple[Any, Any] | None = None
+
+
+def _get_smla_ops() -> tuple[Any, Any] | None:
+    global _smla_ops
+    if _smla_ops is not None:
+        return _smla_ops
+    namespace = getattr(torch.ops, "xllm_ops", None)
+    if namespace is None:
+        return None
+    fused = getattr(namespace, "smla_va", None)
+    metadata = getattr(namespace, "smla_va_metadata", None)
+    if fused is None or metadata is None:
+        return None
+    if not has_op_api("aclnnSmlaVa") or not has_op_api("aclnnSmlaVaMetadata"):
+        return None
+    _smla_ops = (fused, metadata)
+    return _smla_ops
+
+
+def _smla_device_supported(q: torch.Tensor) -> bool:
+    return q.device.type == "npu"
+
+
+def _smla_pa_bbnd(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    if tensor.dim() == 4:
+        if int(tensor.size(-2)) == 1:
+            return tensor
+    elif tensor.dim() == 3:
+        return tensor.unsqueeze(-2)
+    raise RuntimeError(
+        f"DeepSeek-V4.1 SMLA {name} must be [blocks, page, D] or [blocks, page, 1, D], got {tuple(tensor.shape)}"
+    )
+
+
+def _smla_kv_layout_ok(tensor: torch.Tensor, q: torch.Tensor) -> bool:
+    if tensor.dim() not in (3, 4):
+        return False
+    if tensor.dim() == 4 and int(tensor.size(-2)) != 1:
+        return False
+    return (
+        all(size > 0 for size in tensor.shape)
+        and int(tensor.size(-1)) == int(q.size(-1))
+        and tensor.dtype == q.dtype
+        and tensor.device == q.device
+    )
+
+
+_smla_active_logged = False
+_smla_fallback_logged = False
+
+
+def _log_smla_active(layer_id: int) -> None:
+    global _smla_active_logged
+    if not _smla_active_logged:
+        _smla_active_logged = True
+        logger.info(f"DeepSeek-V4.1 SMLA fused attention tail active (layer {layer_id})")
+
+
+def _log_smla_fallback(reason: str) -> None:
+    global _smla_fallback_logged
+    if _smla_fallback_logged or reason in _DECODE_ONLY_FALLBACK_REASONS:
+        return
+    _smla_fallback_logged = True
+    logger.warning(f"the SMLA fused attention tail is inactive ({reason}); staying on the reference tail")
+
+
+@dataclass
+class _SmlaGraphState:
+    """Allocate and JIT during eager warmup; capture and replay only refresh these buffers."""
+
+    rows: int
+    capacity: int
+    read_cols: int
+    ring_cols: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    expanded_ori_bt: torch.Tensor
+    seqused_cmp: dict[int, torch.Tensor]
+    cmp_residual: dict[int, torch.Tensor]
+    metadata: dict[int, torch.Tensor]
+
+
 @dataclass
 class _QliGraphState:
-    """ACL-graph-stable operands of the QLI v3 decode path for one bucket.
-
-    Built once during the runner's eager warmup (which also JIT-compiles the
-    metadata op) and refreshed in place on every replay; the captured graph
-    records these persistent addresses, so no buffer may be allocated and no
-    metadata op may first run inside capture. ``capacity`` is the token-level
-    committed-row bound (``graph_token_capacity``); the per-ratio compressed
-    capacity is ``max(capacity // ratio, 1)``, exactly like ``_run_indexer``'s.
-    The paged key is addressed by the runtime ``block_table`` plus the per-row
-    ``seqused_k`` (PA_BBND), so no ``cu_seqlens_k`` operand exists.
-    """
-
     rows: int
     capacity: int
     cu_seqlens_q: torch.Tensor
@@ -752,27 +838,14 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             )
 
         self._kv_caches: list[Any] = []
-        # Config-derived SWA ring blocks per sequence; refreshed on bind so it is
-        # a plain Python int computed before capture (never a captured tensor).
         self._swa_ring_blocks = self._compute_swa_ring_blocks()
         self._metadata: Any | None = None
         self._v41_shared: CSA2SharedRuntime | None = None
-        # Persistent QLI v3 indexer operands, one entry per (batch_rows,
-        # token capacity) graph bucket; built in warmup, refreshed under capture.
         self._qli_state: dict[tuple[int, int], _QliGraphState] = {}
-
-    # -- V4 backend overrides ----------------------------------------------
+        self._smla_state: dict[tuple[int, int], _SmlaGraphState] = {}
+        self._smla_used_ratio_ids = self._smla_used_ratios()
 
     def _compute_swa_ring_blocks(self) -> int:
-        """SWA ring blocks per sequence, derived from the config.
-
-        ``get_swa_blocks_per_seq(window, block) = (window - 1) // block + 1``
-        (block_utils.cpp), the value the scheduler allocates; production
-        ``window == block == 128`` yields 1. The SWA page width is the cache's
-        own block size; before the caches are bound fall back to
-        ``window_size``, which yields the same production 1. A plain Python int
-        computed before capture.
-        """
         swa_block = self.window_size
         if self._kv_caches:
             swa = getattr(self._kv_caches[0], "swa", None)
@@ -806,30 +879,18 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         return dsa
 
     def refresh_dsa_metadata_for_graph_replay(self, metadata: Any | None = None) -> None:
-        """Refresh DSA tensors and the QLI operand buffers outside capture.
-
-        The inherited refresh rebuilds the DSA metadata and copies the replay
-        values into the graph-captured tensors; the QLI branch rewrites its
-        per-ratio sequence lengths / residuals plus the indexer's tiling
-        metadata. This runs before every graph replay, so it must never
-        allocate a new state, build one under capture, or read a device value
-        back to the host.
-        """
         super().refresh_dsa_metadata_for_graph_replay(metadata)
         resolved = self._metadata if metadata is None else metadata
         dsa = getattr(resolved, "dsa_metadata", None)
         if dsa is None:
             return
-        for state in self._qli_replay_states(dsa):
-            self._refresh_qli_state(dsa, state)
-
-    def _qli_replay_states(self, dsa: DsaMetadata) -> list[_QliGraphState]:
-        key = (
-            int(dsa.seq_lens.numel()),
-            int(getattr(dsa, "graph_token_capacity", 0) or 0),
-        )
-        state = self._qli_state.get(key)
-        return [state] if state is not None else []
+        key = (int(dsa.seq_lens.numel()), int(getattr(dsa, "graph_token_capacity", 0) or 0))
+        smla_state = self._smla_state.get(key)
+        if smla_state is not None:
+            self._refresh_smla_state(dsa, smla_state)
+        qli_state = self._qli_state.get(key)
+        if qli_state is not None:
+            self._refresh_qli_state(dsa, qli_state)
 
     def _build_precomputed_metadata(
         self,
@@ -942,34 +1003,30 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 qr=cp_context.shard(ctx.qr),
                 positions=cp_context.shard(ctx.positions),
             )
-            # DSA metadata remains global for cache layout. Query consumers
-            # receive local q_lens/ctx_lens explicitly.
-        # 3) Indexer: Full/Reindex layers compute a fresh top-k; Reuse layers
-        #    consume the tensor object their group source published.
         if mode.is_full or mode.is_reindex:
             topk = self._run_indexer(layer, ctx, dsa, q_lens, ctx_lens, shared)
         elif mode.is_reuse:
             topk = shared.topk_idxs
             if topk is None and dsa.block_tables:
-                # Real batches always publish the group source's top-k;
-                # profiling batches (empty block tables) degrade to the
-                # plain window path.
                 raise RuntimeError(
                     f"DeepSeek-V4.1 reuse layer {layer_id} has no shared top-k; its group source must run first"
                 )
         else:
             topk = None
-        # Current-chunk KV is read directly; preserve the ring history until
-        # all queries have consumed it, even when the chunk wraps the ring.
-        output = self._csa2_attention(q, kv, layer, dsa, q_lens, ctx_lens, topk, shared, cp_context)
         swa_slot = _get_layer_cache_tensor(dsa.slot_mappings, layer_id, mapping.ori_cache_idx)
+        # The fused tail reads the ring, so scatter first. The reference tail needs old ring history.
+        smla_reason = self._smla_fallback_reason(q, layer, dsa, q_lens, cp_context, topk, shared, layer_cache, swa_slot)
+        if smla_reason is None:
+            _scatter_by_slot(layer_cache.swa, swa_slot, kv)
+            _log_smla_active(layer_id)
+            return self._csa2_attention_smla(q, layer, dsa, topk, shared)
+        _log_smla_fallback(smla_reason)
+        output = self._csa2_attention(q, kv, layer, dsa, q_lens, ctx_lens, topk, shared, cp_context)
         if layer_cache.swa is not None and swa_slot is not None and swa_slot.numel() > 0:
             if not dsa.is_acl_graph:
                 swa_slot, kv = last_ring_writes(swa_slot, kv, slot_capacity=layer_cache.swa.numel() // kv.size(-1))
             _scatter_by_slot(layer_cache.swa, swa_slot, kv)
         return output
-
-    # -- compressor ---------------------------------------------------------
 
     def _run_compressor(
         self,
@@ -1650,9 +1707,6 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         global_q_lens = list(cp_context.global_q_lens) if cp_context is not None else q_lens
         global_ctx_lens = dsa.seq_lens if cp_context is not None else ctx_lens
 
-        # TODO(smla-fused): integrate the SMLA fused decode tail (sparse_flash_mla
-        # + metadata via the ops-transformer mainline registration) in a follow-up
-        # PR; this branch keeps the pure-torch path only.
         swa_flat = layer_cache.swa.view(-1, head_dim) if layer_cache.swa is not None else None
         capacity = 0
         if q_lens and ratio > 0 and topk is not None and shared.key_cache is not None:
@@ -1737,12 +1791,235 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 dense_probs = torch.softmax(logits, dim=-1)[:, :, 1 : kv_cat.size(0) + 1]
                 tile_out = torch.einsum("shn,nd->shd", dense_probs, kv_cat_f)
                 out[token_offset + tile_start : token_offset + tile_end] = tile_out.to(q.dtype)
-                # Do not retain the previous tile while allocating the next one.
+                # Reassignment keeps old tiles alive while allocating their replacements.
                 del dense_scores, logits, dense_probs, tile_out
             token_offset += q_len
         return out
 
-    # -- cache gather helpers -------------------------------------------------
+    def _smla_used_ratios(self) -> tuple[int, ...]:
+        used = {0}
+        for layer_idx in range(len(self.caches_info)):
+            ratio = int(self._layer_compress_ratio(layer_idx))
+            if ratio in _SMLA_SUPPORTED_RATIOS:
+                used.add(ratio)
+        return tuple(sorted(used))
+
+    def _smla_fallback_reason(
+        self,
+        q: torch.Tensor,
+        layer: Any,
+        dsa: DsaMetadata,
+        q_lens: list[int],
+        cp_context: DsaCpContext | None,
+        topk: torch.Tensor | None,
+        shared: CSA2SharedRuntime,
+        layer_cache: Any,
+        swa_slot: torch.Tensor | None,
+    ) -> str | None:
+        if _get_smla_ops() is None:
+            return "smla_va operators unavailable"
+        if not _smla_device_supported(q):
+            return "query is not on an NPU"
+        if q.dtype != torch.bfloat16:
+            return "query dtype is not bfloat16"
+        if q.dim() != 3:
+            return "query is not [tokens, heads, 512]"
+        if self.head_dim != 512 or int(q.size(-1)) != 512:
+            return "head dim != 512"
+        heads = int(self.num_heads)
+        if heads < 1 or heads > _SMLA_HEADS_MAX or heads & (heads - 1):
+            return "head count is not a power of two in [1, 128]"
+        if int(q.size(1)) != heads:
+            return "query is not [tokens, heads, 512]"
+        if self.window_size != 128:
+            return "window != 128"
+        ratio = int(layer.mode.compress_ratio)
+        if ratio not in _SMLA_SUPPORTED_RATIOS:
+            return "compress ratio unsupported"
+        if ratio not in self._smla_used_ratio_ids:
+            return "compress ratio not configured for the fused tail"
+        if not bool(getattr(dsa, "is_acl_graph", False)):
+            return "not an ACL-graph decode step"
+        if cp_context is not None:
+            return "context parallel shard"
+        if int(getattr(dsa, "graph_token_capacity", 0) or 0) <= 0:
+            return "graph token capacity is not positive"
+        rows = len(q_lens)
+        if rows <= 0 or int(q.size(0)) != rows:
+            return "query rows do not match one row per sequence"
+        if int(dsa.seq_lens.numel()) != rows:
+            return "sequence-length rows do not match the query rows"
+        if any(int(length) != 1 for length in q_lens):
+            return "query length != 1"
+        if topk is not None and int(topk.size(-1)) > _SMLA_CMP_TOPK_MAX:
+            return "indexer top-k exceeds the fused width"
+        if ratio > 0 and topk is None:
+            return "no indexer top-k for a compressed layer"
+        if layer_cache.swa is None or swa_slot is None or swa_slot.numel() == 0:
+            return "no paged SWA cache to fuse"
+        if not _smla_kv_layout_ok(layer_cache.swa, q):
+            return "SWA cache layout is not PA_BBND"
+        # The fused ring addressing requires one SWA page per window.
+        if int(layer_cache.swa.size(1)) != self.window_size:
+            return "SWA cache page width does not match the window"
+        if ratio > 0 and topk is not None and topk.size(-1) > 0:
+            if shared.key_cache is None or shared.key_block_table is None:
+                return "compressed cache unavailable"
+            if not _smla_kv_layout_ok(shared.key_cache, q):
+                return "compressed cache layout is not PA_BBND"
+        return None
+
+    def _csa2_attention_smla(
+        self,
+        q: torch.Tensor,
+        layer: Any,
+        dsa: DsaMetadata,
+        topk: torch.Tensor | None,
+        shared: CSA2SharedRuntime,
+    ) -> torch.Tensor:
+        ops = _get_smla_ops()
+        if ops is None:
+            raise RuntimeError("DeepSeek-V4.1 SMLA was selected without its registered operators")
+        smla_va_op, _ = ops
+        ratio = int(layer.mode.compress_ratio)
+        state = self._get_smla_state(dsa)
+        rows = int(q.size(0))
+        cmp_indices = cmp_kv = cmp_block_table = seqused_cmp = cmp_residual = None
+        if ratio > 0 and topk is not None and topk.size(-1) == 0:
+            ratio = 0
+        if ratio > 0:
+            if topk is None or shared.key_cache is None or shared.key_block_table is None:
+                raise RuntimeError(
+                    f"DeepSeek-V4.1 SMLA layer {layer.layer_id} ratio {ratio} is missing its compressed inputs"
+                )
+            picks = torch.where(topk >= 0, topk - self.window_size - 1, -1).to(torch.int32)
+            width = _round_cmp_width(min(self.index_topk, max(state.capacity // ratio, 1)))
+            if picks.size(-1) > width:
+                raise RuntimeError(
+                    f"DeepSeek-V4.1 SMLA layer {layer.layer_id} indexer K {picks.size(-1)} > metadata width {width}"
+                )
+            picks = torch.nn.functional.pad(picks, (0, width - picks.size(-1)), value=-1)
+            cmp_indices = picks.reshape(rows, 1, width).contiguous()
+            cmp_kv = _smla_pa_bbnd(shared.key_cache, "cmp_kv")
+            cmp_block_table = shared.key_block_table
+            seqused_cmp = state.seqused_cmp[ratio]
+            cmp_residual = state.cmp_residual[ratio] if ratio > 1 else None
+        sinks = layer.attn_sink if getattr(layer, "attn_sink_loaded", False) else None
+        ori_kv = _smla_pa_bbnd(self._kv_caches[layer.layer_id].swa, "ori_kv")
+        out, _ = smla_va_op(
+            q,
+            ori_kv=ori_kv,
+            cmp_kv=cmp_kv,
+            ori_sparse_indices=None,
+            cmp_sparse_indices=cmp_indices,
+            ori_block_table=state.expanded_ori_bt,
+            cmp_block_table=cmp_block_table,
+            cu_seqlens_q=state.cu_seqlens_q,
+            seqused_ori_kv=dsa.seq_lens,
+            seqused_cmp_kv=seqused_cmp,
+            cmp_residual_kv=cmp_residual,
+            sinks=sinks,
+            metadata=state.metadata[ratio],
+            softmax_scale=self.scale,
+            cmp_ratio=ratio,
+            ori_mask_mode=_SMLA_ORI_MASK_MODE,
+            cmp_mask_mode=_SMLA_CMP_MASK_MODE if ratio > 0 else _SMLA_NO_MASK_MODE,
+            ori_win_left=self.window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+        )
+        return out
+
+    def _shared_swa_block_table(self, dsa: DsaMetadata | None) -> torch.Tensor | None:
+        if dsa is None or not self._kv_caches:
+            return None
+        mapping = self._resolve_cache_mapping(0, 0)
+        table = _get_layer_cache_tensor(dsa.block_tables, 0, mapping.ori_cache_idx)
+        if table is None or table.numel() == 0:
+            return None
+        return table
+
+    def _get_smla_state(self, dsa: DsaMetadata) -> _SmlaGraphState:
+        key = (int(dsa.seq_lens.numel()), int(getattr(dsa, "graph_token_capacity", 0) or 0))
+        state = self._smla_state.get(key)
+        if state is not None:
+            return state
+        if _is_stream_capturing():
+            raise RuntimeError(f"DeepSeek-V4.1 SMLA state missing for bucket {key} during capture")
+        rows, capacity = key
+        table = self._shared_swa_block_table(dsa)
+        if table is None:
+            raise RuntimeError("DeepSeek-V4.1 SMLA state needs the shared SWA block table")
+        device = dsa.seq_lens.device
+        read_cols = max(int(table.size(1)), 1)
+        # Native ori addressing is absolute; the table must cover every page reachable by this bucket.
+        cols = max(read_cols, capacity // self.window_size + 1)
+        used_ratios = self._smla_used_ratio_ids
+        state = _SmlaGraphState(
+            rows=rows,
+            capacity=capacity,
+            read_cols=read_cols,
+            ring_cols=torch.arange(cols, device=device) % read_cols,
+            cu_seqlens_q=torch.arange(rows + 1, dtype=torch.int32, device=device),
+            expanded_ori_bt=torch.zeros((rows, cols), dtype=torch.int32, device=device),
+            seqused_cmp={r: torch.zeros(rows, dtype=torch.int32, device=device) for r in used_ratios if r > 0},
+            cmp_residual={r: torch.zeros(rows, dtype=torch.int32, device=device) for r in used_ratios if r > 1},
+            metadata={},
+        )
+        self._refresh_smla_state(dsa, state, build=True)
+        self._smla_state[key] = state
+        return state
+
+    def _smla_metadata_kwargs(self, dsa: DsaMetadata, state: _SmlaGraphState, ratio: int) -> dict[str, Any]:
+        has_cmp = ratio > 0
+        if has_cmp:
+            torch.div(dsa.seq_lens, ratio, rounding_mode="floor", out=state.seqused_cmp[ratio])
+            if ratio > 1:
+                torch.remainder(dsa.seq_lens, ratio, out=state.cmp_residual[ratio])
+        cmp_capacity = max(state.capacity // ratio, 1) if has_cmp else 0
+        return dict(
+            cu_seqlens_q=state.cu_seqlens_q,
+            seqused_ori_kv=dsa.seq_lens,
+            seqused_cmp_kv=state.seqused_cmp[ratio] if has_cmp else None,
+            cmp_residual_kv=state.cmp_residual[ratio] if ratio > 1 else None,
+            batch_size=state.rows,
+            max_seqlen_q=1,
+            max_seqlen_ori_kv=state.capacity,
+            max_seqlen_cmp_kv=cmp_capacity,
+            ori_topk=0,
+            cmp_topk=_round_cmp_width(min(self.index_topk, cmp_capacity)) if has_cmp else 0,
+            cmp_ratio=ratio,
+            ori_mask_mode=_SMLA_ORI_MASK_MODE,
+            cmp_mask_mode=_SMLA_CMP_MASK_MODE if has_cmp else _SMLA_NO_MASK_MODE,
+            ori_win_left=self.window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            has_ori_kv=True,
+            has_cmp_kv=has_cmp,
+        )
+
+    def _refresh_smla_state(self, dsa: DsaMetadata, state: _SmlaGraphState, build: bool = False) -> None:
+        table = self._shared_swa_block_table(dsa)
+        if table is None or int(table.size(1)) != state.read_cols:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 SMLA bucket {state.rows}x{state.capacity} lost its SWA read-side "
+                f"block table (expected width {state.read_cols}); captured operands are stale"
+            )
+        ops = _get_smla_ops()
+        if ops is None:
+            raise RuntimeError("DeepSeek-V4.1 SMLA operators disappeared after the bucket was built")
+        metadata_op = ops[1]
+        state.expanded_ori_bt.copy_(table[:, state.ring_cols].clamp_min(0))
+        if build:
+            for ratio in self._smla_used_ratio_ids:
+                state.metadata[ratio] = metadata_op(
+                    self.num_heads, 1, self.head_dim, **self._smla_metadata_kwargs(dsa, state, ratio)
+                )
+            return
+        for ratio, buffer in state.metadata.items():
+            buffer.copy_(metadata_op(self.num_heads, 1, self.head_dim, **self._smla_metadata_kwargs(dsa, state, ratio)))
 
     def _committed_capacity(
         self,
@@ -1750,16 +2027,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         ratio: int,
         ctx_lens: torch.Tensor,
     ) -> int:
-        """Compressed-row gather capacity (rows) for one forward.
-
-        Under ACL graph capture this is a Python constant baked into the
-        graph: the runner's per-bucket bound ``graph_token_capacity`` when the
-        captured entry carries one (the decode-graph runner sets it to
-        ``bucket * granularity``), otherwise ``graph_token_capacity_granularity
-        // ratio`` -- so no replay ever sync-reads the device sequence lengths.
-        Eagerly it is the exact batch maximum, read on the host where the sync
-        is free.
-        """
+        """Capture fixes the gather capacity; eager execution uses the current committed extent."""
         if ratio <= 0:
             return 0
         if bool(getattr(dsa, "is_acl_graph", False)):
