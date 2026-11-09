@@ -29,6 +29,7 @@ MODEL_PLATFORM_SUPPORT: dict[str, dict[str, bool]] = {
     "deepseek_v4": {"cuda": False, "npu": True},
     "deepseek_v4_mtp": {"cuda": False, "npu": True},
     "deepseek_v4_dspark": {"cuda": False, "npu": True},
+    "deepseek_v41": {"cuda": False, "npu": True},
     "glm5_2": {"cuda": False, "npu": True},
     "glm5_2_mtp": {"cuda": False, "npu": True},
     "glm5_next": {"cuda": False, "npu": True},
@@ -49,24 +50,13 @@ def is_deepseek_v4_model(config: dict) -> bool:
     model_type = config.get("model_type", "")
     return (
         model_type == "deepseek_v4"
+        or model_type == "deepseek_v41"
         or model_type == "deepseek_v4_dspark"
         or (model_type.startswith("deepseek_v4") and "mtp" in model_type)
     )
 
 
-# Block-diffusion draft model types (mirrors
-# is_block_draft_model_type / is_dspark_draft_model_type in
-# xllm/core/framework/model/model_args.h).
 _DSPARK_DRAFT_MODEL_TYPES = ("DSparkDraftModel", "glm5_dspark", "deepseek_v4_dspark")
-_BLOCK_DRAFT_MODEL_TYPES = (
-    "DFlashDraftModel",
-    "DFlash2DraftModel",
-) + _DSPARK_DRAFT_MODEL_TYPES
-
-
-def is_block_draft_model(config: dict) -> bool:
-    """Whether the config describes a block-diffusion draft (DFlash/DFlash2/DSpark)."""
-    return config.get("model_type", "") in _BLOCK_DRAFT_MODEL_TYPES
 
 
 def is_dspark_draft_model(config: dict) -> bool:

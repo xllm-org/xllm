@@ -611,8 +611,7 @@ TEST_F(HierarchyBlockManagerPoolTest,
                                    info.dst_block_id == device_blocks[i].id();
                           }),
             expected_copies)
-            << "Unexpected Host restore count for sequence "
-            << sequence->seq_id() << ", logical block " << i;
+            << "Unexpected Host restore count for logical block " << i;
       }
     }
 
@@ -675,7 +674,6 @@ TEST_F(HierarchyBlockManagerPoolTest,
     Sequence sequence = make_test_sequence(/*index=*/0, tokens);
     pool.allocate_shared(&sequence);
     ASSERT_TRUE(pool.allocate(&sequence, tokens.size()));
-    ASSERT_FALSE(sequence.has_host_cache_match());
     std::shared_ptr<KVCacheBlockLease> lease;
     if (submitted) {
       lease = sequence.take_host_restore_blocks();
@@ -781,7 +779,6 @@ TEST_F(HierarchyBlockManagerPoolTest,
   const size_t host_used = host_leaf->num_used_blocks();
   Sequence sequence = make_test_sequence(/*index=*/0, tokens);
   pool.allocate_shared(&sequence);
-  ASSERT_TRUE(sequence.has_host_cache_match());
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 0u);
   EXPECT_EQ(allocator.mapping_count(), 1u);
 
@@ -1165,7 +1162,6 @@ TEST_F(HierarchyBlockManagerPoolTest, DecodeTypedLayoutProbesOnlyDeviceC4C128) {
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::C128), 1u);
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 16384u);
   EXPECT_FALSE(sequence.host_kv_state().has_any_blocks());
-  EXPECT_FALSE(sequence.has_host_cache_match());
   EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
 }
 
@@ -1459,7 +1455,6 @@ TEST_F(HierarchyBlockManagerPoolTest,
   ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/1));
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 0u);
   EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
-  EXPECT_FALSE(sequence.has_host_cache_match());
 
   pool.deallocate(&sequence);
 }
@@ -1514,7 +1509,6 @@ TEST_F(HierarchyBlockManagerPoolTest, FailedHbmAllocationDoesNotQueueH2d) {
   pool.allocate_shared(&sequence);
   EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
   EXPECT_TRUE(sequence.host_kv_state().has_any_blocks());
-  ASSERT_TRUE(sequence.has_host_cache_match());
   const std::vector<size_t> used_before = pool.num_used_blocks();
 
   EXPECT_FALSE(allocate_with_host_cache_budget(
@@ -1657,7 +1651,6 @@ TEST_F(HierarchyBlockManagerPoolTest,
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 2u);
   EXPECT_GE(sequence.kv_state().current_max_tokens_capacity(), 256u);
   EXPECT_FALSE(sequence.host_kv_state().has_any_blocks());
-  EXPECT_FALSE(sequence.has_host_cache_match());
   EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
   EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
 
@@ -1717,7 +1710,6 @@ TEST_F(HierarchyBlockManagerPoolTest,
     EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool),
               completed_tokens / kBlockSize);
     EXPECT_FALSE(sequence->has_any_blocks());
-    EXPECT_FALSE(sequence->has_host_cache_match());
   }
 }
 

@@ -39,7 +39,7 @@ limitations under the License.
 #include "models/model_registry.h"
 #include "processors/deepseek_ocr/image_processor.h"
 #include "processors/deepseek_ocr/prompt_processor.h"
-#include "processors/multimodal_processor.h"
+#include "processors/multimodal_processor_pipeline.h"
 
 namespace xllm {
 

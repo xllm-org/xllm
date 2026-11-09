@@ -41,6 +41,7 @@ class BlockManager;
 // slot id also indexes the conv/ssm KV tensors, which are tagged as the LINEAR
 // cache group). A block carries no type identity itself; the owning
 // BlockManager decides which key to store it under when it fills the state.
+// Append only: numeric values are RPC BlockType values and persisted cache IDs.
 enum class BlockType : int8_t {
   KV = 0,         // normal/Qwen flat attention KV, exported to block_tables
   SWA = 1,        // DSV4 sliding window, exported to multi_block_tables[0]
@@ -51,17 +52,23 @@ enum class BlockType : int8_t {
                   // for proto BlockType wire compatibility.
   LINEAR = 5,     // per-sequence linear-state (GDN recurrent) live slot, drawn
                   // from LinearStateBlockManager; exported via
-  // get_linear_block_id() (linear_state_ids). Also the cache group
-  // for the conv/ssm recurrent-state KV tensors.
+                  // get_linear_block_id() (linear_state_ids). Also the cache
+                  // group for the conv/ssm recurrent-state KV tensors.
+  C1 = 6,
+  C2 = 7,
 };
 
 // Fixed column order of worker multi_block_tables. The exported tables must
 // follow this order so they line up with the worker-side DSA group_infos; it
 // must never depend on std::map iteration order or config traversal order.
-inline constexpr std::array<BlockType, 3> kMultiBlockExportOrder = {
+// Export in registration order, not enum order: V4 [SWA, C4, C128],
+// V4.1 [SWA, C2, C1].
+inline constexpr std::array<BlockType, 5> kMultiBlockExportOrder = {
     BlockType::SWA,
     BlockType::C4,
-    BlockType::C128};
+    BlockType::C128,
+    BlockType::C2,
+    BlockType::C1};
 
 // Stable cache-group identity used by PD transfer. BlockType remains a local
 // storage key; the serialized group id is intentionally opaque to transfer
@@ -77,6 +84,8 @@ inline constexpr bool is_kv_split_cache_block_type(BlockType type) {
   switch (type) {
     case BlockType::KV:
     case BlockType::SWA:
+    case BlockType::C1:
+    case BlockType::C2:
     case BlockType::C4:
     case BlockType::C128:
       return true;
@@ -94,6 +103,10 @@ inline constexpr std::optional<BlockType> block_type_from_cache_group_id(
       return BlockType::KV;
     case cache_group_id(BlockType::SWA):
       return BlockType::SWA;
+    case cache_group_id(BlockType::C1):
+      return BlockType::C1;
+    case cache_group_id(BlockType::C2):
+      return BlockType::C2;
     case cache_group_id(BlockType::C4):
       return BlockType::C4;
     case cache_group_id(BlockType::C128):
@@ -160,10 +173,6 @@ class Block final {
 
   void set_hash_value(const uint8_t* hash_value) {
     memcpy(hash_value_, hash_value, XXH3_128BITS_HASH_VALUE_LEN);
-  }
-
-  constexpr uint32_t get_hash_value_len() const {
-    return XXH3_128BITS_HASH_VALUE_LEN;
   }
 
  private:

@@ -265,7 +265,16 @@ void HierarchyKVCacheTransfer::shutdown() {
 
 int32_t HierarchyKVCacheTransfer::domain_group_id(CacheHandle handle,
                                                   BlockType block_type) {
-  constexpr int32_t kBlockTypeCount = cache_group_id(BlockType::LINEAR) + 1;
+  constexpr int32_t kBlockTypeCount =
+      std::max({cache_group_id(BlockType::KV),
+                cache_group_id(BlockType::SWA),
+                cache_group_id(BlockType::C4),
+                cache_group_id(BlockType::C128),
+                cache_group_id(BlockType::EMBEDDING),
+                cache_group_id(BlockType::LINEAR),
+                cache_group_id(BlockType::C1),
+                cache_group_id(BlockType::C2)}) +
+      1;
   CHECK_LE(handle,
            static_cast<CacheHandle>(
                (std::numeric_limits<int32_t>::max() - kBlockTypeCount + 1) /

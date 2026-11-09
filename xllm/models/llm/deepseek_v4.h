@@ -1103,22 +1103,6 @@ class DeepseekV4ModelImpl
         {0}, torch::dtype(torch::kInt32).device(reference.device())));
   }
 
- private:
-  static int64_t tensor_max_or_zero(const torch::Tensor& tensor) {
-    if (!tensor.defined() || tensor.numel() == 0) {
-      return 0;
-    }
-    return tensor.max().item<int64_t>();
-  }
-
-  static int64_t pick_max_seqlen(const torch::Tensor& max_seqlen_tensor,
-                                 const torch::Tensor& fallback_tensor) {
-    if (max_seqlen_tensor.defined() && max_seqlen_tensor.numel() > 0) {
-      return max_seqlen_tensor.max().item<int64_t>();
-    }
-    return tensor_max_or_zero(fallback_tensor);
-  }
-
  public:
   static bool tensor_aliases_storage(const torch::Tensor& lhs,
                                      const torch::Tensor& rhs) {
@@ -2009,16 +1993,7 @@ inline void load_deepseek_v4_model_args(const JsonReader& json,
   });
   LOAD_ARG_OR(hidden_act, "hidden_act", "silu");
   LOAD_ARG_OR_FUNC(intermediate_size, "intermediate_size", [&] {
-    if (args->intermediate_size() > 0) {
-      return args->intermediate_size();
-    }
-    if (args->moe_intermediate_size() > 0) {
-      return static_cast<int64_t>(args->moe_intermediate_size());
-    }
-    if (args->hidden_size() > 0) {
-      return args->hidden_size() * 4;
-    }
-    return int64_t{0};
+    return resolve_dense_intermediate_size(*args);
   });
 
   // Norm / RoPE
@@ -2149,8 +2124,6 @@ inline void normalize_deepseek_v4_args(ModelArgs* args) {
 
 inline void validate_deepseek_v4_args(const ModelArgs& args,
                                       const DeepseekV4ArgsPolicy& policy) {
-  CHECK(!policy.supported_compress_ratios.empty())
-      << "deepseek_v4 internal supported_compress_ratios must not be empty";
   CHECK(policy.supported_compress_ratios.count(policy.default_compress_ratio) >
         0)
       << "deepseek_v4 config default_compress_ratio("

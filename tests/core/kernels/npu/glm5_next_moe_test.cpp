@@ -32,7 +32,7 @@ namespace xllm {
 namespace {
 
 std::filesystem::path source_root() {
-  std::filesystem::path root(__FILE__);
+  std::filesystem::path root(GLM5_NEXT_MOE_CASES_PATH);
   for (int32_t depth = 0; depth < 5; ++depth) {
     root = root.parent_path();
   }
@@ -40,8 +40,7 @@ std::filesystem::path source_root() {
 }
 
 py::dict load_cases() {
-  const std::filesystem::path cases =
-      std::filesystem::path(__FILE__).parent_path() / "glm5_next_moe_cases.py";
+  const std::filesystem::path cases = GLM5_NEXT_MOE_CASES_PATH;
   return py::module_::import("runpy")
       .attr("run_path")(cases.string())
       .cast<py::dict>();

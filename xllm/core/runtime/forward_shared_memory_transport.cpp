@@ -127,9 +127,6 @@ bool read_input_layout(const char* payload,
     offset += sizeof(value);
   };
   if (magic == kPackedInputMagic) {
-    if (payload_size < kPackedInputHeaderBytes) {
-      return false;
-    }
     uint16_t version = 0;
     uint8_t domain = 0;
     uint8_t flags = 0;
@@ -430,17 +427,6 @@ inline void write_tensor(RawInputSerializeContext& context,
 }
 
 template <typename T>
-inline void write_vector(char*& buffer, const std::vector<T>& vec) {
-  const uint64_t size = vec.size();
-  write_data(buffer, size);
-  if (size > 0) {
-    const size_t bytes = size * type_size<T>;
-    std::memcpy(buffer, vec.data(), bytes);
-    buffer += bytes;
-  }
-}
-
-template <typename T>
 inline void write_vector(RawInputSectionCursor& cursor,
                          const std::vector<T>& vec) {
   const uint64_t size = vec.size();
@@ -463,26 +449,6 @@ void write_json_object_state_snapshots(
 }
 
 template <typename T>
-void write_vector_to_tensor(char*& buffer, const std::vector<T>& vec) {
-  // write ndim
-  uint64_t ndim = 1;
-  write_data(buffer, ndim);
-  // write shape
-  write_data(buffer, vec.size());
-  // write dtype
-  const int8_t tensor_dtype = static_cast<int8_t>(get_scalar_type<T>());
-  write_data(buffer, tensor_dtype);
-  // write data_bytes
-  const uint64_t data_bytes = vec.size() * type_size<T>;
-  write_data(buffer, data_bytes);
-  // write vec data
-  if (data_bytes > 0) {
-    std::memcpy(buffer, vec.data(), data_bytes);
-    buffer += data_bytes;
-  }
-}
-
-template <typename T>
 void write_vector_to_tensor(RawInputSerializeContext& context,
                             const std::vector<T>& vec) {
   uint64_t ndim = 1;
@@ -497,31 +463,6 @@ void write_vector_to_tensor(RawInputSerializeContext& context,
   write_bytes(context.tensor_arena, vec.data(), data_bytes);
   const uint64_t aligned_bytes = get_aligned_tensor_arena_bytes(data_bytes);
   write_padding(context.tensor_arena, aligned_bytes - data_bytes);
-}
-
-inline void write_instance_info(char*& buffer, const InstanceInfo& info) {
-  write_string(buffer, info.name);
-  write_string(buffer, info.rpc_address);
-  write_string(buffer, info.type);
-
-  write_vector(buffer, info.cluster_ids);
-
-  write_data(buffer, (uint64_t)info.addrs.size());
-  for (const auto& addr : info.addrs) {
-    write_string(buffer, addr);
-  }
-
-  write_data(buffer, info.dp_size);
-  write_data(buffer, info.kv_split_size);
-
-  const uint64_t prof_size = info.ttft_profiling_data.size();
-  write_data(buffer, prof_size);
-  if (prof_size > 0) {
-    std::memcpy(buffer,
-                info.ttft_profiling_data.data(),
-                prof_size * sizeof(std::pair<int32_t, int64_t>));
-    buffer += prof_size * sizeof(std::pair<int32_t, int64_t>);
-  }
 }
 
 inline void write_instance_info(RawInputSerializeContext& context,
@@ -549,28 +490,6 @@ inline void write_instance_info(RawInputSerializeContext& context,
   }
 }
 
-inline void write_virtual_kv_cache_layer_global_offsets(
-    char*& buffer,
-    const std::vector<VirtualKVCacheLayerGlobalOffsets>& offsets) {
-  write_data(buffer, (uint64_t)offsets.size());
-  for (const auto& layer : offsets) {
-    write_vector(buffer, layer.k_offsets);
-    write_vector(buffer, layer.v_offsets);
-    write_vector(buffer, layer.index_offsets);
-  }
-}
-
-inline void write_kv_transfer_mappings(
-    char*& buffer,
-    const std::vector<KVTransferMapping>& mappings) {
-  write_data(buffer, static_cast<uint64_t>(mappings.size()));
-  for (const KVTransferMapping& mapping : mappings) {
-    write_data(buffer, mapping.group_id);
-    write_vector(buffer, mapping.local_ids);
-    write_vector(buffer, mapping.remote_ids);
-  }
-}
-
 inline void write_kv_transfer_mappings(
     RawInputSerializeContext& context,
     const std::vector<KVTransferMapping>& mappings) {
@@ -593,16 +512,6 @@ inline void write_virtual_kv_cache_layer_global_offsets(
   }
 }
 
-inline void write_transfer_kv_info(char*& buffer, const TransferKVInfo& info) {
-  write_string(buffer, info.request_id);
-  write_data(buffer, info.rank_local_mapping);
-  write_data(buffer, info.dp_rank);
-  write_instance_info(buffer, info.remote_instance_info);
-  write_virtual_kv_cache_layer_global_offsets(
-      buffer, info.dst_virtual_kv_cache_layer_global_offsets);
-  write_kv_transfer_mappings(buffer, info.mappings);
-}
-
 inline void write_transfer_kv_info(RawInputSerializeContext& context,
                                    const TransferKVInfo& info) {
   write_string(context.descriptor, info.request_id);
@@ -612,14 +521,6 @@ inline void write_transfer_kv_info(RawInputSerializeContext& context,
   write_virtual_kv_cache_layer_global_offsets(
       context, info.dst_virtual_kv_cache_layer_global_offsets);
   write_kv_transfer_mappings(context, info.mappings);
-}
-
-inline void write_eplb_info(char*& buffer, const EplbInfo& info) {
-  write_data(buffer, info.prepare_layer_id);
-  write_data(buffer, info.prepare_token);
-  write_vector(buffer, info.expert_ids);
-  write_data(buffer, info.update_layer_id);
-  write_data(buffer, info.activation_token);
 }
 
 inline void write_eplb_info(RawInputSerializeContext& context,
@@ -649,30 +550,6 @@ inline void write_vector_tensor(RawInputSerializeContext& context,
   }
 }
 
-inline void write_mm_dict(char*& buffer, const MMDict& mm_dict) {
-  // size
-  size_t size = mm_dict.size();
-  write_data(buffer, (size_t)size);
-  // tensor num
-  int32_t tensor_num = 1;
-  for (auto& [mm_key, mm_value] : mm_dict) {
-    write_string(buffer, mm_key);
-    if (std::holds_alternative<torch::Tensor>(mm_value)) {
-      tensor_num = 1;
-      write_data(buffer, tensor_num);
-      auto& tensor = std::get<torch::Tensor>(mm_value);
-      write_tensor(buffer, tensor);
-    } else if (std::holds_alternative<std::vector<torch::Tensor>>(mm_value)) {
-      auto& tensor_vec = std::get<std::vector<torch::Tensor>>(mm_value);
-      tensor_num = tensor_vec.size();
-      write_data(buffer, tensor_num);
-      for (const auto& tensor : tensor_vec) {
-        write_tensor(buffer, tensor);
-      }
-    }
-  }
-}
-
 inline void write_mm_dict(RawInputSerializeContext& context,
                           const MMDict& mm_dict) {
   size_t size = mm_dict.size();
@@ -695,27 +572,6 @@ inline void write_mm_dict(RawInputSerializeContext& context,
   }
 }
 
-inline void write_mm_item(char*& buffer, const MMDataItem& item) {
-  write_data(buffer, item.type());
-  write_mm_dict(buffer, item.data());
-
-  const auto& state = item.state();
-  write_data(buffer, state.seq_index());
-  // write token_pos
-  write_data(buffer, state.token_pos().offset);
-  write_data(buffer, state.token_pos().length);
-  write_data(buffer, state.mm_token_num());
-
-  // write mm_token_mask
-  write_tensor(buffer, state.mm_token_mask());
-
-  // write schedule_data
-  memcpy(buffer, state.schedule_data().key.data, XXH3_128BITS_HASH_VALUE_LEN);
-  buffer += XXH3_128BITS_HASH_VALUE_LEN;
-  write_data(buffer, state.schedule_data().start_pos);
-  write_data(buffer, state.schedule_data().end_pos);
-}
-
 inline void write_mm_item(RawInputSerializeContext& context,
                           const MMDataItem& item) {
   write_data(context.descriptor, item.type());
@@ -734,15 +590,6 @@ inline void write_mm_item(RawInputSerializeContext& context,
   write_data(context.descriptor, state.schedule_data().end_pos);
 }
 
-inline void write_mm_data_items(char*& buffer, const MMData& mm_data) {
-  const auto& mm_items = mm_data.items<MMItemVec>();
-  write_data(buffer, mm_data.type());
-  write_data(buffer, mm_items.size());
-  for (const auto& mm_item : mm_items) {
-    write_mm_item(buffer, mm_item);
-  }
-}
-
 inline void write_mm_data_items(RawInputSerializeContext& context,
                                 const MMData& mm_data) {
   const auto& mm_items = mm_data.items<MMItemVec>();
@@ -753,32 +600,10 @@ inline void write_mm_data_items(RawInputSerializeContext& context,
   }
 }
 
-inline void write_mm_data_dict(char*& buffer, const MMData& mm_data) {
-  const auto& mm_dict = mm_data.items<MMDict>();
-  write_data(buffer, mm_data.type());
-  write_mm_dict(buffer, mm_dict);
-}
-
 inline void write_mm_data_dict(RawInputSerializeContext& context,
                                const MMData& mm_data) {
   write_data(context.descriptor, mm_data.type());
   write_mm_dict(context, mm_data.items<MMDict>());
-}
-
-inline void write_mm_batch_data(char*& buffer, const MMBatchData& mm_data) {
-  const auto& vec = mm_data.mm_data_vec();
-  write_data(buffer, vec.size());
-
-  uint8_t is_mm_item =
-      vec.size() ? static_cast<uint8_t>(vec[0].hold<MMItemVec>()) : 1;
-  write_data(buffer, is_mm_item);
-  std::function<void(char*&, const MMData&)> write_mm_data =
-      is_mm_item
-          ? static_cast<void (*)(char*&, const MMData&)>(&write_mm_data_items)
-          : static_cast<void (*)(char*&, const MMData&)>(&write_mm_data_dict);
-  for (const auto& mm_data : vec) {
-    write_mm_data(buffer, mm_data);
-  }
 }
 
 inline void write_mm_batch_data(RawInputSerializeContext& context,
@@ -939,40 +764,6 @@ inline void read_data(ReadContext& context, T& data) {
   advance_descriptor_cursor(context, type_size<T>);
 }
 
-template <typename T>
-inline void read_data(const char*& buffer,
-                      T& data,
-                      const char*& device_buffer) {
-  std::memcpy(&data, buffer, sizeof(data));
-  buffer += type_size<T>;
-  safe_advance_buffer(device_buffer, type_size<T>);
-}
-
-inline void read_string(const char*& buffer, std::string& str) {
-  uint64_t len;
-  read_data(buffer, len);
-  if (len > 0) {
-    str.assign(buffer, len);
-    buffer += len;
-  } else {
-    str.clear();
-  }
-}
-
-inline void read_string(const char*& buffer,
-                        std::string& str,
-                        const char*& device_buffer) {
-  uint64_t len;
-  read_data(buffer, len, device_buffer);
-  if (len > 0) {
-    str.assign(buffer, len);
-    buffer += len;
-    safe_advance_buffer(device_buffer, len);
-  } else {
-    str.clear();
-  }
-}
-
 inline void read_string(ReadContext& context, std::string& str) {
   uint64_t len;
   read_data(context, len);
@@ -1045,27 +836,6 @@ void read_tensor_parameters_impl(TensorParameters& parameters,
   }
 }
 
-inline void read_string_vector(const char*& buffer,
-                               std::vector<std::string>& vec) {
-  uint64_t size;
-  read_data(buffer, size);
-  vec.resize(size);
-  for (uint64_t i = 0; i < size; ++i) {
-    read_string(buffer, vec[i]);
-  }
-}
-
-inline void read_string_vector(const char*& buffer,
-                               std::vector<std::string>& vec,
-                               const char*& device_buffer) {
-  uint64_t size;
-  read_data(buffer, size, device_buffer);
-  vec.resize(size);
-  for (uint64_t i = 0; i < size; ++i) {
-    read_string(buffer, vec[i], device_buffer);
-  }
-}
-
 inline void read_string_vector(ReadContext& context,
                                std::vector<std::string>& vec) {
   uint64_t size;
@@ -1074,37 +844,6 @@ inline void read_string_vector(ReadContext& context,
   for (uint64_t i = 0; i < size; ++i) {
     read_string(context, vec[i]);
   }
-}
-
-inline void read_tensor(const char*& buffer, torch::Tensor& tensor) {
-  // read ndim
-  uint64_t ndim;
-  read_data(buffer, ndim);
-  if (ndim == 0) {
-    return;
-  }
-  // read shape
-  std::vector<int64_t> shape(ndim);
-  for (size_t i = 0; i < ndim; ++i) {
-    int64_t dim_size;
-    read_data(buffer, dim_size);
-    shape[i] = static_cast<int64_t>(dim_size);
-  }
-  // read dtype
-  int8_t tensor_dtype;
-  read_data(buffer, tensor_dtype);
-  auto dtype = static_cast<torch::ScalarType>(tensor_dtype);
-  // read data_bytes
-  uint64_t data_bytes;
-  read_data(buffer, data_bytes);
-
-  tensor = torch::from_blob(const_cast<void*>(static_cast<const void*>(buffer)),
-                            shape,
-                            torch::TensorOptions()
-                                .dtype(dtype)
-                                .device(torch::kCPU)
-                                .pinned_memory(true));
-  buffer += data_bytes;
 }
 
 inline TensorMeta read_tensor_meta(ReadContext& context) {
@@ -1254,75 +993,6 @@ inline void read_tensor_and_host(ReadContext& context,
                          get_aligned_tensor_arena_bytes(meta.data_bytes));
 }
 
-inline void read_tensor(const char*& buffer,
-                        torch::Tensor& tensor,
-                        const char*& device_buffer,
-                        Stream* stream = nullptr) {
-  TensorMeta meta;
-  uint64_t ndim;
-  read_data(buffer, ndim, device_buffer);
-  if (ndim == 0) {
-    return;
-  }
-
-  meta.shape.resize(ndim);
-  for (size_t i = 0; i < ndim; ++i) {
-    int64_t dim_size;
-    read_data(buffer, dim_size, device_buffer);
-    meta.shape[i] = static_cast<int64_t>(dim_size);
-  }
-
-  int8_t tensor_dtype;
-  read_data(buffer, tensor_dtype, device_buffer);
-  meta.dtype = static_cast<torch::ScalarType>(tensor_dtype);
-  read_data(buffer, meta.data_bytes, device_buffer);
-
-  if (device_buffer != nullptr) {
-    DeviceBufferSession device_session;
-    device_session.device_cursor = device_buffer;
-    device_session.active = true;
-    tensor =
-        materialize_tensor_from_current_cursor(meta, device_session, stream);
-    safe_advance_buffer(device_buffer, meta.data_bytes);
-  } else {
-    tensor =
-        torch::from_blob(const_cast<void*>(static_cast<const void*>(buffer)),
-                         meta.shape,
-                         torch::TensorOptions()
-                             .dtype(meta.dtype)
-                             .device(torch::kCPU)
-                             .pinned_memory(true));
-  }
-  buffer += meta.data_bytes;
-}
-
-template <typename T>
-inline void read_vector(const char*& buffer, std::vector<T>& vec) {
-  uint64_t size;
-  read_data(buffer, size);
-  vec.resize(size);
-  if (size > 0) {
-    const size_t bytes = size * type_size<T>;
-    std::memcpy(vec.data(), buffer, bytes);
-    buffer += bytes;
-  }
-}
-
-template <typename T>
-inline void read_vector(const char*& buffer,
-                        std::vector<T>& vec,
-                        const char*& device_buffer) {
-  uint64_t size;
-  read_data(buffer, size, device_buffer);
-  vec.resize(size);
-  if (size > 0) {
-    const size_t bytes = size * type_size<T>;
-    std::memcpy(vec.data(), buffer, bytes);
-    buffer += bytes;
-    safe_advance_buffer(device_buffer, bytes);
-  }
-}
-
 template <typename T>
 inline void read_vector(ReadContext& context, std::vector<T>& vec) {
   uint64_t size;
@@ -1378,34 +1048,6 @@ inline void read_tensor_and_vector(ReadContext& context,
                          get_aligned_tensor_arena_bytes(meta.data_bytes));
 }
 
-inline void read_instance_info(const char*& buffer, InstanceInfo& info) {
-  read_string(buffer, info.name);
-  read_string(buffer, info.rpc_address);
-  read_string(buffer, info.type);
-
-  read_vector(buffer, info.cluster_ids);
-
-  uint64_t addr_count;
-  read_data(buffer, addr_count);
-  info.addrs.resize(addr_count);
-  for (auto& addr : info.addrs) {
-    read_string(buffer, addr);
-  }
-
-  read_data(buffer, info.dp_size);
-  read_data(buffer, info.kv_split_size);
-
-  uint64_t prof_size;
-  read_data(buffer, prof_size);
-  info.ttft_profiling_data.resize(prof_size);
-  if (prof_size > 0) {
-    std::memcpy(info.ttft_profiling_data.data(),
-                buffer,
-                prof_size * sizeof(std::pair<int32_t, int64_t>));
-    buffer += prof_size * sizeof(std::pair<int32_t, int64_t>);
-  }
-}
-
 inline void read_instance_info(ReadContext& context, InstanceInfo& info) {
   read_string(context, info.name);
   read_string(context, info.rpc_address);
@@ -1435,32 +1077,6 @@ inline void read_instance_info(ReadContext& context, InstanceInfo& info) {
   }
 }
 
-inline void read_virtual_kv_cache_layer_global_offsets(
-    const char*& buffer,
-    std::vector<VirtualKVCacheLayerGlobalOffsets>& offsets) {
-  uint64_t num_layers;
-  read_data(buffer, num_layers);
-  offsets.resize(num_layers);
-  for (auto& layer : offsets) {
-    read_vector(buffer, layer.k_offsets);
-    read_vector(buffer, layer.v_offsets);
-    read_vector(buffer, layer.index_offsets);
-  }
-}
-
-inline void read_kv_transfer_mappings(
-    const char*& buffer,
-    std::vector<KVTransferMapping>& mappings) {
-  uint64_t mapping_count;
-  read_data(buffer, mapping_count);
-  mappings.resize(mapping_count);
-  for (KVTransferMapping& mapping : mappings) {
-    read_data(buffer, mapping.group_id);
-    read_vector(buffer, mapping.local_ids);
-    read_vector(buffer, mapping.remote_ids);
-  }
-}
-
 inline void read_kv_transfer_mappings(
     ReadContext& context,
     std::vector<KVTransferMapping>& mappings) {
@@ -1487,16 +1103,6 @@ inline void read_virtual_kv_cache_layer_global_offsets(
   }
 }
 
-inline void read_transfer_kv_info(const char*& buffer, TransferKVInfo& info) {
-  read_string(buffer, info.request_id);
-  read_data(buffer, info.rank_local_mapping);
-  read_data(buffer, info.dp_rank);
-  read_instance_info(buffer, info.remote_instance_info);
-  read_virtual_kv_cache_layer_global_offsets(
-      buffer, info.dst_virtual_kv_cache_layer_global_offsets);
-  read_kv_transfer_mappings(buffer, info.mappings);
-}
-
 inline void read_transfer_kv_info(ReadContext& context, TransferKVInfo& info) {
   read_string(context, info.request_id);
   read_data(context, info.rank_local_mapping);
@@ -1505,14 +1111,6 @@ inline void read_transfer_kv_info(ReadContext& context, TransferKVInfo& info) {
   read_virtual_kv_cache_layer_global_offsets(
       context, info.dst_virtual_kv_cache_layer_global_offsets);
   read_kv_transfer_mappings(context, info.mappings);
-}
-
-inline void read_eplb_info(const char*& buffer, EplbInfo& info) {
-  read_data(buffer, info.prepare_layer_id);
-  read_data(buffer, info.prepare_token);
-  read_vector(buffer, info.expert_ids);
-  read_data(buffer, info.update_layer_id);
-  read_data(buffer, info.activation_token);
 }
 
 inline void read_eplb_info(ReadContext& context, EplbInfo& info) {
@@ -1532,30 +1130,6 @@ inline void read_vector_tensor(ReadContext& context,
   tensor_vec.resize(tensor_num);
   for (size_t i = 0; i < tensor_num; ++i) {
     read_tensor(context, tensor_vec[i], stream, force_host_materialize);
-  }
-}
-
-inline void read_mm_dict(const char*& buffer,
-                         MMDict& mm_dict,
-                         const char*& device_buffer) {
-  size_t size;
-  read_data(buffer, size, device_buffer);
-  int32_t tensor_num;
-  while (size--) {
-    std::string mm_key;
-    read_string(buffer, mm_key, device_buffer);
-    read_data(buffer, tensor_num, device_buffer);
-    if (tensor_num == 1) {
-      torch::Tensor tensor;
-      read_tensor(buffer, tensor, device_buffer);
-      mm_dict[mm_key] = tensor;
-    } else {
-      std::vector<torch::Tensor> tensor_vec(tensor_num);
-      for (size_t i = 0; i < tensor_num; ++i) {
-        read_tensor(buffer, tensor_vec[i], device_buffer);
-      }
-      mm_dict[mm_key] = tensor_vec;
-    }
   }
 }
 
@@ -1579,36 +1153,6 @@ inline void read_mm_dict(ReadContext& context, MMDict& mm_dict) {
       mm_dict[mm_key] = tensor_vec;
     }
   }
-}
-
-inline void read_mm_item(const char*& buffer,
-                         MMDataItem& item,
-                         const char*& device_buffer) {
-  uint32_t type;
-  read_data(buffer, type, device_buffer);
-  MMDict dict;
-  read_mm_dict(buffer, dict, device_buffer);
-  auto mm_type_value = static_cast<MMType::Value>(type);
-  item = std::move(MMDataItem(mm_type_value, dict));
-  auto& state = item.mutable_state();
-  read_data(buffer, state.mutable_seq_index(), device_buffer);
-
-  // read token_pos
-  read_data(buffer, state.mutable_token_pos().offset, device_buffer);
-  read_data(buffer, state.mutable_token_pos().length, device_buffer);
-  read_data(buffer, state.mutable_mm_token_num(), device_buffer);
-
-  // read mm_token_mask
-  read_tensor(buffer, state.mutable_mm_token_mask(), device_buffer);
-
-  // read schedule_data
-  std::memcpy(state.mutable_schedule_data().key.data,
-              buffer,
-              XXH3_128BITS_HASH_VALUE_LEN);
-  buffer += XXH3_128BITS_HASH_VALUE_LEN;
-  safe_advance_buffer(device_buffer, XXH3_128BITS_HASH_VALUE_LEN);
-  read_data(buffer, state.mutable_schedule_data().start_pos, device_buffer);
-  read_data(buffer, state.mutable_schedule_data().end_pos, device_buffer);
 }
 
 inline void read_mm_item(ReadContext& context, MMDataItem& item) {
@@ -1635,17 +1179,6 @@ inline void read_mm_item(ReadContext& context, MMDataItem& item) {
   read_data(context, state.mutable_schedule_data().end_pos);
 }
 
-inline void read_mm_data_dict(const char*& buffer,
-                              MMData& mm_data,
-                              const char*& device_buffer) {
-  uint32_t mm_type;
-  read_data(buffer, mm_type, device_buffer);
-  MMDict mm_dict;
-  read_mm_dict(buffer, mm_dict, device_buffer);
-  MMType ty{static_cast<MMType::Value>(mm_type)};
-  mm_data = MMData(ty, mm_dict);
-}
-
 inline void read_mm_data_dict(ReadContext& context, MMData& mm_data) {
   uint32_t mm_type;
   read_data(context, mm_type);
@@ -1653,23 +1186,6 @@ inline void read_mm_data_dict(ReadContext& context, MMData& mm_data) {
   read_mm_dict(context, mm_dict);
   MMType ty{static_cast<MMType::Value>(mm_type)};
   mm_data = MMData(ty, mm_dict);
-}
-
-inline void read_mm_data_items(const char*& buffer,
-                               MMData& mm_data,
-                               const char*& device_buffer) {
-  uint32_t mm_type;
-  read_data(buffer, mm_type, device_buffer);
-  size_t mm_items_num;
-  read_data(buffer, mm_items_num, device_buffer);
-  MMItemVec mm_items;
-  mm_items.reserve(mm_items_num);
-  for (size_t idx = 0; idx < mm_items_num; ++idx) {
-    mm_items.emplace_back(MMType::NONE);
-    read_mm_item(buffer, mm_items.back(), device_buffer);
-  }
-  MMType ty{static_cast<MMType::Value>(mm_type)};
-  mm_data = MMData(ty, std::move(mm_items));
 }
 
 inline void read_mm_data_items(ReadContext& context, MMData& mm_data) {
@@ -1685,29 +1201,6 @@ inline void read_mm_data_items(ReadContext& context, MMData& mm_data) {
   }
   MMType ty{static_cast<MMType::Value>(mm_type)};
   mm_data = MMData(ty, std::move(mm_items));
-}
-
-inline void read_mm_batch_data(const char*& buffer,
-                               MMBatchData& batch_mm_data,
-                               const char*& device_buffer) {
-  using ReadMmDataFn = void (*)(const char*&, MMData&, const char*&);
-
-  std::vector<MMData> vec;
-
-  size_t mm_data_num;
-  read_data(buffer, mm_data_num, device_buffer);
-  uint8_t is_mm_item;
-  read_data(buffer, is_mm_item, device_buffer);
-  vec.reserve(mm_data_num);
-  ReadMmDataFn read_mm_data =
-      is_mm_item ? static_cast<ReadMmDataFn>(&read_mm_data_items)
-                 : static_cast<ReadMmDataFn>(&read_mm_data_dict);
-  for (size_t i = 0; i < mm_data_num; ++i) {
-    vec.emplace_back();
-    read_mm_data(buffer, vec.back(), device_buffer);
-  }
-
-  batch_mm_data.batch(std::move(vec));
 }
 
 inline void read_mm_batch_data(ReadContext& context,

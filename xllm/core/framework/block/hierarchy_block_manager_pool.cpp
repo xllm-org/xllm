@@ -953,8 +953,7 @@ void HierarchyBlockManagerPool::allocate_shared(Sequence* sequence) {
                                                host_probes,
                                                sequence->tokens().size(),
                                                sequence->num_tokens());
-  VLOG(1) << "[HostCache][PrefixMatch] sequence_id=" << sequence->seq_id()
-          << " hbm_tokens=" << match.hbm_tokens
+  VLOG(1) << "[HostCache][PrefixMatch] hbm_tokens=" << match.hbm_tokens
           << " host_tokens=" << match.host_tokens;
 
   sequence->clear_host_cache_match();

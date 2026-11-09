@@ -657,7 +657,8 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .head_dim(args.head_dim())
       .index_head_dim(std::max(args.index_head_dim(), 1))
       .window_size(std::max(args.window_size(), 1))
-      .compress_ratios(args.compress_ratios());
+      .compress_ratios(args.compress_ratios())
+      .kv_source_layer_ids(args.kv_source_layer_ids());
 #if defined(USE_NPU)
   create_options.enable_kv_cache_huge_page_allocator(use_huge_page_allocator);
 #endif

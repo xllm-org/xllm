@@ -1256,27 +1256,34 @@ TEST_F(BlockManagerPoolTest, SequenceUpdateBlockHashes) {
     prompt.push_back(static_cast<int32_t>(i * 7 + 1));
   }
 
-  // Build the Sequence in-test so the sampling/stopping params outlive it.
   RequestSamplingParam sampling_param;
 
   sampling_param.is_embeddings = false;
   StoppingChecker stopping_checker;
   SequenceParams params;
   params.seq_capacity = prompt.size() + 8;
+  params.enable_schedule_overlap = true;
   params.bos_token_id = 0;
   params.request_id = "seq_block_hash_test";
   params.sampling_param = &sampling_param;
   params.stopping_checker = &stopping_checker;
+  const size_t rewrite_index = 2 * block_size + 1;
+  const std::vector<int32_t> initial_prompt(prompt.begin(),
+                                            prompt.begin() + rewrite_index);
   IncrementalDecoder decoder(/*prompt=*/"prompt",
-                             /*num_prompt_tokens=*/prompt.size(),
+                             /*num_prompt_tokens=*/initial_prompt.size(),
                              /*echo=*/false,
                              /*skip_special_tokens=*/true);
   Sequence seq(/*index=*/0,
-               prompt,
+               initial_prompt,
                /*input_embedding=*/torch::Tensor(),
                /*mm_data=*/MMData(),
                decoder,
                params);
+  seq.kv_state().set_kv_cache_tokens_num(initial_prompt.size());
+  for (size_t i = initial_prompt.size(); i < prompt.size(); ++i) {
+    seq.append_token(prompt[i]);
+  }
 
   const std::vector<XXH3Key> expected = ExpectedChain(prompt, block_size);
 
@@ -1295,7 +1302,7 @@ TEST_F(BlockManagerPoolTest, SequenceUpdateBlockHashes) {
 
   // Rewriting a token in block index 2 invalidates block 2 and everything
   // after it; blocks 0 and 1 survive.
-  seq.update_token(2 * block_size + 1, Token(/*id=*/999999));
+  seq.update_last_step_token(Token(/*id=*/999999));
   EXPECT_EQ(seq.block_hashes().size(), 2u);
 
   // Recompute: blocks 0/1 unchanged, block 2 differs from the old chain.

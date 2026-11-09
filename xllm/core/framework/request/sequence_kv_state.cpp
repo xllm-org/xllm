@@ -51,7 +51,6 @@ void KVCacheState::set_kv_cache_tokens_num(size_t num) {
 void KVCacheState::incr_kv_cache_tokens_num(size_t num) {
   CHECK(kv_cache_tokens_num_ + num <= current_max_tokens_capacity());
   kv_cache_tokens_num_ += num;
-  slice_window_pos_ += num;
 }
 
 void KVCacheState::incr_kv_cache_tokens_num_up_to(size_t new_target) {
@@ -66,9 +65,7 @@ void KVCacheState::incr_kv_cache_tokens_num_up_to(size_t new_target) {
       << "incr_kv_cache_tokens_num_up_to target above capacity: " << new_target
       << " > " << capacity;
   if (new_target > kv_cache_tokens_num_) {
-    const size_t delta = new_target - kv_cache_tokens_num_;
     kv_cache_tokens_num_ = new_target;
-    slice_window_pos_ += delta;
   }
 }
 
@@ -88,12 +85,10 @@ size_t KVCacheState::num_blocks(BlockType type) const {
 }
 
 bool KVCacheState::has_any_blocks() const {
-  // Cache-bearing types only; EMBEDDING is a per-sequence resource block, not
-  // token cache, and must not count toward "the sequence already holds cache".
-  for (const BlockType type :
-       {BlockType::KV, BlockType::SWA, BlockType::C4, BlockType::C128}) {
-    const auto it = composite_blocks_.find(type);
-    if (it != composite_blocks_.end() && !it->second.empty()) {
+  // Only token caches establish ownership; recurrent and embedding slots are
+  // per-sequence resources.
+  for (const auto& [type, blocks] : composite_blocks_) {
+    if (!blocks.empty() && is_kv_split_cache_block_type(type)) {
       return true;
     }
   }
@@ -138,12 +133,6 @@ void KVCacheState::remember_block_size(BlockType type,
         << "block size changed for cache type " << static_cast<int32_t>(type);
     return;
   }
-}
-
-void KVCacheState::incr_shared_blocks_num(BlockType type, size_t num) {
-  uint32_t& shared = num_owned_shared_blocks_[type];
-  CHECK(shared + num <= num_blocks(type));
-  shared += num;
 }
 
 void KVCacheState::set_shared_blocks_num(BlockType type, size_t num) {
@@ -300,25 +289,6 @@ void KVCacheState::set_num_cached_blocks(BlockType type, size_t n) {
   num_cached_blocks_[type] = n;
 }
 
-void KVCacheState::set_slice_window_size(uint32_t size) {
-  CHECK(size > 0);
-  CHECK(!blocks(BlockType::SWA).empty());
-  slice_window_size_ = size;
-  slice_window_pos_ = 0;
-  slice_window_buffer_ = size;
-}
-
-void KVCacheState::update_slice_window_pos() {
-  if (slice_window_size_ > 0) {
-    if (slice_window_pos_ >= slice_window_buffer_) {
-      // Preserve the legacy cursor contract for non-composite block managers.
-      // CompositeBlockManager exposes DSA SWA tables as absolute logical
-      // columns instead.
-      slice_window_pos_ = slice_window_pos_ % slice_window_size_;
-    }
-  }
-}
-
 size_t KVCacheState::current_max_tokens_capacity() const {
   const Slice<Block> kv = blocks(BlockType::KV);
   if (!kv.empty()) {
@@ -331,7 +301,8 @@ size_t KVCacheState::current_max_tokens_capacity() const {
   // keep advancing past ring_capacity * block_size, so counting it here would
   // make incr_kv_cache_tokens_num's CHECK fail.
   size_t capacity = 0;
-  for (const BlockType type : {BlockType::C4, BlockType::C128}) {
+  for (const BlockType type :
+       {BlockType::C1, BlockType::C2, BlockType::C4, BlockType::C128}) {
     const Slice<Block> bs = blocks(type);
     if (bs.empty()) {
       continue;
@@ -396,10 +367,6 @@ size_t KVCacheState::next_transfer_block_idx() const {
   return next_transfer_block_idx_;
 }
 
-void KVCacheState::set_next_transfer_block_idx(size_t idx) {
-  next_transfer_block_idx_ = idx;
-}
-
 void KVCacheState::advance_transfer_block_idx(size_t idx) {
   next_transfer_block_idx_ = std::max(next_transfer_block_idx_, idx);
 }
@@ -420,7 +387,6 @@ void KVCacheState::reset() {
   prefix_cache_matched_ = false;
   num_owned_shared_blocks_.clear();
   num_cached_blocks_.clear();
-  pushed_local_block_count_ = 0;
   for (auto& [type, blocks] : composite_blocks_) {
     Block::release(std::move(blocks));
   }

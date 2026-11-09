@@ -34,6 +34,9 @@ cc_test(
     pybind11::embed
 )
 
+target_compile_definitions(glm5_next_moe_test PRIVATE
+  GLM5_NEXT_MOE_CASES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/glm5_next_moe_cases.py")
+
 # Temporarily disabled: Dsv4ScatterCache tests are unstable in the current
 # NPU test environment.
 # cc_test(

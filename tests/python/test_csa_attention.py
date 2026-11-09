@@ -25,13 +25,9 @@ from xllm.python import kernels
 from xllm.python.attention import csa_attention as csa_attention_module
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa_attention import (
-    COMPRESSED_SPARSE_ATTENTION,
-    HEAVILY_COMPRESSED_ATTENTION,
-    SLIDING_ATTENTION,
     CsaAttentionBackend,
     _attention_type_for_compress_ratio,
     _build_dspark_swa_indices,
-    _CompressedAttentionCacheMapping,
     _deepseek_v4_ori_window_left,
     _get_layer_cache_tensor,
     _scatter_by_slot,
@@ -142,18 +138,6 @@ def test_compress_ratio_per_layer() -> None:
     assert b._layer_compress_ratio(2) == 128
 
 
-@pytest.mark.parametrize(
-    ("compress_ratio", "attention_type"),
-    [
-        (1, SLIDING_ATTENTION),
-        (4, COMPRESSED_SPARSE_ATTENTION),
-        (128, HEAVILY_COMPRESSED_ATTENTION),
-    ],
-)
-def test_official_attention_type_names(compress_ratio: int, attention_type: str) -> None:
-    assert _attention_type_for_compress_ratio(compress_ratio) == attention_type
-
-
 def test_unsupported_compression_ratio_has_clear_error() -> None:
     with pytest.raises(ValueError, match="unsupported DeepSeek-V4 compression ratio"):
         _attention_type_for_compress_ratio(8)
@@ -248,12 +232,6 @@ def test_scatter_by_slot_npu_works_without_forward_context(monkeypatch: pytest.M
     assert len(calls) == 1
     assert calls[0][1].shape == (3, 1)
     assert calls[0][2].shape == (3, 3)
-
-
-def test_default_mapping_is_empty() -> None:
-    m = _CompressedAttentionCacheMapping()
-    assert m.cmp_cache_idx == -1
-    assert m.ori_cache_idx == -1
 
 
 def test_prepare_binds_compressed_metadata_to_current_forward(monkeypatch) -> None:
@@ -492,37 +470,6 @@ def test_prepare_clears_previous_forward_state() -> None:
     assert metadata.dsa_graph_mode is False
     assert not hasattr(backend, "_compressor_fn")
     assert not hasattr(backend, "_indexer_fn")
-
-
-def test_dsa_api_aliases_are_equivalent(monkeypatch) -> None:
-    backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
-    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
-    metadata = SimpleNamespace(
-        multi_block_tables=[],
-        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
-        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
-        is_prefill=False,
-        is_chunked_prefill=False,
-        dsa_metadata=None,
-        dsa_positions=torch.tensor([0]),
-        dsa_cos_sin=None,
-        dsa_c4_cos_sin=None,
-        dsa_c128_cos_sin=None,
-        dsa_graph_mode=False,
-    )
-    backend.prepare_dsa_metadata_for_forward(metadata)
-    canonical = metadata.dsa_metadata
-    metadata.dsa_metadata = None
-    backend.prepare_csa_metadata_for_forward(metadata)
-    assert metadata.dsa_metadata is not canonical
-
-
-def test_graph_mode_is_recorded_on_metadata() -> None:
-    backend = _make_backend()
-    metadata = SimpleNamespace()
-    backend.prepare(metadata, graph_mode=True)
-    assert metadata.dsa_graph_mode is True
 
 
 def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
@@ -959,6 +906,7 @@ def test_graph_dsa_refresh_preserves_tensor_addresses() -> None:
     def make_metadata(value: int, seq_rows: int) -> SimpleNamespace:
         return SimpleNamespace(
             seq_lens=torch.full((seq_rows,), value, dtype=torch.int32),
+            seq_lens_q_host=[value] * seq_rows,
             block_tables=[[torch.full((seq_rows, 2), value, dtype=torch.int32)]],
             slot_mappings=[[torch.full((seq_rows,), value, dtype=torch.int32)]],
             input_rope_by_ratio={

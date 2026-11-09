@@ -116,6 +116,8 @@ enum BlockType {
   C128 = 3;
   EMBEDDING = 4;
   LINEAR = 5;
+  C1 = 6;
+  C2 = 7;
 }
 
 message BlockTransferInfo {

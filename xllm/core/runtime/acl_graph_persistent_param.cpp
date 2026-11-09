@@ -1883,7 +1883,9 @@ void GraphPersistentParam::plan_paged_attention_tiling(
   // Convert torch tensors to atb tensors
   atb::Tensor atb_k_cache = atb::at_tensor_to_atb_tensor(k_cache);
   atb::Tensor atb_v_cache = atb::at_tensor_to_atb_tensor(v_cache);
-  atb::Tensor atb_block_tables = atb::at_tensor_to_atb_tensor(block_tables);
+  const auto contiguous_block_tables = block_tables.contiguous();
+  atb::Tensor atb_block_tables =
+      atb::at_tensor_to_atb_tensor(contiguous_block_tables);
   // Get context_lens from input_params.attention.device.kv_seq_lens
   atb::Tensor atb_context_lens =
       atb::at_tensor_to_atb_tensor(input_params.attention.device.kv_seq_lens);

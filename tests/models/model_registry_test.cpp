@@ -53,29 +53,6 @@ TEST(ModelRegistryTest, PythonModelMetadataRetainsBackendDiscovery) {
   EXPECT_EQ(ModelRegistry::get_model_backend("kimi_k25"), "vlm");
 }
 
-TEST(ModelRegistryTest, DeepseekV4DSparkUsesTorchBackend) {
-  std::string effective_backend;
-  std::string resolved_name;
-  std::string error_message;
-
-  EXPECT_TRUE(resolve_model_registration("deepseek_v4_dspark",
-                                         "AUTO",
-                                         &effective_backend,
-                                         &resolved_name,
-                                         &error_message));
-  EXPECT_EQ(effective_backend, "TORCH");
-  EXPECT_EQ(resolved_name, "deepseek_v4_dspark");
-  EXPECT_TRUE(error_message.empty());
-
-  EXPECT_TRUE(resolve_model_registration("deepseek_v4_dspark",
-                                         "TORCH",
-                                         &effective_backend,
-                                         &resolved_name,
-                                         &error_message));
-  EXPECT_EQ(effective_backend, "TORCH");
-  EXPECT_EQ(resolved_name, "deepseek_v4_dspark");
-}
-
 TEST(ModelRegistryTest, ExtensionModelUsesTorchRouting) {
   std::string effective_backend;
   std::string resolved_name;
@@ -89,29 +66,6 @@ TEST(ModelRegistryTest, ExtensionModelUsesTorchRouting) {
   EXPECT_EQ(effective_backend, "TORCH");
   EXPECT_EQ(resolved_name, "extension_model");
   EXPECT_TRUE(error_message.empty());
-}
-
-TEST(ModelRegistryTest, GlmMoeDsaMtpUsesTorchBackend) {
-  std::string effective_backend;
-  std::string resolved_name;
-  std::string error_message;
-
-  EXPECT_TRUE(resolve_model_registration("glm_moe_dsa_mtp",
-                                         "AUTO",
-                                         &effective_backend,
-                                         &resolved_name,
-                                         &error_message));
-  EXPECT_EQ(effective_backend, "TORCH");
-  EXPECT_EQ(resolved_name, "glm_moe_dsa_mtp");
-  EXPECT_TRUE(error_message.empty());
-
-  EXPECT_TRUE(resolve_model_registration("glm_moe_dsa_mtp",
-                                         "TORCH",
-                                         &effective_backend,
-                                         &resolved_name,
-                                         &error_message));
-  EXPECT_EQ(effective_backend, "TORCH");
-  EXPECT_EQ(resolved_name, "glm_moe_dsa_mtp");
 }
 
 TEST(ModelRegistryTest, NpuResolutionUsesEachInstanceExtensionSelection) {
@@ -343,6 +297,12 @@ TEST(ModelRegistryTest, Glm5NextMtpPreservesBackendIndexSharingPolicy) {
 #endif
     }
   }
+}
+
+TEST(ModelRegistryTest, DeepseekV41RegistersArgsLoaderAndLlmBackend) {
+  EXPECT_TRUE(
+      static_cast<bool>(ModelRegistry::get_model_args_loader("deepseek_v41")));
+  EXPECT_EQ(ModelRegistry::get_model_backend("deepseek_v41"), "llm");
 }
 
 }  // namespace

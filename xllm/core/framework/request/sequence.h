@@ -205,11 +205,6 @@ class Sequence {
     return {tokens_, kv_state_.kv_cache_tokens_num()};
   }
 
-  // get token ids in host kv cache
-  Slice<int32_t> cached_host_tokens() const {
-    return {tokens_, host_kv_state_.kv_cache_tokens_num()};
-  }
-
   // get the number of tokens need compute
   size_t num_need_compute_tokens() const {
     return num_tokens_ - kv_cache_tokens_num();
@@ -227,7 +222,6 @@ class Sequence {
   // the token would be discarded if the sequence is still in prefill stage
   void append_token(const Token& token);
   void append_token(int64_t token_id) { append_token(Token(token_id)); }
-  void update_token(size_t index, const Token& token);
   void update_last_step_token(const Token& token, size_t token_offset = 0);
   bool has_new_tokens_generated() const {
     return num_tokens_ > stream_output_token_offset_;
@@ -261,10 +255,6 @@ class Sequence {
     return kv_state_.get_linear_block_id();
   }
 
-  int32_t get_recurrent_state_slot_id() const {
-    return get_linear_state_slot_id();
-  }
-
   // The request id already lives in sequence_params_; don't keep a second
   // copy per sequence (a heap allocation each for UUID-length ids).
   const std::string& request_id() const { return sequence_params_.request_id; }
@@ -278,9 +268,6 @@ class Sequence {
   bool has_input_embedding() const { return input_embedding_.defined(); }
 
   void add_blocks(BlockType type, const std::vector<Block>& blocks);
-  void add_host_blocks(BlockType type, const std::vector<Block>& blocks);
-  void add_shared_host_blocks(BlockType type, std::vector<Block>&& blocks);
-
   // Precomputed chained block hashes used by the prefix cache. Covers all full
   // blocks with available token dependencies; reused by match()/insert() so the
   // hash is computed once per sequence instead of recomputed on every call.
@@ -372,12 +359,6 @@ class Sequence {
     return generated_tokens_since_latency_;
   }
 
-  void set_wait_time_ms() {
-    wait_time_ms_ = static_cast<int32_t>(
-        absl::ToDoubleSeconds(absl::Now() - latest_generate_time_) * 1000);
-  }
-  int32_t get_wait_time_ms() const { return wait_time_ms_; }
-
   // set sequence ttft
   void set_time_to_first_token_latency_seconds(
       double time_to_first_token_latency_seconds) {
@@ -411,9 +392,6 @@ class Sequence {
   void set_host_cache_match(size_t restore_tokens, size_t copy_units);
   void set_host_cache_restore(size_t restore_tokens, size_t copy_units);
   void clear_host_cache_match();
-  bool has_host_cache_match() const {
-    return effective_restore_tokens_.has_value();
-  }
   size_t host_cache_copy_units() const { return host_cache_copy_units_; }
   // Scheduler-owned H2D aliases move to the batch before transfer submission.
   std::shared_ptr<KVCacheBlockLease> retain_host_restore_blocks(
@@ -437,20 +415,11 @@ class Sequence {
                : *sequence_params_.sample_slots;
   }
 
-  bool check_need_unique_tokens() { return need_unique_tokens_; }
-
-  LogprobState* logprob_state() { return &logprob_state_; }
   void set_estimated_latency(double estimated_latency) {
     estimated_latency_ = estimated_latency;
   }
 
   double estimated_latency() const { return estimated_latency_; }
-
-  // set sequence id
-  void set_seq_id(int32_t seq_id) { seq_id_ = seq_id; }
-
-  // get sequence id
-  int32_t seq_id() const { return seq_id_; }
 
   void set_cancel() { cancelled_.store(true, std::memory_order_relaxed); }
 
@@ -487,9 +456,6 @@ class Sequence {
   // Whether the sequence can only be finished once it generated a token.
   virtual bool requires_generated_token_to_finish() const { return false; }
 
-  // Read access for derived output paths.
-  const SequenceParams& sequence_params() const { return sequence_params_; }
-  const torch::Tensor& output_embedding() const { return output_embedding_; }
   // Number of leading tokens that are real: trailing placeholder tokens (< 0,
   // appended under schedule overlap) are excluded.
   size_t num_valid_tokens() const;
@@ -518,7 +484,6 @@ class Sequence {
   void generate_embeddings_output(SequenceOutput& output);
   void generate_mm_embeddings_output(SequenceOutput& output);
 
-  int32_t wait_time_ms_ = 0;
   double estimated_latency_ = 0.0;
 
   // the index of the sequence in the request
@@ -651,9 +616,6 @@ class Sequence {
 
   // dp_rank
   int32_t dp_rank_ = -1;
-
-  // seq id in the batch
-  int32_t seq_id_ = -1;
 
   // for enable_schedule_overlap case
   uint32_t cur_generated_token_idx_;

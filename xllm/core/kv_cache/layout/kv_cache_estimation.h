@@ -113,6 +113,8 @@ struct Dsv4KVCacheEstimateCost {
   int64_t swa_count = 0;
   int64_t n_c4_layers = 0;
   int64_t n_c128_layers = 0;
+  int64_t n_c2_layers = 0;
+  int64_t n_c1_layers = 0;
   int64_t swa_bytes_per_block = 0;
   int64_t constant_swa_bytes = 0;
   int64_t token_unit_bytes = 0;

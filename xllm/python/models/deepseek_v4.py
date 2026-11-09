@@ -36,7 +36,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, TypeVar
 
 import torch
 import torch.nn as nn
@@ -284,6 +284,9 @@ def _compress_kv(
 # ---------------------------------------------------------------------------
 
 
+_ConfigT = TypeVar("_ConfigT", bound="DeepseekV4Config")
+
+
 @dataclass
 class DeepseekV4Config:
     """DeepSeek-V4 model config (DSV3.2 MLA fields + DSV4-specific fields)."""
@@ -351,7 +354,7 @@ class DeepseekV4Config:
     num_speculative_tokens: int = 0
 
     @classmethod
-    def from_dict(cls, d: dict) -> DeepseekV4Config:
+    def from_dict(cls: type[_ConfigT], d: dict) -> _ConfigT:
         rs_raw = d.get("rope_scaling")
         rs = rs_raw if isinstance(rs_raw, dict) else {}
 
@@ -1333,8 +1336,6 @@ class DeepseekV4MoE(nn.Module):
             # stores each W4 output pair in one int8 row; after transpose the
             # operator consumes NZ/INT32 packed weights and int64 bit-cast
             # per-channel scales plus the summed scale_bias.
-            import torch_npu
-
             def _pack(weight: torch.Tensor) -> torch.Tensor:
                 weight = torch_npu.npu_format_cast(weight.transpose(1, 2).contiguous(), 29)
                 return weight.view(torch.int32).contiguous()
@@ -2025,7 +2026,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
         mlp = self.model.layers[layer_id].mlp
         if hasattr(mlp, "experts_w13"):
             moe_prefix = _resolve_dsv4_moe_prefix(loader, checkpoint_prefix, description)
-            self._load_dsv4_moe(loader, checkpoint_prefix, parameter_prefix, layer_id, moe_prefix)
+            self._load_dsv4_moe(mlp, loader, checkpoint_prefix, parameter_prefix, layer_id, moe_prefix)
             mlp.process_weights_after_loading()
         else:
             self._load_dsv4_dense_mlp(loader, checkpoint_prefix, parameter_prefix, mlp)
@@ -2194,23 +2195,16 @@ class DeepseekV4ForCausalLM(PyModelBase):
             loader.get_tensor(bias_key),
         )
 
+    @staticmethod
     def _load_dsv4_moe(
-        self,
+        mlp: DeepseekV4MoE,
         loader: W8A8WeightLoader,
         ck: str,
         pm: str,
         layer_id: int,
         source_prefix: str,
     ) -> None:
-        """Stage DSV4 MoE weights for DeepseekV4MoE (hash routing + EP sharding).
-
-        Loads gate.weight + tid2eid (hash layers) + per-expert w1/w2/w3
-        (only local EP experts, fused into w13=w1+w3) + shared_experts.
-        Mirrors C++ FusedMoEImpl::load_experts (fused_moe.cpp:1938+).
-        """
-
-        cfg = self.cfg
-        mlp = self.model.layers[layer_id].mlp
+        cfg = mlp.cfg
         gate_prefix = _find_checkpoint_prefix(
             loader,
             (
@@ -2221,23 +2215,23 @@ class DeepseekV4ForCausalLM(PyModelBase):
         )
         if gate_prefix is None:
             raise KeyError(f"DeepSeek-V4 layer {layer_id} routing gate weight not found")
-        self._load_dsv4_moe_routing(loader, gate_prefix, pm, mlp, layer_id)
+        DeepseekV4ForCausalLM._load_dsv4_moe_routing(loader, gate_prefix, pm, mlp, layer_id)
         # Per-expert w1+w3 -> fused w13, w2 -> w2 (int8 + scale).
         # EP: only load local experts [start_expert_id, start_expert_id + num_experts_per_rank).
         tp = mlp.moe_tp_size
         tp_rank = mlp.moe_tp_rank
         start = mlp.start_expert_id
         nepr = mlp.num_experts_per_rank
-        w13 = self.get_parameter(pm + "mlp.experts_w13")
-        w2 = self.get_parameter(pm + "mlp.experts_w2")
-        w13_scale = self.get_buffer(pm + "mlp.experts_w13_scale")
-        w13_scale_second = self.get_buffer(pm + "mlp.experts_w13_scale_second")
-        w2_scale = self.get_buffer(pm + "mlp.experts_w2_scale")
-        w2_scale_second = self.get_buffer(pm + "mlp.experts_w2_scale_second")
-        w13_offset = self.get_buffer(pm + "mlp.experts_w13_offset")
-        w2_offset = self.get_buffer(pm + "mlp.experts_w2_offset")
-        w13_scale_bias = self.get_buffer(pm + "mlp.experts_w13_scale_bias")
-        w2_scale_bias = self.get_buffer(pm + "mlp.experts_w2_scale_bias")
+        w13 = mlp.get_parameter("experts_w13")
+        w2 = mlp.get_parameter("experts_w2")
+        w13_scale = mlp.get_buffer("experts_w13_scale")
+        w13_scale_second = mlp.get_buffer("experts_w13_scale_second")
+        w2_scale = mlp.get_buffer("experts_w2_scale")
+        w2_scale_second = mlp.get_buffer("experts_w2_scale_second")
+        w13_offset = mlp.get_buffer("experts_w13_offset")
+        w2_offset = mlp.get_buffer("experts_w2_offset")
+        w13_scale_bias = mlp.get_buffer("experts_w13_scale_bias")
+        w2_scale_bias = mlp.get_buffer("experts_w2_scale_bias")
 
         def _shard_fused(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
             """Shard w1/w3 independently, matching LOAD_MOE_FUSED_WEIGHT."""

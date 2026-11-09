@@ -111,6 +111,13 @@ RawSampleOutput make_raw_sample_output(int64_t token_id,
 
 namespace {
 
+class TokenIdTokenizer final : public Tokenizer {
+ public:
+  std::string decode(const Slice<int32_t>& ids, bool) const override {
+    return std::to_string(ids[0]);
+  }
+};
+
 KVTransferMapping make_mapping(BlockType block_type,
                                const std::vector<uint64_t>& remote_ids) {
   KVTransferMapping mapping;
@@ -581,7 +588,7 @@ TEST(ForwardInputBuilderTest, LaterChunkUsesLogicalOffset) {
   std::vector<Block> blocks = manager.allocate(4);
   Sequence sequence = make_basic_sequence({1});
   sequence.add_blocks(BlockType::KV, blocks);
-  sequence.kv_state().set_next_transfer_block_idx(2);
+  sequence.kv_state().advance_transfer_block_idx(2);
   const TransferKVInfo full_info = make_info({100, 101, 102, 103, 104});
 
   const TransferKVInfo info =
@@ -739,7 +746,7 @@ TEST(ForwardInputBuilderTest, SharedPrefixSlicesVirtualMemoryOffsets) {
   std::vector<Block> blocks = manager.allocate(4);
   Sequence sequence = make_basic_sequence({1});
   sequence.add_blocks(BlockType::KV, blocks);
-  sequence.kv_state().set_next_transfer_block_idx(2);
+  sequence.kv_state().advance_transfer_block_idx(2);
   TransferKVInfo full_info = make_info({100, 101, 102, 103, 104});
   full_info.dst_virtual_kv_cache_layer_global_offsets = {
       make_offsets({1000, 1001, 1002, 1003, 1004},
@@ -3968,17 +3975,20 @@ TEST(BatchTest, SampleRequestProcessesAllMatchedRawOutputs) {
   EXPECT_EQ(seq.tokens()[prompt_tokens], 101);
   EXPECT_EQ(seq.tokens()[prompt_tokens + 1], 202);
 
-  const auto& logprobs = seq.logprob_state()->get_logprobs();
-  ASSERT_TRUE(logprobs[prompt_tokens].has_value());
-  ASSERT_TRUE(logprobs[prompt_tokens + 1].has_value());
-  EXPECT_FLOAT_EQ(logprobs[prompt_tokens].value(), -0.10f);
-  EXPECT_FLOAT_EQ(logprobs[prompt_tokens + 1].value(), -0.20f);
-
-  const auto& top_tokens = seq.logprob_state()->get_top_tokens();
-  ASSERT_EQ(top_tokens[prompt_tokens].size(), 2);
-  ASSERT_EQ(top_tokens[prompt_tokens + 1].size(), 2);
-  EXPECT_EQ(top_tokens[prompt_tokens][0], 101);
-  EXPECT_EQ(top_tokens[prompt_tokens + 1][0], 202);
+  TokenIdTokenizer tokenizer;
+  std::optional<std::vector<LogProb>> logprobs;
+  seq.generate_output_tokens_logprobs(
+      prompt_tokens, seq.num_tokens(), tokenizer, logprobs);
+  ASSERT_TRUE(logprobs.has_value());
+  ASSERT_EQ(logprobs->size(), 2u);
+  EXPECT_FLOAT_EQ((*logprobs)[0].logprob, -0.10f);
+  EXPECT_FLOAT_EQ((*logprobs)[1].logprob, -0.20f);
+  ASSERT_TRUE((*logprobs)[0].top_logprobs.has_value());
+  ASSERT_TRUE((*logprobs)[1].top_logprobs.has_value());
+  ASSERT_EQ((*logprobs)[0].top_logprobs->size(), 2u);
+  ASSERT_EQ((*logprobs)[1].top_logprobs->size(), 2u);
+  EXPECT_EQ((*(*logprobs)[0].top_logprobs)[0].token_id, 101);
+  EXPECT_EQ((*(*logprobs)[1].top_logprobs)[0].token_id, 202);
 }
 
 TEST(BatchTest, SampleRequestDistributesRawOutputsAcrossSequences) {
@@ -4121,9 +4131,14 @@ TEST(BatchTest, SampleRequestFallsBackToEmptyPlaceholderOnPartialRawOutputs) {
   EXPECT_EQ(seq.tokens()[prompt_tokens], 301);
   EXPECT_EQ(seq.tokens()[prompt_tokens + 1], seq.tokens()[0]);
 
-  const auto& logprobs = seq.logprob_state()->get_logprobs();
-  ASSERT_TRUE(logprobs[prompt_tokens].has_value());
-  EXPECT_FALSE(logprobs[prompt_tokens + 1].has_value());
+  TokenIdTokenizer tokenizer;
+  std::optional<std::vector<LogProb>> logprobs;
+  seq.generate_output_tokens_logprobs(
+      prompt_tokens, seq.num_tokens(), tokenizer, logprobs);
+  ASSERT_TRUE(logprobs.has_value());
+  ASSERT_EQ(logprobs->size(), 1u);
+  EXPECT_EQ(logprobs->front().token_id, 301);
+  EXPECT_FLOAT_EQ(logprobs->front().logprob, -0.30f);
 }
 
 TEST_P(BatchOutputActionTest, CommitSkipsCancelledPendingTarget) {

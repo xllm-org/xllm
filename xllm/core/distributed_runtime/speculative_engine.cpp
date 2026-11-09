@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_controller.h"
+#include "core/framework/model/model_type.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
 #include "core/kv_cache/layout/vmm_kv_cache_layout.h"
 #include "core/util/tensor_options.h"
@@ -197,6 +198,11 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache(
       return engine_->allocate_kv_cache(capacity, layout);
     }
   };
+
+  if (util::is_deepseek_v41_model_type(model_args_.model_type())) {
+    LOG(FATAL) << "DeepSeek-V4.1 grouped KV (C1/C2) is not supported in the "
+                  "speculative path";
+  }
 
   if (draft_engine_ == nullptr) {
     return allocate_target_cache(target_kv_cache_cap);

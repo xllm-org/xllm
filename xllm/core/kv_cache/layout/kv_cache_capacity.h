@@ -66,6 +66,8 @@ class KVCacheCapacity final {
   PROPERTY(int64_t, swa_count) = 0;
   PROPERTY(int64_t, c4_count) = 0;
   PROPERTY(int64_t, c128_count) = 0;
+  PROPERTY(int64_t, c2_count) = 0;
+  PROPERTY(int64_t, c1_count) = 0;
 };
 
 }  // namespace xllm

@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -359,6 +359,7 @@ class DsaAttentionBackend(AttentionBackend):
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
         )
+        compressed_metadata.graph_token_capacity = int(getattr(metadata, "dsa_graph_token_capacity", 0) or 0)
         # Synthetic warmup metadata may omit rotary caches.
         if getattr(metadata, "dsa_cos_sin", None) is not None and metadata.dsa_cos_sin.numel() > 0:
             compressed_metadata.input_rope_by_ratio = self._build_dsa_rope_metadata(compressed_metadata, metadata)
@@ -499,10 +500,12 @@ class DsaAttentionBackend(AttentionBackend):
             cls._copy_graph_tensor(persistent_pair[0], refreshed_pair[0], f"input_rope[{ratio}].cos")
             cls._copy_graph_tensor(persistent_pair[1], refreshed_pair[1], f"input_rope[{ratio}].sin")
 
+        persistent.seq_lens_q_host = refreshed.seq_lens_q_host
         persistent.max_query_len = refreshed.max_query_len
         persistent.max_seq_len = refreshed.max_seq_len
         persistent.sparse_metadata_ori_win_left = refreshed.sparse_metadata_ori_win_left
         persistent.is_acl_graph = refreshed.is_acl_graph
+        persistent.graph_token_capacity = int(getattr(refreshed, "graph_token_capacity", 0) or 0)
         persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
 
     @staticmethod
@@ -545,7 +548,7 @@ class DsaAttentionBackend(AttentionBackend):
         metadata = self._metadata if metadata is None else metadata
         if metadata is None or metadata.dsa_metadata is None:
             raise RuntimeError("compressed-attention metadata must be prepared before CP localization")
-        dsa = metadata.dsa_metadata
+        dsa = cast("DsaMetadata", metadata.dsa_metadata)
 
         dsa.v4_cp_context = cp_context
 
@@ -555,6 +558,7 @@ class DsaAttentionBackend(AttentionBackend):
 
         q_lens = torch.tensor(local_q, dtype=torch.int32, device=device)
         dsa.seq_lens_q = q_lens
+        dsa.seq_lens_q_host = local_q
         actual_q = torch.cat(
             (
                 torch.zeros(1, dtype=torch.int32, device=device),

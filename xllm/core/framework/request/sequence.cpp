@@ -382,30 +382,6 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   finish_status_invalidated_ = true;
 }
 
-void Sequence::update_token(size_t index, const Token& token) {
-  // TODO: not record in non-disagg pd mode.
-  record_first_token(token);
-
-  const int32_t origin_token_id = tokens_[index];
-  const int32_t token_id = static_cast<int32_t>(token.id);
-  tokens_[index] = token_id;
-  // A rewritten token invalidates the cached hash of its block and all
-  // subsequent blocks; recompute lazily on the next update_block_hashes().
-  invalidate_block_hashes_from(index);
-  invalidate_linear_state_hashes_from(index);
-  if (need_unique_tokens_) {
-    --token_to_count_map_[origin_token_id];
-    ++token_to_count_map_[token_id];
-  }
-  // update logprobs if needed
-  if (sequence_params_.sampling_param->logprobs) {
-    logprob_state_.update_logprob(
-        index, token, sequence_params_.sampling_param->top_logprobs);
-  }
-  // logprobs_[index] = token.logprob;
-  finish_status_invalidated_ = true;
-}
-
 void Sequence::update_mm_embeddings(
     const std::vector<torch::Tensor>& mm_embeddings,
     EmbeddingOutputMetadata metadata) {
@@ -698,11 +674,6 @@ void Sequence::add_blocks(BlockType type, const std::vector<Block>& blocks) {
   kv_state_.add_blocks(type, blocks);
 }
 
-void Sequence::add_host_blocks(BlockType type,
-                               const std::vector<Block>& blocks) {
-  host_kv_state_.add_blocks(type, blocks);
-}
-
 size_t Sequence::num_prefix_cache_tokens() const {
   size_t cached_tokens = std::max(kv_state_.shared_tokens_num(),
                                   host_kv_state_.shared_tokens_num());
@@ -757,11 +728,6 @@ void Sequence::reset() {
   pending_host_restore_.reset();
   clear_host_cache_match();
   volatile_num_prompt_tokens_ = num_tokens_;
-}
-
-void Sequence::add_shared_host_blocks(BlockType type,
-                                      std::vector<Block>&& blocks) {
-  host_kv_state_.add_shared_blocks(type, std::move(blocks), num_tokens_);
 }
 
 Slice<XXH3Key> Sequence::block_hashes() const {

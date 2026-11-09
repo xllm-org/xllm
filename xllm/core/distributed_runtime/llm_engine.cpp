@@ -357,7 +357,8 @@ bool LLMEngine::allocate_kv_cache(
       .enable_kvcache_store = options_.enable_kvcache_store(),
       .instance_role = options_.instance_role(),
       .supports_grouped_cache_offload =
-          util::is_deepseek_v4_model_type(args_.model_type()),
+          util::is_deepseek_v4_model_type(args_.model_type()) &&
+          !util::is_deepseek_v41_model_type(args_.model_type()),
       .kv_cache_dtype = options_.kv_cache_dtype(),
       .indexer_cache_dtype = kv_cache_config.indexer_cache_dtype(),
       .model_type = args_.model_type(),
@@ -424,13 +425,30 @@ bool LLMEngine::allocate_kv_cache(
         0};  // unused for sliding window manager
     std::vector<uint32_t> token_manager_ratios;
     token_manager_ratios.reserve(2);
-    for (const int32_t ratio : args_.compress_ratios()) {
-      if (ratio == 4 || ratio == 128) {
-        const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
-        if (std::find(token_manager_ratios.begin(),
-                      token_manager_ratios.end(),
-                      ratio_u32) == token_manager_ratios.end()) {
-          token_manager_ratios.push_back(ratio_u32);
+    const auto add_ratio = [&](uint32_t ratio) {
+      if (std::find(token_manager_ratios.begin(),
+                    token_manager_ratios.end(),
+                    ratio) == token_manager_ratios.end()) {
+        token_manager_ratios.push_back(ratio);
+      }
+    };
+    if (util::is_deepseek_v41_model_type(args_.model_type())) {
+      const std::vector<int32_t>& compress_ratios = args_.compress_ratios();
+      for (const int32_t layer_id : args_.kv_source_layer_ids()) {
+        if (layer_id < 0 ||
+            layer_id >= static_cast<int64_t>(compress_ratios.size())) {
+          continue;
+        }
+        const int32_t ratio = compress_ratios[static_cast<size_t>(layer_id)];
+        if (ratio != 2 && ratio != 1) {
+          continue;
+        }
+        add_ratio(static_cast<uint32_t>(ratio));
+      }
+    } else {
+      for (const int32_t ratio : args_.compress_ratios()) {
+        if (ratio == 4 || ratio == 128) {
+          add_ratio(static_cast<uint32_t>(ratio));
         }
       }
     }

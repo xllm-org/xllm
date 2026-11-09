@@ -90,11 +90,11 @@ TEST(MultimodalProcessorTest, CacheRestoresMixedHitsAndMissesInInputOrder) {
       4);
   MMInputItem first;
   first.type = MMType::IMAGE;
-  first.hash_key = hash_string("first");
+  first.hash_key = hash_string("first", 0);
   first.decode_image = torch::ones({3, 2, 2});
   MMInputItem second;
   second.type = MMType::IMAGE;
-  second.hash_key = hash_string("second");
+  second.hash_key = hash_string("second", 0);
   second.decode_image = torch::zeros({3, 2, 2});
   MMData output;
   ASSERT_TRUE(processor.process_multimodal(MMInput({first}), output));

@@ -89,9 +89,6 @@ void publish_blocks(Sequence* seq,
 // being probed or restored as a prefix.
 bool leaf_participates_in_prefix_cache(BlockType type,
                                        bool instance_is_decode) {
-  if (!instance_is_decode) {
-    return true;
-  }
   switch (type) {
     case BlockType::KV:
     case BlockType::C4:
@@ -99,7 +96,10 @@ bool leaf_participates_in_prefix_cache(BlockType type,
       return true;
     case BlockType::SWA:
     case BlockType::LINEAR:
+      return !instance_is_decode;
     case BlockType::EMBEDDING:
+    case BlockType::C1:
+    case BlockType::C2:
       return false;
   }
   // Fail loudly on unhandled BlockType. Falling back to false would silently
@@ -108,6 +108,19 @@ bool leaf_participates_in_prefix_cache(BlockType type,
   LOG(FATAL) << "leaf_participates_in_prefix_cache: unhandled BlockType="
              << static_cast<int32_t>(type);
   return false;
+}
+
+inline BlockType block_type_from_compress_ratio(uint32_t ratio) {
+  if (ratio == 1) {
+    return BlockType::C1;
+  }
+  if (ratio == 2) {
+    return BlockType::C2;
+  }
+  if (ratio == 4) {
+    return BlockType::C4;
+  }
+  return BlockType::C128;
 }
 
 // Wrap the leaf in a concurrency adapter when sequence-level calls may run
@@ -349,18 +362,39 @@ CompositeBlockManager::LeafMap build_composite_leaves(
                   options.num_blocks(), options.shared_linear_state_slots()));
   }
 
-  const bool prefix_cache_on = options.enable_prefix_cache();
+  bool prefix_cache_on = options.enable_prefix_cache();
   const bool is_decode = options.instance_is_decode();
   const bool linear_participates =
       leaf_participates_in_prefix_cache(BlockType::LINEAR, is_decode);
   const bool swa_participates =
       leaf_participates_in_prefix_cache(BlockType::SWA, is_decode);
-  const bool c4_participates =
-      leaf_participates_in_prefix_cache(BlockType::C4, is_decode);
-  const bool c128_participates =
-      leaf_participates_in_prefix_cache(BlockType::C128, is_decode);
   const bool kv_participates =
       leaf_participates_in_prefix_cache(BlockType::KV, is_decode);
+
+  // C1/C2 cannot restore prefixes; disable the whole composite rather than
+  // cache SWA alone.
+  bool grouped_anchor_participates = false;
+  bool has_token_group = false;
+  for (size_t i = 0; i < options.manager_types().size(); ++i) {
+    if (options.manager_types()[i] != kManagerTypeBlockManagerImpl) {
+      continue;
+    }
+    if (i >= options.compress_ratios().size()) {
+      break;  // Size mismatch is checked when the leaves are built.
+    }
+    const uint32_t ratio = options.compress_ratios()[i];
+    const BlockType key = block_type_from_compress_ratio(ratio);
+    has_token_group |= key == BlockType::C1 || key == BlockType::C2;
+    if (leaf_participates_in_prefix_cache(key, is_decode)) {
+      grouped_anchor_participates = true;
+      break;
+    }
+  }
+  if (prefix_cache_on && has_token_group && !grouped_anchor_participates) {
+    LOG(WARNING) << "grouped cache has no prefix-cache-capable group; "
+                    "disabling prefix cache for this instance";
+    prefix_cache_on = false;
+  }
 
   // LINEAR holds recurrent state in addition to KV and must not determine
   // token capacity. The concurrent wrapper also covers off-scheduler callers.
@@ -421,17 +455,19 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     BlockManager::Options opts = options;
 
     if (type == kManagerTypeBlockManagerImpl) {
+      CHECK(compress_ratio == 1 || compress_ratio == 2 || compress_ratio == 4 ||
+            compress_ratio == 128)
+          << "unexpected compress_ratio " << compress_ratio
+          << " for composite BlockManagerImpl sub-manager";
+      // Scale block size and count together to preserve token capacity across
+      // compressed groups.
       opts.block_size(static_cast<uint32_t>(options.block_size()) *
                       compress_ratio);
       opts.num_blocks(static_cast<uint32_t>(options.num_blocks()) /
                       compress_ratio);
-      CHECK(compress_ratio == 4 || compress_ratio == 128)
-          << "unexpected compress_ratio " << compress_ratio
-          << " for composite BlockManagerImpl sub-manager";
-      const BlockType key =
-          compress_ratio == 4 ? BlockType::C4 : BlockType::C128;
+      const BlockType key = block_type_from_compress_ratio(compress_ratio);
       const bool compressed_participates =
-          key == BlockType::C4 ? c4_participates : c128_participates;
+          leaf_participates_in_prefix_cache(key, is_decode);
       const bool compressed_prefix_cache =
           prefix_cache_on && compressed_participates;
       opts.block_type(key)

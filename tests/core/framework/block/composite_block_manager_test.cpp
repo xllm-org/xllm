@@ -3811,4 +3811,54 @@ TEST_F(SharedSlabKVCacheBlockTest,
   pinned.clear();
 }
 
+TEST(CompositeBlockManagerTest, V41DefaultPrefixCacheDemotesInsteadOfAbort) {
+  const uint32_t window_size = 4 * kBaseBlockSize;
+  BlockManager::Options opts = MakeCompositeOptions(
+      /*base_num_blocks=*/4096,
+      /*block_size=*/kBaseBlockSize,
+      /*window_size=*/window_size,
+      /*max_seqs_per_batch=*/4);
+  opts.manager_types({kManagerTypeSlidingWindowBlockManager,
+                      kManagerTypeBlockManagerImpl,
+                      kManagerTypeBlockManagerImpl});
+  opts.compress_ratios({0, 2, 1});
+  ASSERT_TRUE(opts.enable_prefix_cache());
+
+  for (const bool is_decode : {false, true}) {
+    SCOPED_TRACE(is_decode);
+    opts.instance_is_decode(is_decode);
+    CompositeBlockManager manager(build_composite_leaves(opts), opts);
+    for (const BlockType type :
+         {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+      const BlockManager* leaf = manager.leaf_of(type);
+      ASSERT_NE(leaf, nullptr);
+      EXPECT_FALSE(leaf->options().enable_prefix_cache());
+    }
+    EXPECT_EQ(manager.leaf_combination(),
+              CompositeBlockManager::LeafCombination::UNSUPPORTED);
+  }
+}
+
+TEST(CompositeBlockManagerTest, V4DefaultPrefixCacheKeepsRolePolicy) {
+  BlockManager::Options opts = MakeCompositeOptions(
+      /*base_num_blocks=*/4096,
+      /*block_size=*/kBaseBlockSize,
+      /*window_size=*/4 * kBaseBlockSize,
+      /*max_seqs_per_batch=*/4);
+  ASSERT_TRUE(opts.enable_prefix_cache());
+  for (const bool is_decode : {false, true}) {
+    SCOPED_TRACE(is_decode);
+    opts.instance_is_decode(is_decode);
+    CompositeBlockManager manager(build_composite_leaves(opts), opts);
+    const BlockManager* swa = manager.leaf_of(BlockType::SWA);
+    ASSERT_NE(swa, nullptr);
+    EXPECT_EQ(swa->options().enable_prefix_cache(), !is_decode);
+    for (const BlockType type : {BlockType::C4, BlockType::C128}) {
+      const BlockManager* leaf = manager.leaf_of(type);
+      ASSERT_NE(leaf, nullptr);
+      EXPECT_TRUE(leaf->options().enable_prefix_cache());
+    }
+  }
+}
+
 }  // namespace xllm

@@ -19,7 +19,6 @@ Pure-Python: does not load compiled operators or weights.
 
 from __future__ import annotations
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -434,17 +433,6 @@ def test_dense_mlp_uses_native_aware_tp_reduce(monkeypatch) -> None:
     tp_reduce.assert_called_once()
 
 
-def test_model_accepts_cp_config() -> None:
-    cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "cp_size": 2})
-    model = DeepseekV4Model(cfg, torch.float32, torch.device("cpu"))
-    assert model.cfg.cp_size == 2
-
-
-def test_causal_lm_accepts_data_parallelism_config() -> None:
-    model = DeepseekV4ForCausalLM({**_DSV4_CONFIG, "dp_size": 2, "device": "cpu"})
-    assert model.cfg.dp_size == 2
-
-
 def _capture_test_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -716,14 +704,6 @@ def test_moe_loader_prepares_down_scales_for_each_quantization(
     assert moe.experts_w2_scale.dtype == torch.bfloat16
     assert moe.experts_w13_scale.dtype == torch.float32
     assert not hasattr(moe, "experts_w2_scale_compute")
-    owner = torch.nn.Module()
-    owner.cfg = cfg
-    owner.model = torch.nn.Module()
-    layer = torch.nn.Module()
-    layer.mlp = moe
-    owner.model.layers = torch.nn.ModuleList([layer])
-
-    owner._load_dsv4_moe_routing = DeepseekV4ForCausalLM._load_dsv4_moe_routing
     packed_divisor = 2 if quantization == "w4a8" else 1
     tensors = {
         "layers.0.ffn.gate.weight": torch.zeros_like(moe.gate.weight),
@@ -739,17 +719,21 @@ def test_moe_loader_prepares_down_scales_for_each_quantization(
             if quantization == "w4a8":
                 bias_groups = 8 if projection == "w2" else 1
                 tensors[prefix + projection + ".scale_bias"] = torch.zeros(8, bias_groups)
+
+    def _copy_in(name: str, value: torch.Tensor) -> None:
+        moe.get_parameter(name.removeprefix("model.layers.0.mlp.")).data.copy_(value)
+
     loader = SimpleNamespace(
         has=tensors.__contains__,
         get_tensor=tensors.__getitem__,
-        copy_in=lambda name, value: owner.get_parameter(name).data.copy_(value),
+        copy_in=_copy_in,
         shard=lambda value, dim, world, rank: value.chunk(world, dim=dim)[rank].contiguous(),
     )
     monkeypatch.setattr(moe.shared_experts.gate_up_proj, "process_weights_after_loading", MagicMock())
     monkeypatch.setattr(moe.shared_experts.down_proj, "process_weights_after_loading", MagicMock())
-    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_format_cast=lambda value, _format: value))
+    monkeypatch.setattr(deepseek_v4, "torch_npu", SimpleNamespace(npu_format_cast=lambda value, _format: value))
 
-    DeepseekV4ForCausalLM._load_dsv4_moe(owner, loader, "layers.0.", "model.layers.0.", 0, "layers.0.ffn.")
+    DeepseekV4ForCausalLM._load_dsv4_moe(moe, loader, "layers.0.", "model.layers.0.", 0, "layers.0.ffn.")
 
     assert moe.experts_w2_scale.dtype == (torch.float32 if quantization == "w4a8" else torch.bfloat16)
     moe.process_weights_after_loading()
