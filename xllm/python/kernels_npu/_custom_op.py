@@ -1092,6 +1092,57 @@ def _sparse_attn_sharedkv_fake(
     return out, lse
 
 
+def _smla_va_fake(
+    q: torch.Tensor,
+    *,
+    ori_kv: torch.Tensor | None = None,
+    cmp_kv: torch.Tensor | None = None,
+    layout_q: str = "BSND",
+    layout_kv: str = "BSND",
+    return_softmax_lse: bool = False,
+    **kwargs: object,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(q)
+    if not return_softmax_lse:
+        return out, q.new_empty((0,), dtype=torch.float32)
+    kv = ori_kv if ori_kv is not None else cmp_kv
+    if kv is None:
+        raise ValueError("smla_va requires original or compressed KV")
+    kv_heads = kv.size(1 if layout_kv == "TND" else 2)
+    query_heads = q.size(2 if layout_q == "BSND" else 1)
+    if kv_heads <= 0 or query_heads % kv_heads:
+        raise ValueError("smla_va query heads must be divisible by positive KV heads")
+    shape = (
+        (q.size(0), kv_heads, q.size(1), q.size(2) // kv_heads)
+        if layout_q == "BSND"
+        else (kv_heads, q.size(0), q.size(1) // kv_heads)
+    )
+    return out, q.new_empty(shape, dtype=torch.float32)
+
+
+def _smla_va_metadata_fake(
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_dim: int,
+    **kwargs: object,
+) -> torch.Tensor:
+    for name in (
+        "cu_seqlens_q",
+        "cu_seqlens_ori_kv",
+        "cu_seqlens_cmp_kv",
+        "seqused_q",
+        "seqused_ori_kv",
+        "seqused_cmp_kv",
+        "cmp_residual_kv",
+        "ori_topk_length",
+        "cmp_topk_length",
+    ):
+        tensor = kwargs.get(name)
+        if isinstance(tensor, torch.Tensor):
+            return tensor.new_empty((_DSA_METADATA_BUFFER_ELEMENTS,), dtype=torch.int32)
+    return torch.empty((_DSA_METADATA_BUFFER_ELEMENTS,), dtype=torch.int32, device="privateuseone")
+
+
 def _sparse_attn_sharedkv_metadata_fake(
     num_heads_q: int,
     num_heads_kv: int,
@@ -1515,6 +1566,8 @@ register_fake("xllm_ops::hc_pre", _hc_pre_fake)
 register_fake("xllm_ops::hc_pre_va", _hc_pre_va_fake)
 register_fake("xllm_ops::hc_post", _hc_post_fake)
 register_fake("xllm_ops::hc_post_va", _hc_post_fake)
+register_fake("xllm_ops::smla_va", _smla_va_fake)
+register_fake("xllm_ops::smla_va_metadata", _smla_va_metadata_fake)
 register_fake("xllm_ops::sparse_attn_sharedkv", _sparse_attn_sharedkv_fake)
 register_fake("xllm_ops::sparse_attn_sharedkv_metadata", _sparse_attn_sharedkv_metadata_fake)
 register_fake("xllm_ops::sparse_flash_attention_lse", _sparse_flash_attention_lse_fake)
