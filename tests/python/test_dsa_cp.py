@@ -137,6 +137,7 @@ def test_cp_execution_keeps_full_layer_context_and_passes_query_plan(monkeypatch
     metadata = SimpleNamespace(dsa_metadata=dsa)
     backend = object.__new__(Csa2AttentionBackend)
     backend.window_size, backend.scale = 2, width**-0.5
+    backend.index_topk = 3
     backend._kv_caches = [SimpleNamespace(swa=None)]
     backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
     backend._current_forward_metadata = lambda: metadata
@@ -263,6 +264,7 @@ def test_compressed_picks_use_global_chunk_offset(
     )
     backend = object.__new__(Csa2AttentionBackend)
     backend.window_size, backend.scale = 2, width**-0.5
+    backend.index_topk = 3
     backend._kv_caches = [SimpleNamespace(swa=None)]
     backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
     backend._current_forward_metadata = lambda: SimpleNamespace(dsa_metadata=global_dsa)

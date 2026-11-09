@@ -145,19 +145,15 @@ def test_swa_gate_static() -> None:
     assert gate(empty_dsa, 0, 0, ring_blocks=1)[1] == "no swa block table"
 
 
-# ============================================================================
-# Layer 2: NPU numerical parity (real triton kernel vs pure-torch reference)
-# ============================================================================
-
-
-def _reference_from_projected(kv, scores, kv_state, score_state, metadata):
-    """Pure-torch mirror of the K2 pool and K3 ring-update kernels.
-
-    Adapts vllm-ascend's ``compressor_ratio2_reference`` to the xLLM planes:
-    two split FP32 state rings, a token-aligned BF16 output, and PROTECT_NULL
-    semantics (block id 0 padding rows neither pool nor write).
-    """
-    out = torch.zeros_like(kv, dtype=torch.bfloat16)
+def _reference_from_projected(
+    kv: torch.Tensor,
+    scores: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    metadata: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    out = torch.zeros_like(kv, dtype=output_dtype)
     starts = metadata[0].tolist()
     used = metadata[1].tolist()
     in_bases = metadata[3].tolist()
@@ -184,7 +180,7 @@ def _reference_from_projected(kv, scores, kv_state, score_state, metadata):
             ss = torch.stack(member_score).float()
             pooled = (kk * ss.softmax(dim=0)).sum(dim=0)
             out_row = base + (gidx + 1) * 2 - 1 - s
-            out[out_row] = pooled.to(torch.bfloat16)
+            out[out_row] = pooled.to(output_dtype)
         tail = min(u, RING_ROWS)
         for w in range(tail):
             seg_row = u - tail + w
@@ -194,8 +190,15 @@ def _reference_from_projected(kv, scores, kv_state, score_state, metadata):
     return out
 
 
-def _run_parity_case(starts, used, blocks, *, seed: int, width: int = WIDTH):
-    """Drive one kernel-vs-reference parity batch on the NPU."""
+def _run_parity_case(
+    starts: list[int],
+    used: list[int],
+    blocks: list[int],
+    *,
+    seed: int,
+    width: int = WIDTH,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> None:
     torch.manual_seed(seed)
     requests = len(starts)
     tokens = sum(used)
@@ -225,11 +228,11 @@ def _run_parity_case(starts, used, blocks, *, seed: int, width: int = WIDTH):
     ref_kv_state = kv_state.clone()
     ref_score_state = score_state.clone()
 
-    ref_out = _reference_from_projected(kv, scores, ref_kv_state, ref_score_state, metadata)
+    ref_out = _reference_from_projected(kv, scores, ref_kv_state, ref_score_state, metadata, output_dtype)
 
     from xllm.python.kernels_npu.triton import compressor
 
-    out = torch.zeros(tokens, width, dtype=torch.bfloat16, device=dev)
+    out = torch.zeros(tokens, width, dtype=output_dtype, device=dev)
     got = compressor.compressor_from_projected(
         kv.contiguous(),
         scores.contiguous(),
@@ -241,29 +244,27 @@ def _run_parity_case(starts, used, blocks, *, seed: int, width: int = WIDTH):
         num_cores=8,
     )
     assert got is out
-    torch.testing.assert_close(out.float(), ref_out.float(), rtol=2e-2, atol=2e-2)
+    tolerance = 2e-2 if output_dtype == torch.bfloat16 else 2e-5
+    torch.testing.assert_close(out, ref_out, rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(kv_state, ref_kv_state)
     torch.testing.assert_close(score_state, ref_score_state)
 
 
 @pytest.mark.skipif(not _npu_ready(), reason="NPU is not available")
-def test_parity_multi_request_random() -> None:
-    """Random multi-request batches: odd/even starts, mixed lengths."""
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_parity_multi_request_random(output_dtype: torch.dtype) -> None:
     for seed, starts, used in (
         (0, [0, 3, 29, 64, 97], [32, 5, 8, 17, 1]),
         (1, [11, 40, 7, 100, 61], [9, 48, 3, 2, 33]),
         (2, [5, 16, 71, 33, 90], [40, 6, 12, 31, 4]),
     ):
-        _run_parity_case(starts, used, [1, 2, 3, 4, 5], seed=seed)
+        _run_parity_case(starts, used, [1, 2, 3, 4, 5], seed=seed, output_dtype=output_dtype)
 
 
 @pytest.mark.skipif(not _npu_ready(), reason="NPU is not available")
-def test_parity_ring_boundaries_and_padding() -> None:
-    """Exactly-full ring, wrap-around, residual group, empty and padded rows."""
-    # Full ring (start 0, 32 rows), wrap-around (start 29), residual group
-    # (odd start reads the ring before writing), empty request, block-id-0
-    # padding row, and a plain even-start segment, all in one batch.
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_parity_ring_boundaries_and_padding(output_dtype: torch.dtype) -> None:
     starts = [0, 29, 3, 65, 0, 12]
     used = [32, 8, 4, 7, 0, 5]
     blocks = [1, 2, 3, 4, 5, 0]
-    _run_parity_case(starts, used, blocks, seed=3)
+    _run_parity_case(starts, used, blocks, seed=3, output_dtype=output_dtype)

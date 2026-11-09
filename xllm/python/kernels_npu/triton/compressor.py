@@ -178,7 +178,7 @@ def _pool_kernel(
                 kv_vals = tl.load(kv_ptr + (seg_row_base + seg_off)[:, None] * HEAD_DIM + offs_h[None, :])
                 pooled = tl.sum(prob * kv_vals, axis=0)
             out_row = seg_row_base + (group_idx + 1) * RATIO - 1 - start_pos
-            tl.store(out_ptr + out_row * HEAD_DIM + offs_h, pooled.to(tl.bfloat16))
+            tl.store(out_ptr + out_row * HEAD_DIM + offs_h, pooled)
 
 
 @triton.jit
@@ -240,18 +240,6 @@ def compressor_from_projected(
     max_query_len: int,
     num_cores: int,
 ) -> torch.Tensor:
-    """Pool C2 into token-aligned BF16 rows, then update a private FP32 ring.
-
-    metadata is contiguous device INT32 [5, requests]: start positions, used
-    lengths, output bases (reserved), input bases, and actual global block IDs.
-    Controls must be bounded by the input rows and request table; padded requests
-    have used length and block ID zero. No tensor contents are read by the host.
-
-    xLLM adaptation: the ring state is the two contiguous fp32 planes
-    ``kv_state`` / ``score_state`` (each [blocks, 32, width]) that
-    ``Csa2AttentionBackend`` owns, not vllm-ascend's single packed
-    [blocks, 32, 2*width] tensor.
-    """
     if kv.dtype != torch.float32 or scores.dtype != torch.float32:
         raise ValueError("Aurora projections must be FP32")
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
@@ -267,8 +255,8 @@ def compressor_from_projected(
         raise ValueError("Expected [blocks, 32, width] score ring state")
     if kv_state.shape[0] != score_state.shape[0]:
         raise ValueError("Compressor kv/score ring state must have the same block count")
-    if out.dtype != torch.bfloat16 or out.shape != kv.shape:
-        raise ValueError("Expected token-aligned BF16 pooled output")
+    if out.dtype not in (torch.bfloat16, torch.float32) or out.shape != kv.shape:
+        raise ValueError("Expected token-aligned BF16 or FP32 pooled output")
     if metadata.dtype != torch.int32 or metadata.ndim != 2 or metadata.shape[0] != 5:
         raise ValueError("Expected INT32 [5, requests] device metadata")
     tensors = (kv, scores, kv_state, score_state, metadata, out)

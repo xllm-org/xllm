@@ -790,7 +790,9 @@ class DeepseekV41HyperConnection(nn.Module):
         return y, pre, post, comb
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-        """Collapse the hc copies: ``sum_j pre[j] * x[j]`` (model.py:957-960)."""
+        if x.device.type in ("npu", "privateuseone") and pre_mix.dtype == torch.float32:
+            # The batched dot avoids materializing FP32 weighted copies of every hidden row.
+            return torch.matmul(pre_mix.unsqueeze(-2), x.float()).squeeze(-2).to(x.dtype)
         y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=-2)
         return y.to(x.dtype)
 
@@ -951,16 +953,12 @@ class DeepseekV41Attention(Attention):
             if ratio > 1:
                 self.cmp_wgate = nn.Linear(cfg.hidden_size, head_dim, bias=False, dtype=torch.float32, device=device)
             self.cmp_norm = RMSNorm(head_dim, cfg.rms_norm_eps, dtype, device)
-        # Indexer: Full layers write the shared K and select; Reindex layers
-        # re-select against it; Reuse/SWA layers own no indexer weights.
         self.indexer: DeepseekV41Indexer | None = (
             DeepseekV41Indexer(cfg, dtype, device, quant_mode, owns_k=mode.is_full)
             if mode.is_full or mode.is_reindex
             else None
         )
-        # Per-forward hand-off to the backend.
         self._csa2_ctx: Csa2LayerContext | None = None
-        self._csa2_used_topk: torch.Tensor | None = None
 
     def process_weights_after_loading(self) -> None:
         if self.quant_mode == V41_QUANT_ASCEND:
@@ -1014,54 +1012,37 @@ class DeepseekV41Attention(Attention):
             positions=positions,
             cos_sin_cache=cos_sin_cache,
         )
-        attn_out = execute_csa2(q, kv, self)
-        # De-rotate the rope dims by the query's own rotation (conjugate)
-        # BEFORE the o path (model.py:781).
+        try:
+            attn_out = execute_csa2(q, kv, self)
+        finally:
+            self._csa2_ctx = None
         if attn_out.size(0) > 0:
             attn_out = apply_interleaved_rope(attn_out, query_positions, cos_sin_cache, inverse=True)
         if cp_context is not None:
             attn_out = cp_context.restore_tp_heads(attn_out)
-        # O path: grouped LoRA projection (model.py:783-789).
         out = attn_out.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.o_a_proj.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o_low = torch.einsum("tgd,grd->tgr", out, wo_a)
         o = self.o_b_proj(o_low.reshape(num_tokens, -1))
         if self.cfg.tp_size > 1 and self.quant_mode != V41_QUANT_ASCEND:
-            # Row-parallel partial: sum the per-rank head-group contributions.
             _distributed.tp_all_reduce(o)
         return o
 
-    # -- weight helpers used by the backend -------------------------------------
-
     def compress_kv_score(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Compressor projections: fp32 (kv, score) for ratio > 1, (kv, None) for ratio 1."""
         if self.mode.compress_ratio > 1:
             xf = x.float()
             return self.cmp_wkv(xf), self.cmp_wgate(xf)
         return self.cmp_wkv(x), None
 
     def compress_rmsnorm(self, v: torch.Tensor) -> torch.Tensor:
-        """RMSNorm AFTER pooling (ratio > 1) / after the projection (ratio 1)."""
         return self.cmp_norm(v)
 
     def indexer_key(self, latent: torch.Tensor) -> torch.Tensor:
-        """Indexer K from the pre-RoPE compressor latent: k_norm(wk(latent))."""
         k = self.indexer.wk(latent)
         return self.indexer.k_norm(k)
 
-    def indexer_query(self, qr: torch.Tensor, qr_scale: torch.Tensor | None = None) -> torch.Tensor:
-        """Indexer Q from the shared q-lora latent: wq_b(qr).
-
-        Under the fused q norm+quant path the latent arrives already
-        per-token INT8-quantized (``qr_scale`` present); the indexer then
-        reuses those codes/scales through ``forward_quantized`` instead of
-        re-quantizing -- the DSV4 production shape (deepseek_v4.py:826-830).
-        """
-        if qr_scale is not None:
-            q = self.indexer.wq_b.forward_quantized(qr, qr_scale)
-        else:
-            q = self.indexer.wq_b(qr)
-        return q.view(-1, self.indexer.n_heads, self.indexer.head_dim)
+    def indexer_query(self, qr: torch.Tensor) -> torch.Tensor:
+        return self.indexer.wq_b(qr).view(-1, self.indexer.n_heads, self.indexer.head_dim)
 
     def indexer_weights(self, x: torch.Tensor) -> torch.Tensor:
         scale = self.indexer.head_dim**-0.5 * self.indexer.n_heads**-0.5

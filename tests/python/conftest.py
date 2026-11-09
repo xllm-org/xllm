@@ -148,6 +148,7 @@ def _model_cpu_normalization(request: pytest.FixtureRequest, monkeypatch: pytest
         "test_glm5_next_dsa",
         "test_glm53flash_rms_norm",
         "test_deepseek_v41_model",
+        "test_deepseek_v41_chunked_prefill",
         "test_deepseek_v41_rms_norm",
     }:
         return
@@ -170,8 +171,10 @@ def _model_cpu_normalization(request: pytest.FixtureRequest, monkeypatch: pytest
 
 @pytest.fixture(autouse=True)
 def _v41_cpu_grouped_moe(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the V4.1 CPU oracle local to its tests and preserve NPU dispatch."""
-    if request.module.__name__.rsplit(".", 1)[-1] != "test_deepseek_v41_model":
+    if request.module.__name__.rsplit(".", 1)[-1] not in {
+        "test_deepseek_v41_model",
+        "test_deepseek_v41_chunked_prefill",
+    }:
         return
     from xllm.python import kernels
 

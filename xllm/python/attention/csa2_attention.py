@@ -45,26 +45,14 @@ from xllm.python.models.deepseek_v41 import (
     V41_QUANT_NONE,
 )
 
-# Softmax-scale exponent base of the sparse kernel's running-max floor.
-_NEG_INF_FLOOR = -1e30
-_FP32_TINY = torch.finfo(torch.float32).tiny
-# Query rows per attention tile (the reference kernel processes 64 gathered
-# rows per tile; a few hundred rows keep the [s, H, n] score tile bounded).
 _ATTENTION_QUERY_TILE = 256
-# Query rows per indexer scoring tile. The fp32 score intermediate is
-# [tile, index_heads, capacity]; a whole-prompt chunk against a long-context
-# committed capacity reaches multiple GiB per layer (30k ctx x 2k chunk x 32
-# heads x 4B ~= 4 GiB), which overflows the activation headroom of the
-# W8A8+engram full model. Top-k selection is per query row, so tiling over
-# the query axis is exact; decode/graph batches (q_len <= tile) take the
-# single-tile path unchanged.
+_ATTENTION_SCORE_TILE_BYTES = 128 * 1024 * 1024
+# The FP32 [tile, index_heads, capacity] scores otherwise grow to several GiB.
 _INDEXER_QUERY_TILE = 256
 
 
 @dataclass
 class _SwaGroupMetadata:
-    """SWA-group tensors shared by every layer (one ring layout per request)."""
-
     slot_mapping: torch.Tensor
     block_table: torch.Tensor
     block_size: int
@@ -372,15 +360,11 @@ def _v41_compressor_pool_triton(
     start_pos: torch.Tensor,
     used_len: int,
     block_id: torch.Tensor,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor | None:
-    """Pool one segment's ratio-2 groups with the Triton kernel.
-
-    Returns the token-aligned bf16 pooled rows ``[q_len, head_dim]`` (the caller
-    gathers the committed group rows and applies RMSNorm), or None when the op
-    declines so the caller keeps the pure-torch path. ``start_pos`` / ``block_id``
-    are device scalars, so the control metadata is built with device arithmetic
-    and stays ACL-graph friendly.
-    """
+    if output_dtype not in (torch.bfloat16, torch.float32):
+        return None
     module = _get_v41_compressor_module()
     if module is None:
         return None
@@ -401,7 +385,7 @@ def _v41_compressor_pool_triton(
             block_id.to(torch.int32).reshape(()),
         )
     ).reshape(5, 1)
-    out = torch.empty(q_len, head_dim, dtype=torch.bfloat16, device=dev)
+    out = torch.empty(q_len, head_dim, dtype=output_dtype, device=dev)
     module.compressor_from_projected(
         kv_seq.contiguous(),
         score_seq.contiguous(),
@@ -505,26 +489,9 @@ def _picked_row_mask(idxs: torch.Tensor, num_rows: int) -> torch.Tensor:
     return wide_mask[:, :num_rows]
 
 
-def _window_visible_idxs(
-    positions_seq: torch.Tensor,
-    col_pos: torch.Tensor,
-    cols: torch.Tensor,
-    win: int,
-) -> torch.Tensor:
-    """Per-query SWA window index matrix over the fixed-capacity window columns.
-
-    The window columns are ``[win ring candidates ; current chunk]``: a ring
-    candidate's absolute position may be negative (before the sequence start)
-    and the chunk columns follow it. Query ``i`` sits at absolute position
-    ``positions_seq[i]`` and must see exactly the columns whose absolute
-    position lies in ``[max(p - win + 1, 0), p]`` -- a *per-query* lower bound
-    (only the chunk's first token shares the chunk-level
-    ``max(prev - win + 1, 0)``). Masked columns become the ``-1`` sentinel,
-    which :func:`_picked_row_mask` drops.
-    """
-    window_lo = torch.clamp(positions_seq - win + 1, min=0)
-    valid = (col_pos.unsqueeze(0) >= window_lo.unsqueeze(-1)) & (col_pos.unsqueeze(0) <= positions_seq.unsqueeze(-1))
-    return torch.where(valid, cols.unsqueeze(0).expand(positions_seq.numel(), col_pos.numel()), -1)
+def _window_visible_idxs(positions_seq: torch.Tensor, previous_context: torch.Tensor, win: int) -> torch.Tensor:
+    window_positions = positions_seq[:, None] - win + 1 + torch.arange(win, device=positions_seq.device)
+    return torch.where(window_positions >= 0, window_positions - previous_context + win, -1)
 
 
 def _paged_cache_slots(
@@ -992,7 +959,6 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 )
         else:
             topk = None
-        layer._csa2_used_topk = topk
         # Current-chunk KV is read directly; preserve the ring history until
         # all queries have consumed it, even when the chunk wraps the ring.
         output = self._csa2_attention(q, kv, layer, dsa, q_lens, ctx_lens, topk, shared, cp_context)
@@ -1030,16 +996,15 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         slot_seqs: list[torch.Tensor] = []
         slot_masks: list[torch.Tensor] = []
         token_offset = 0
+        has_non_decode_rows: bool | None = None
         for seq, q_len in enumerate(q_lens):
+            if q_len == 0:
+                continue
             ctx_len = ctx_lens[seq]
             prev_ctx = ctx_len - q_len
-            # Padded graph rows (ctx <= 0) stay fully inert: no parking, no
-            # commit, so a garbage block-table entry can never be written.
             seq_valid = ctx_len > 0
             x_seq = ctx.x[token_offset : token_offset + q_len]
             rows = torch.arange(q_len, device=ctx.x.device)
-            # Fixed commit capacity: a chunk of q_len tokens completes at most
-            # q_len // ratio + 1 groups (the group straddling each boundary).
             capacity = q_len // ratio + 1
             g = torch.arange(capacity, device=ctx.x.device)
             group_idx = torch.div(prev_ctx, ratio, rounding_mode="floor") + g
@@ -1055,24 +1020,16 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 mask_segment = commit_mask[:q_len]
             else:
                 kv_seq, score_seq = layer.compress_kv_score(x_seq)
-                # Fused Triton pooling: pool the committed groups at their
-                # completion-token rows and
-                # update the state ring in place. The op consumes host control
-                # metadata and the pre-capture warmup forward JIT-compiles it, so
-                # it runs in both eager and ACL-graph capture; the reference torch
-                # path below (same ring-32 addressing) is the fallback.
                 reason = _v41_compressor_triton_reason(ratio, kv_state, score_state)
                 triton_pooled = None
                 if reason is None:
-                    if any(int(q) != 1 for q in q_lens):
-                        # The op is validated on the single-token decode rows
-                        # only; a q_len > 1 row (prefill / speculative chunk) is
-                        # unverified, so it keeps the torch path.
+                    if has_non_decode_rows is None:
+                        has_non_decode_rows = any(q > 1 for q in q_lens)
+                    if has_non_decode_rows:
+                        # Only single-token decode has been validated for the fused compressor.
                         reason = "non-decode row"
                     else:
-                        # Resolve state from the current absolute position,
-                        # just like the torch path. SWA releases old blocks;
-                        # column zero can be invalid while later blocks live.
+                        # Old SWA blocks may be released; resolve the current absolute position instead of column zero.
                         block_table, reason = _v41_compressor_swa_gate(
                             dsa, layer_id, mapping.ori_cache_idx, self._swa_ring_blocks
                         )
@@ -1084,13 +1041,18 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                                 score_state,
                                 start_pos=prev_ctx,
                                 used_len=q_len,
-                                block_id=torch.div(
-                                    self._v41_state_slots(
-                                        dsa, layer_id, mapping.ori_cache_idx, seq, prev_ctx.reshape(1), state_rows
+                                block_id=torch.where(
+                                    seq_valid,
+                                    torch.div(
+                                        self._v41_state_slots(
+                                            dsa, layer_id, mapping.ori_cache_idx, seq, prev_ctx.reshape(1), state_rows
+                                        ),
+                                        state_rows,
+                                        rounding_mode="floor",
                                     ),
-                                    state_rows,
-                                    rounding_mode="floor",
+                                    0,
                                 ),
+                                output_dtype=ctx.x.dtype,
                             )
                             if triton_pooled is None:
                                 reason = "op declined"
@@ -1710,37 +1672,19 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             prev_ctx = ctx_len - q_len
             global_prev_ctx = prev_ctx if cp_context is None else global_ctx_lens[seq] - global_q_len
             q_seq = q[token_offset : token_offset + q_len]
-            # Window rows at fixed capacity: [win ring candidates ; chunk].
-            # Ring candidate c sits at absolute position prev - win + c; which
-            # candidates a given query may read is decided per query below.
             ring_pos = (global_prev_ctx - win) + torch.arange(win, device=q.device)
             if swa_flat is not None and swa_bt is not None:
                 ring_rows = self._gather_swa_positions(swa_flat, swa_bt, seq, ring_pos.clamp_min(0), swa_bs)
             else:
-                # Profiling / warmup batches carry no block tables: keep the
-                # traced shapes intact with zeros; the mask below drops them.
                 ring_rows = q.new_zeros((win, kv_seq.size(-1)))
-            # Unwritten rows can contain NaN/Inf. Score masking alone still
-            # lets zero probabilities multiply those values in the reduction.
-            # The gather owns this storage; masking does not change the cache.
+            # Zero gathered padding before reduction: zero probability times NaN is still NaN.
             ring_rows.masked_fill_((ring_pos < 0).unsqueeze(-1), 0)
+            # This page can already be recycled; zero it before the value matmul.
+            ring_rows[:1].zero_()
             kv_seq = torch.where(ctx_len > 0, kv_seq, 0)
-            n_w = ring_rows.size(0) + kv_seq.size(0)
-            # Window index matrix: query p (position prev+i) sees exactly the
-            # window rows whose absolute position lies in
-            # [max(p - win + 1, 0), p]; the lower bound tightens with the query
-            # (only the chunk's first token shares the chunk-level bound).
             positions_seq = prev_ctx + torch.arange(q_len, device=q.device)
-            chunk_positions = (
-                positions_seq if cp_context is None else global_prev_ctx + torch.arange(global_q_len, device=q.device)
-            )
-            col_pos = torch.cat((ring_pos, chunk_positions), dim=0)
-            cols = torch.arange(n_w, device=q.device)
-            window_idxs = _window_visible_idxs(positions_seq, col_pos, cols, win)
+            window_idxs = _window_visible_idxs(positions_seq, global_prev_ctx, win)
 
-            # Compressed rows for the top-k picks (shared group cache),
-            # gathered at the committed capacity; padding rows are unreachable
-            # because every top-k pick past `committed` is -1.
             compress_kv = None
             if capacity > 0:
                 shared_key_cache = shared.key_cache
@@ -1767,46 +1711,34 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                     compressed_idxs = torch.where(
                         compressed_idxs >= 0, compressed_idxs + global_q_len - q_len, compressed_idxs
                     )
+                compressed_idxs = torch.nn.functional.pad(
+                    compressed_idxs, (0, max(self.index_topk - compressed_idxs.size(-1), 0)), value=-1
+                )
                 idxs = torch.cat((window_idxs, compressed_idxs), dim=-1)
             else:
                 kv_cat = torch.cat((ring_rows, kv_seq), dim=0)
                 idxs = window_idxs
-            kv_cat_f = kv_cat.to(torch.float32)
-            # Empty/padded DP-shard rows carry a context length but no written
-            # SWA history, so the gathered ring rows read uninitialized HBM and
-            # come back as NaN/Inf or huge *finite* garbage. Clear the
-            # non-finite entries and bound everything to the magnitude of the
-            # always-written current-token rows (kv_seq): a real row's history
-            # is in range already (no-op for it), a fake row becomes finite
-            # instead of poisoning the softmax and the DP-gathered MoE. Derive
-            # the bound from a *sanitized* kv_seq so a non-finite
-            # current-token row cannot make the bound itself NaN.
-            kv_seq_f = torch.nan_to_num(kv_seq.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
-            bound = kv_seq_f.abs().amax().clamp_min(1.0) * 32.0
-            kv_cat_f = torch.nan_to_num(kv_cat_f, nan=0.0, posinf=0.0, neginf=0.0)
-            kv_cat_f = kv_cat_f.clamp(-bound, bound)
-            # Each query attends exactly the rows its index list selects
-            # (window picks + compressed top-k picks), while the gathered
-            # tensor holds every committed row: expand the per-query index
-            # list into a row mask with static shapes (see _picked_row_mask)
-            # so the block replays inside a captured ACL graph.
-            row_mask = _picked_row_mask(idxs, kv_cat.size(0))
-
-            for tile_start in range(0, q_len, _ATTENTION_QUERY_TILE):
-                tile_end = min(tile_start + _ATTENTION_QUERY_TILE, q_len)
-                scores = torch.einsum("shd,nd->shn", q_seq[tile_start:tile_end].to(torch.float32), kv_cat_f)
-                scores = scores * self.scale
-                scores = scores.masked_fill(~row_mask[tile_start:tile_end].unsqueeze(1), float("-inf"))
-                row_max = scores.amax(dim=-1).clamp_min(_NEG_INF_FLOOR)
-                probs = torch.exp(scores - row_max.unsqueeze(-1))
-                # The sink adds exp(sink - row_max) to the normalizer only.
-                sum_exp = probs.sum(dim=-1)
-                if sinks is not None:
-                    sum_exp = sum_exp + torch.exp(sinks - row_max)
-                tile_out = torch.einsum("shn,nd->shd", probs, kv_cat_f)
-                # Empty-DP queries have no visible values and no required sink.
-                tile_out = tile_out / sum_exp.clamp_min(_FP32_TINY).unsqueeze(-1)
+            kv_cat_f = kv_cat.float()
+            score_bytes_per_query = 3 * q.size(1) * (kv_cat.size(0) + 1) * 4
+            query_tile = max(1, min(_ATTENTION_QUERY_TILE, _ATTENTION_SCORE_TILE_BYTES // score_bytes_per_query))
+            if sinks is not None:
+                sink_column = sinks.view(1, q.size(1), 1)
+            else:
+                sink_column = torch.where(ctx_len > 0, float("-inf"), 0.0).reshape(1, 1, 1)
+            for tile_start in range(0, q_len, query_tile):
+                tile_end = min(tile_start + query_tile, q_len)
+                picks = idxs[tile_start:tile_end].to(torch.int64)
+                dense_scores = torch.einsum("shd,nd->shn", q_seq[tile_start:tile_end].float(), kv_cat_f)
+                row_mask = _picked_row_mask(picks, kv_cat.size(0))
+                dense_scores.mul_(self.scale)
+                dense_scores.masked_fill_(~row_mask.unsqueeze(1), float("-inf"))
+                sink_logits = sink_column.expand(dense_scores.size(0), q.size(1), 1)
+                logits = torch.cat((sink_logits, dense_scores), dim=-1)
+                dense_probs = torch.softmax(logits, dim=-1)[:, :, 1 : kv_cat.size(0) + 1]
+                tile_out = torch.einsum("shn,nd->shd", dense_probs, kv_cat_f)
                 out[token_offset + tile_start : token_offset + tile_end] = tile_out.to(q.dtype)
+                # Do not retain the previous tile while allocating the next one.
+                del dense_scores, logits, dense_probs, tile_out
             token_offset += q_len
         return out
 

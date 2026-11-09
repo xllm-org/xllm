@@ -53,6 +53,7 @@ from xllm.python.attention.dsa_metadata import (
 from xllm.python.layers import moe_parallel
 from xllm.python.layers.attention import Attention
 from xllm.python.model_executor import executor as executor_module
+from xllm.python.model_executor.dsa_cp import DsaCpContext
 from xllm.python.model_executor.executor import ModelExecutor
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import deepseek_v41 as dq
@@ -1255,14 +1256,8 @@ def _allocate_v41_layer_caches(
     *,
     reserve_token_sink: bool = False,
     reserve_swa_sink: bool = False,
+    token_blocks_per_seq: int = 1,
 ) -> list[LayerCache]:
-    """LayerCache tensors for the contract-section-2 layout.
-
-    With ``reserve_token_sink`` the TOKEN pools carry one extra leading block
-    (block 0) that is never written, so real per-sequence blocks are addressed
-    1-based. This mirrors the production invariant that block 0 is a reserved
-    zero padding sink, which the padded (``-1``) rows clamp to.
-    """
     device = device or torch.device("cpu")
 
     def swa(dtype_: torch.dtype = dtype) -> torch.Tensor:
@@ -1274,7 +1269,7 @@ def _allocate_v41_layer_caches(
             device=device,
         )
 
-    token_blocks = n_seqs + 1 if reserve_token_sink else n_seqs
+    token_blocks = n_seqs * token_blocks_per_seq + int(reserve_token_sink)
     caches: list[LayerCache] = []
     for layer_id in range(cfg.n_layers):
         if layer_id not in cfg.kv_source_layer_ids:
@@ -1313,13 +1308,6 @@ def _allocate_v41_layer_caches(
 
 
 class _V41ForwardHarness:
-    """Drives one model through ModelExecutor with synthetic paging metadata.
-
-    The block tables follow the contract-section-2 groups: the SWA ring (two
-    blocks per sequence), the TOKEN(2) pool of layer 2 and the TOKEN(1) pool
-    of layer 4, one block per sequence each.
-    """
-
     def __init__(
         self,
         lm: DeepseekV41ForCausalLM,
@@ -1327,6 +1315,8 @@ class _V41ForwardHarness:
         n_seqs: int,
         dtype: torch.dtype,
         device: torch.device | None = None,
+        *,
+        max_tokens: int | None = None,
     ) -> None:
         self.lm = lm
         self.cfg = lm.cfg
@@ -1336,16 +1326,40 @@ class _V41ForwardHarness:
         self.swa_bt = (torch.arange(_SWA_RING_BLOCKS * n_seqs, dtype=torch.int32, device=self.device) + 1).view(
             n_seqs, -1
         )
-        # Block 0 of the TOKEN pools is a reserved zero padding sink, so real
-        # per-sequence blocks are addressed 1-based (matching production).
-        self.tok2_bt = (torch.arange(n_seqs, dtype=torch.int32, device=self.device) + 1).view(n_seqs, 1)
-        self.tok1_bt = (torch.arange(n_seqs, dtype=torch.int32, device=self.device) + 1).view(n_seqs, 1)
+        token_blocks_per_seq = max(1, ((max_tokens or 1) + _TOKEN_BLOCK_SIZE - 1) // _TOKEN_BLOCK_SIZE)
+        block_ids = torch.arange(n_seqs * token_blocks_per_seq, dtype=torch.int32, device=self.device) + 1
+        self.tok2_bt = block_ids.view(n_seqs, token_blocks_per_seq)
+        self.tok1_bt = self.tok2_bt.clone()
         self.layer_caches = _allocate_v41_layer_caches(
-            self.cfg, n_seqs, dtype, device=self.device, reserve_token_sink=True, reserve_swa_sink=True
+            self.cfg,
+            n_seqs,
+            dtype,
+            device=self.device,
+            reserve_token_sink=True,
+            reserve_swa_sink=True,
+            token_blocks_per_seq=token_blocks_per_seq,
         )
         self.executor = ModelExecutor(lm, dict(config), max_seqs_per_batch=n_seqs)
         self.executor.bind_kv_caches(list(self.layer_caches))
         self.backend = self.executor.attention_backend
+        self.used_topk: dict[int, torch.Tensor | None] = {}
+        attention = self.backend._csa2_attention
+
+        def record_topk(
+            q: torch.Tensor,
+            kv: torch.Tensor,
+            layer: dq.DeepseekV41Attention,
+            dsa: DsaMetadata,
+            q_lens: list[int],
+            ctx_lens: torch.Tensor,
+            topk: torch.Tensor | None,
+            shared: CSA2SharedRuntime,
+            cp_context: DsaCpContext | None = None,
+        ) -> torch.Tensor:
+            self.used_topk[layer.layer_id] = topk
+            return attention(q, kv, layer, dsa, q_lens, ctx_lens, topk, shared, cp_context)
+
+        self.backend._csa2_attention = record_topk
 
     def step(
         self,
@@ -1819,13 +1833,6 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     picks = topk5[0, 0]
     assert (picks[picks >= 0] - (cfg.window_size + 1)).tolist() == [1, 3, 4, 6]
 
-    # Regression: a candidate pool smaller than
-    # index_topk must not leak pool-outside rows into the picks. The pool
-    # holds fewer rows than index_topk while every non-pool row still sits
-    # inside the visible range, so the visibility filter alone cannot exclude
-    # them -- only the -inf pool mask can, and the picks it cuts must land on
-    # the -1 sentinel (which _picked_row_mask drops, so attention reads pool
-    # rows + window rows only).
     backend.index_topk = 512
     topk_wide = backend._run_indexer(layer5, ctx_late, None, [1], torch.tensor([ctx_len], dtype=torch.int64), shared5)
     picks_wide = topk_wide[0, 0]
@@ -1886,9 +1893,8 @@ def test_swa_window_lower_bound_is_per_query() -> None:
         ring_pos = (prev_ctx - win) + torch.arange(win, dtype=torch.int64)
         positions_seq = prev_ctx + torch.arange(q_len, dtype=torch.int64)
         col_pos = torch.cat((ring_pos, positions_seq), dim=0)
-        cols = torch.arange(col_pos.numel(), dtype=torch.int64)
-        idxs = _window_visible_idxs(positions_seq, col_pos, cols, win)
-        assert idxs.shape == (q_len, win + q_len)
+        idxs = _window_visible_idxs(positions_seq, torch.tensor(prev_ctx), win)
+        assert idxs.shape == (q_len, win)
         for i in range(q_len):
             p = prev_ctx + i
             picked = idxs[i][idxs[i] >= 0]
@@ -2022,15 +2028,10 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
     assert (key4[1, :prompt_len].abs().sum(dim=-1) > 0).all()
     assert (key4[1, prompt_len:] == 0).all()
 
-    # Reuse layer 3 consumes the group source's top-k object as-is.
-    assert lm.model.layers[3].self_attn._csa2_used_topk is lm.model.layers[2].self_attn._csa2_used_topk
-    # The candidate pool is published by layer 4 only, and the reindex layer's
-    # picks stay inside the pool.
+    assert harness.used_topk[3] is harness.used_topk[2]
     shared = harness.backend._v41_shared
     assert shared.candidates_layer == cfg.candidate_source_layer_id
-    topk5 = lm.model.layers[5].self_attn._csa2_used_topk
-    # Layer 5 (ratio 1) ran with q_len = prompt_len, so its compressed picks
-    # start after window_size + prompt_len window rows.
+    topk5 = harness.used_topk[5]
     compress_offset = cfg.window_size + prompt_len
     for seq in range(n_seqs):
         pool = shared.candidates[seq]
@@ -2448,15 +2449,7 @@ def test_compressor_cached_long_chunk_preserves_partial_group() -> None:
     def run(x: torch.Tensor, start: int) -> None:
         end = start + x.shape[0]
         positions = torch.arange(start, end)
-        dsa = backend._builder.build(
-            multi_block_tables=[torch.tensor([[0, 1]], dtype=torch.int32)]
-            + [torch.tensor([[0]], dtype=torch.int32)] * 2,
-            kv_seq_lens=[end],
-            q_seq_lens=[x.shape[0]],
-            positions=positions,
-            is_prefill=False,
-            is_chunked_prefill=True,
-        )
+        dsa = _chunked_dsa(backend, end, x.shape[0], start, swa_blocks=2)
         ctx = Csa2LayerContext(
             x=x, qr=torch.zeros(x.shape[0], cfg.q_lora_rank), positions=positions, cos_sin_cache=cos_sin
         )
@@ -3503,3 +3496,39 @@ def test_v41_compressor_swa_table_column0_matches_across_widths() -> None:
     graph = build(wide, True, cap)
     assert eager.block_tables[1][2][:, 0].tolist() == [7, 9]
     assert graph.block_tables[1][2][:, 0].tolist() == [7, 9]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_hc_pre_preserves_strided_mix_and_token_batch_invariance(dtype: torch.dtype) -> None:
+    torch.manual_seed(41)
+    device = _active_device()
+    x = torch.randn(17, 4, 128, device=device, dtype=dtype)
+    pre_mix = torch.rand(17, 24, device=device, dtype=torch.float32)[:, 4:8]
+    collapse = dq.DeepseekV41HyperConnection.hc_pre
+    actual = collapse(None, x, pre_mix)
+    expected = (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(dtype)
+    torch.testing.assert_close(actual, expected, rtol=0.008 if dtype == torch.bfloat16 else 1e-5, atol=1e-6)
+    per_token = torch.cat([collapse(None, x[i : i + 1], pre_mix[i : i + 1]) for i in range(x.size(0))])
+    torch.testing.assert_close(actual, per_token, rtol=0, atol=0)
+    assert collapse(None, x[:0], pre_mix[:0]).shape == (0, 128)
+
+
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_hc_pre_retains_promoted_and_broadcast_mix_contract(broadcast: bool) -> None:
+    x = torch.randn(3, 4, 32)
+    pre_mix = torch.randn(1 if broadcast else 3, 4, dtype=torch.float64)
+    actual = dq.DeepseekV41HyperConnection.hc_pre(None, x, pre_mix)
+    expected = (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("mix_shape", [(4,), (1, 4)])
+def test_hc_pre_accepts_broadcast_fp32_mix(dtype: torch.dtype, mix_shape: tuple[int, ...]) -> None:
+    torch.manual_seed(73)
+    device = _active_device()
+    x = torch.randn(3, 4, 32, device=device, dtype=dtype)
+    pre_mix = torch.rand(mix_shape, device=device, dtype=torch.float32)
+    actual = dq.DeepseekV41HyperConnection.hc_pre(None, x, pre_mix)
+    expected = (pre_mix.cpu().double().unsqueeze(-1) * x.cpu().double()).sum(-2).to(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.008 if dtype == torch.bfloat16 else 1e-5, atol=1e-6)
