@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -640,25 +641,47 @@ def _log_qli_v3_fallback(reason: str) -> None:
     logger.warning(f"the QLI v3 indexer path is inactive ({reason}); staying on the pure-torch indexer")
 
 
-def _quantize_indexer_rows_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-row symmetric INT8 quantization of the last axis.
+@lru_cache(maxsize=1)
+def _get_indexer_quant_module() -> Any:
+    try:
+        from xllm.python.kernels_npu.triton import indexer_quant
+    except ModuleNotFoundError as exc:
+        if exc.name != "triton":
+            raise
+        return None
+    return indexer_quant
 
-    Matches vllm-ascend's ``quantize_indexer_query`` rounding: the FP16 scale
-    is ``absmax / 127`` (floored at the smallest positive value so a zero row
-    stays defined) and the codes are the half-to-even rounded normalised values
-    clamped to ``[-127, 127]``. Every step is row-local/pointwise, so the helper
-    is ACL-graph safe (static shapes, no host sync).
 
-    Parity note (recorded at the definition so it governs every call site):
-    this helper runs bare, exactly like vllm-ascend's upstream
-    ``quantize_indexer_query`` -- no inf/NaN input defense is performed here;
-    evaluating such defenses is deferred to a later round.
-    """
+def _indexer_quant_triton_reason(x: torch.Tensor) -> str | None:
+    if x.device.type not in ("npu", "privateuseone"):
+        return "not an NPU device"
+    if x.dtype != torch.bfloat16:
+        return f"dtype {x.dtype} is not bfloat16"
+    if x.dim() < 2:
+        return "not a matrix or batch of matrices"
+    if not x.is_contiguous():
+        return "not contiguous"
+    if x.size(-1) != _QLI_V3_HEAD_DIM:
+        return f"row width {x.size(-1)} != {_QLI_V3_HEAD_DIM}"
+    if _get_indexer_quant_module() is None:
+        return "triton indexer quantization unavailable"
+    return None
+
+
+def _quantize_indexer_rows_int8_torch(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     absmax = x.float().abs().amax(dim=-1)
     scale = (absmax / _QLI_V3_INT8_MAX).to(torch.float16).to(torch.float32).clamp_min(_QLI_V3_MIN_SCALE)
     normalized = x.float() / scale.unsqueeze(-1)
     codes = torch.round(normalized).clamp(-_QLI_V3_INT8_MAX, _QLI_V3_INT8_MAX)
     return codes.to(torch.int8), scale.to(torch.float16)
+
+
+def _quantize_indexer_rows_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if _indexer_quant_triton_reason(x) is None:
+        return _get_indexer_quant_module().quantize_indexer_rows_int8(x)
+    return _quantize_indexer_rows_int8_torch(x)
 
 
 @dataclass
