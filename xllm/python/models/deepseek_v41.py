@@ -1399,32 +1399,11 @@ class DeepseekV41W8A8MoE(DeepseekV4MoE):
         _log_moe_mc2_collective(ep_rank, ep_size)
         _log_moe_mc2_active(ep_rank, ep_size)
 
-        # 0) Batch layout. ``dp == 1`` keeps the established single-replica call:
-        #    the whole batch is local and C++ derives the global batch as
-        #    ``local_bs * ep_world_size`` (an explicit value, ``fused_moe.cpp``
-        #    :2652). Under ``dp > 1`` we do NOT pad/all-gather: like the C++
-        #    mode-0 EP2 branch (``fused_moe.cpp:2853-2874``) each rank dispatches
-        #    exactly its own rows, and ``global_bs = 0`` (auto) matches C++
-        #    (``fused_moe.cpp:2653-2659``), which prefers the operator's inferred
-        #    global batch over an explicit sum that is wrong for uneven DP
-        #    batches. No ``x_active_mask`` is passed: every dispatched row is a
-        #    real local token, and C++ only sets the mask for EPLB
-        #    (``fused_moe.cpp:2635-2645``), which this path does not use.
         global_bs = hidden.shape[0] * ep_size if self.dp_size == 1 else 0
         x_active_mask: torch.Tensor | None = None
 
-        # 1) FFN RMSNorm on this rank's rows (``_apply_post_norm`` is the V4.1
-        #    fused RMSNorm+cast; the guard already vetted the input). The base
-        #    class runs it after its DP gather, but the norm is row-wise, so on
-        #    the local rows it is identical while feeding the dispatch directly.
-        if post_norm is not None:
-            hidden, gate_input = self._apply_post_norm(hidden, post_norm)
-        else:
-            gate_input = hidden.to(torch.float32)
+        hidden, logits = self._prepare_moe_gate(hidden, post_norm)
 
-        # 2) Gate + top-k exactly as the portable path. There is NO EP-local
-        #    weighting: dispatch routes unconsumed (token, expert) pairs away.
-        logits = self.gate(gate_input)
         norm_type = {"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}.get(self.scoring_func, 2)
         renorm = 0 if norm_type == 2 else 1
         bias = getattr(self, "e_score_correction_bias", None)
@@ -1647,15 +1626,9 @@ class DeepseekV41DecoderLayer(nn.Module):
             x = self.hc.hc_pre(hidden, attn_pre)
         post_norm = self.post_attention_layernorm
         if isinstance(self.mlp, (DeepseekV41MoE, DeepseekV41W8A8MoE)):
-            # Delegate the FFN RMSNorm to the MoE. ``DeepseekV4MoE.forward``
-            # pads+all-gathers ``hidden`` across DP BEFORE it takes the
-            # gate/expert input, so the norm must run there for the fused op's
-            # fp32 routing input to describe the gathered rows. The MoE applies
-            # it exactly once (fused RMSNorm+cast when available, eager norm
-            # otherwise) and never double-normalises.
+            # Let MoE own normalization so both paths use identical local rows and routing weights.
             x = self.mlp(x, input_ids, post_norm=post_norm)
         else:
-            # Dense FFN keeps the eager RMSNorm and its single-argument MLP.
             x = post_norm(x)
             x = self.mlp(x)
         hidden = self.hc.hc_post(x, residual, ffn_post, ffn_comb)
