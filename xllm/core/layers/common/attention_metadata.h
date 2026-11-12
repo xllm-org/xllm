@@ -151,6 +151,8 @@ struct AttentionMetadata {
   ExpandedDecodeMetadata expanded_decode;
   // Shared by NPU ACL graph and MUSA FlashInfer expanded-decode routing.
   bool is_spec_verify = false;
+  // DFlash2 draft query is a proposal block, not a target spec-verify step.
+  bool is_dflash_proposal = false;
 
   // for mrope
   torch::Tensor mrope_cos;

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "core/platform/platform.h"
 
+#include <algorithm>
+#include <cctype>
 #include <mutex>
 
 #if defined(USE_NPU)
@@ -79,6 +81,27 @@ bool Platform::is_ascend950() {
   const char* soc_name = aclrtGetSocName();
   return soc_name != nullptr &&
          std::string(soc_name).find("Ascend950") != std::string::npos;
+#else
+  return false;
+#endif
+}
+
+bool Platform::is_ascend_a3() {
+#if defined(USE_NPU)
+  const char* soc_name = aclrtGetSocName();
+  if (soc_name == nullptr) {
+    return false;
+  }
+
+  std::string normalized_soc_name(soc_name);
+  std::transform(normalized_soc_name.begin(),
+                 normalized_soc_name.end(),
+                 normalized_soc_name.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::toupper(character));
+                 });
+  return normalized_soc_name.find("910C") != std::string::npos ||
+         normalized_soc_name.find("910_93") != std::string::npos;
 #else
   return false;
 #endif

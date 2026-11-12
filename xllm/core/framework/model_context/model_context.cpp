@@ -44,6 +44,7 @@ ModelContext ModelContext::with_parallel_args(
   derived.optimization_config_ = optimization_config_;
   derived.flash_comm1_options_ = flash_comm1_options_;
   derived.stream_registry_ = stream_registry_;
+  derived.dflash_xfia_enabled_ = dflash_xfia_enabled_;
   return derived;
 }
 
@@ -55,6 +56,7 @@ ModelContext ModelContext::with_quant_args(const QuantArgs& quant_args) const {
   derived.extension_impl_ = extension_impl_;
   derived.flash_comm1_options_ = flash_comm1_options_;
   derived.stream_registry_ = stream_registry_;
+  derived.dflash_xfia_enabled_ = dflash_xfia_enabled_;
   derived.derive_optimization_config();
   return derived;
 }

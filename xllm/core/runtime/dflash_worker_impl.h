@@ -85,6 +85,22 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   virtual DraftProposal run_decode_draft(const LlmForwardInput& input,
                                          LlmForwardInput& validate_input);
 
+  // DFlash2 overlaps the next draft with this step's target work. The base
+  // drafter stages nothing, so these hooks default to the synchronous path;
+  // an override owns the lifetime of whatever it stages.
+  virtual bool prepare_draft_prelaunch(const LlmForwardInput& /*input*/) {
+    return false;
+  }
+  virtual void launch_draft_prelaunch(const LlmForwardInput& /*input*/,
+                                      const SampleOutput& /*output*/,
+                                      const torch::Tensor& /*accepted_host*/) {
+    LOG(FATAL) << "Draft prelaunch was not implemented";
+  }
+  virtual void discard_draft_prelaunch() {}
+  // Finish host preparation, then retire writes to scheduler-owned KV blocks
+  // before publishing tokens that may terminate a request.
+  virtual void finish_draft_prelaunch(const LlmForwardInput& /*input*/) {}
+
   // Shared with subclasses (DSpark): build the N/N+1-wide draft query block and
   // the target validate input. A DSpark override of run_decode_draft calls both
   // before its draft forward.
@@ -99,6 +115,10 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   bool draft_needs_dummy_rows_ = false;
 
  private:
+  static bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
+                                          const torch::Device& device,
+                                          const runtime::Options& options);
+
   void fill_validate_input_from_draft_outputs(
       const DraftProposal& draft_proposal,
       LlmForwardInput& validate_input,
@@ -111,10 +131,6 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
   // commits the same prefix. No-op for a single rank.
   void maybe_broadcast_spec_tokens(torch::Tensor& tokens);
-
-  void update_decode_step_input(
-      LlmForwardInput& input,
-      const std::vector<EmbeddingCache::DecodeState>& last_states) const;
 
   std::vector<std::string> write_context_kv(
       const LlmForwardInput& input,

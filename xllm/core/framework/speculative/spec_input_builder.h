@@ -84,6 +84,13 @@ struct DecodeRowContext {
   bool build_execution_batch = false;
 };
 
+// Check allocated lookahead pages before issuing speculative writes. Block 0
+// is valid; unallocated columns must use a negative sentinel.
+bool has_decode_lookahead_capacity(const DecodeRowContext& ctx,
+                                   int32_t num_tokens,
+                                   int32_t block_size,
+                                   int64_t max_position_embeddings);
+
 // Declarative spec for one emitted decode row.
 // A row can selectively append token/kv/q/block fields depending on caller
 // needs.

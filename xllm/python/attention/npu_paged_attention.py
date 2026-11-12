@@ -260,6 +260,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         device: torch.device,
         dtype: torch.dtype,
         mla_block_draft: bool = False,
+        use_xfia_decode: bool = False,
+        xfia_query_width: int = 1,
     ) -> None:
         self._mla_block_draft = mla_block_draft
         self.num_heads = num_heads
@@ -269,6 +271,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self.sliding_window = sliding_window
         self.dtype = dtype
         self.device = device
+        self._use_xfia_decode = use_xfia_decode
+        self._xfia_query_width = xfia_query_width
+        self._xfia_query_ends: torch.Tensor | None = None
+        self._xfia_kv_lengths: torch.Tensor | None = None
+        self._xfia_kv_starts: torch.Tensor | None = None
+        self._xfia_row_ends: dict[int, torch.Tensor] = {}
         self._use_fia_v2 = _HAS_FIA_V2
         self._is_mla = is_mla
         self._uses_sparse_mla = False
@@ -386,7 +394,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     @property
     def requires_host_kv_lengths(self) -> bool:
         """Whether ACL Graph replay must update FIA's host KV-length list."""
-        return self._is_mla and not self._uses_sparse_mla
+        return not self._use_xfia_decode and (not self._is_mla or not self._uses_sparse_mla)
 
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         full_attention_caches = [(cache.key, cache.value) for cache in kv_caches if cache.key is not None]
@@ -645,6 +653,18 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._block_attention_masks.clear()
         self._windowed_block_tables.clear()
         self._block_draft_metadata = None
+        if self._use_xfia_decode and (
+            not (metadata.is_prefill or metadata.is_chunked_prefill)
+            or (
+                metadata.is_chunked_prefill
+                and getattr(metadata, "is_dflash_proposal", False)
+                and metadata.block_table is not None
+                and metadata.slot_mapping.numel() == metadata.block_table.shape[0] * self._xfia_query_width
+            )
+        ):
+            self._prepare_xfia_decode(metadata, graph_mode=graph_mode)
+            self._metadata = metadata
+            return
         self._kda_validated_query_shape = None
         self._graph_metadata_updated_in_place = False
         self._active_full_layer = None
@@ -850,6 +870,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             else:
                 self._mla_actual_seq_q = actual_seq_q
                 self._mla_actual_seq_kv = actual_seq_kv
+            # Dense (FIA v2) MLA needs host cumulative seq-lens; sparse SFA
+            # does not, so skip the D2H unless the dense path can run.
             if self.requires_host_kv_lengths:
                 if metadata.is_prefill or metadata.is_chunked_prefill:
                     self._mla_actual_seq_q_host = actual_seq_q.cpu().tolist()
@@ -864,11 +886,16 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 self._mla_actual_seq_kv_host = None
             if metadata.is_prefill or metadata.is_chunked_prefill:
                 q_seq_lens = getattr(metadata, "q_seq_lens", None)
-                if q_seq_lens is not None and q_seq_lens.numel() > 0:
+                q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
+                if q_seq_lens_host is not None and q_seq_lens_host.numel() > 0:
+                    self._mla_max_seqlen_q = int(q_seq_lens_host.max().item())
+                elif q_seq_lens is not None and q_seq_lens.device.type == "cpu" and q_seq_lens.numel() > 0:
                     self._mla_max_seqlen_q = int(q_seq_lens.max().item())
+                elif graph_mode:
+                    self._mla_max_seqlen_q = metadata.slot_mapping.numel()
                 else:
-                    seq_starts = torch.cat([actual_seq_q.new_zeros(1), actual_seq_q[:-1]])
-                    self._mla_max_seqlen_q = int((actual_seq_q - seq_starts).max().item())
+                    starts = torch.cat((actual_seq_q.new_zeros(1), actual_seq_q[:-1]))
+                    self._mla_max_seqlen_q = int((actual_seq_q - starts).max().item())
             else:
                 self._mla_max_seqlen_q = 1
             if graph_mode and self._block_table_i32 is not None:
@@ -880,7 +907,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             elif kv_seq_lens_host_values:
                 self._mla_max_seqlen_k = max(kv_seq_lens_host_values)
             else:
-                self._mla_max_seqlen_k = int(actual_seq_kv.max().item())
+                kv_seq_lens_host = getattr(metadata, "kv_seq_lens_host", None)
+                kv_seq_lens_host_values = getattr(metadata, "kv_seq_lens_host_values", None)
+                if kv_seq_lens_host is not None and kv_seq_lens_host.numel() > 0:
+                    self._mla_max_seqlen_k = int(kv_seq_lens_host.max().item())
+                elif kv_seq_lens_host_values:
+                    self._mla_max_seqlen_k = max(int(value) for value in kv_seq_lens_host_values)
+                else:
+                    self._mla_max_seqlen_k = int(actual_seq_kv.max().item())
         else:
             self._mla_actual_seq_q = None
             self._mla_actual_seq_kv = None
@@ -1114,17 +1148,25 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             raise ValueError("windowed block drafts require a paged KV block table")
         kernels.reshape_paged_cache(self._full_slot_mapping(metadata), k_3d, v_3d, k_cache, v_cache)
 
+        if (
+            self._use_xfia_decode
+            and metadata.is_chunked_prefill
+            and getattr(metadata, "is_dflash_proposal", False)
+            and metadata.block_table is not None
+            and num_tokens == metadata.block_table.shape[0] * self._xfia_query_width
+        ):
+            return self._xfia_decode(q_3d, k_cache, v_cache, layer_id)
         prepared = getattr(metadata, "prepared_attention_state", None)
         if (
             getattr(metadata, "is_spec_verify", False)
             and isinstance(prepared, _PreparedPagedAttention)
             and prepared.device_kv_lengths is not None
         ):
-            return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
+            return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens, layer_id)
         device_lengths = isinstance(prepared, _PreparedPagedAttention) and prepared.device_kv_lengths is not None
         if metadata.is_prefill or metadata.is_chunked_prefill or device_lengths or block_window:
             if self._use_expanded_decode:
-                return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
+                return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens, layer_id)
             return self._prefill(
                 q_3d,
                 k_3d,
@@ -1135,7 +1177,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 num_tokens,
                 layer,
             )
-        return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
+        return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens, layer_id)
 
     def execute_mla(
         self,
@@ -1490,18 +1532,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         cp_context: CpContext,
     ) -> torch.Tensor:
         """Return the cached block-table rows for this CP segment layout."""
-        # Keep this helper usable by lightweight test doubles that bypass
-        # ``__init__`` while retaining the normal per-forward cache on the
-        # production backend.
-        cache = getattr(self, "_mla_cp_block_tables", None)
-        if cache is None:
-            cache = {}
-            self._mla_cp_block_tables = cache
         cache_key = (id(cp_context), id(block_table))
-        segmented = cache.get(cache_key)
+        segmented = self._mla_cp_block_tables.get(cache_key)
         if segmented is None:
             segmented = block_table.index_select(0, cp_context.segment_seq_indices).contiguous()
-            cache[cache_key] = segmented
+            self._mla_cp_block_tables[cache_key] = segmented
         return segmented
 
     def _get_quant_indexer_metadata(
@@ -2376,6 +2411,72 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     # Decode: FIA with block_table (paged KV, no gather)
     # ------------------------------------------------------------------
 
+    def _prepare_xfia_decode(self, metadata: AttentionMetadata, *, graph_mode: bool = False) -> None:
+        """Keep decode lengths on device, including ACL graph replay inputs."""
+        if metadata.block_table is None or metadata.kv_seq_lens is None:
+            raise RuntimeError("XFIA decode requires device block tables and KV lengths")
+        if self._is_mla or self.head_dim != 128 or self.page_size != 128:
+            raise RuntimeError("XFIA decode requires dense attention with head/page size 128")
+        sequences = metadata.block_table.shape[0]
+        if metadata.kv_seq_lens.numel() != sequences:
+            raise RuntimeError("XFIA requires one KV length per block-table row")
+        rows = metadata.slot_mapping.numel()
+        if rows not in (sequences, sequences * self._xfia_query_width):
+            raise RuntimeError("XFIA requires complete DFlash2 proposal blocks")
+        self._block_table_i32 = metadata.block_table.to(torch.int32).contiguous()
+        self._xfia_kv_lengths = metadata.kv_seq_lens.to(torch.int32).contiguous()
+        if rows != sequences:
+            self._block_table_i32 = self._block_table_i32.repeat_interleave(self._xfia_query_width, dim=0)
+            self._xfia_kv_lengths = self._xfia_kv_lengths.repeat_interleave(self._xfia_query_width)
+        if rows not in self._xfia_row_ends:
+            self._xfia_row_ends[rows] = torch.arange(1, rows + 1, dtype=torch.int32, device=self.device)
+        self._xfia_query_ends = self._xfia_row_ends[rows]
+        if self.sliding_window <= 0:
+            self._xfia_kv_starts = torch.zeros_like(self._xfia_kv_lengths)
+        elif rows == sequences:
+            # A configured proposal width does not make single-token decode
+            # rows part of a proposal. Each row uses its own sequence window.
+            self._xfia_kv_starts = (self._xfia_kv_lengths - self.sliding_window).clamp_min(0)
+        else:
+            # Preserve FIA band-mode's right-aligned [left=window-1, right=width-1]
+            # visibility. Every proposal row sees the complete proposal block;
+            # its left boundary can fall inside a physical KV page.
+            row_in_block = (self._xfia_query_ends - 1).remainder(self._xfia_query_width)
+            self._xfia_kv_starts = (
+                self._xfia_kv_lengths - self._xfia_query_width + row_in_block - (self.sliding_window - 1)
+            ).clamp_min(0)
+        if graph_mode:
+            for attribute, name in (
+                ("_block_table_i32", "XFIA_BLOCK_TABLE"),
+                ("_xfia_kv_lengths", "XFIA_KV_LENGTHS"),
+                ("_xfia_kv_starts", "XFIA_KV_STARTS"),
+            ):
+                source = getattr(self, attribute)
+                setattr(self, attribute, copy_into_execution_buffer((name, *source.shape), source))
+
+    def _xfia_decode(
+        self,
+        q: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        output = get_execution_buffer(("XFIA_OUTPUT", layer_id, *q.shape), lambda: torch.empty_like(q))
+        # All changing arguments are device tensor contents. The captured op
+        # needs no external event or host-side FIA task update on replay.
+        torch.ops.xllm_ops.x_flash_attention_decode_out(
+            q,
+            key,
+            value,
+            self._block_table_i32,
+            self._xfia_query_ends,
+            self._xfia_kv_lengths,
+            self._xfia_kv_starts,
+            self.scale,
+            output,
+        )
+        return output.reshape(q.shape[0], self.num_heads * self.head_dim)
+
     def _fia_out(
         self,
         q: torch.Tensor,
@@ -2443,7 +2544,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         v_cache: torch.Tensor,
         metadata: AttentionMetadata,
         num_tokens: int,
+        layer_id: int,
     ) -> torch.Tensor:
+        if self._use_xfia_decode:
+            return self._xfia_decode(q_3d, k_cache, v_cache, layer_id)
         block_size = k_cache.size(1)
         k_flat = k_cache.view(k_cache.size(0), block_size, -1)
         v_flat = v_cache.view(v_cache.size(0), block_size, -1)

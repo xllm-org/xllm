@@ -69,6 +69,7 @@ cc_test(
     mtp_async_state_test.cpp
     "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/mtp_async_state.cpp"
     "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/spec_verify.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/speculative_cache_utils.cpp"
   DEPS
     :sampler
     :speculative
@@ -112,3 +113,15 @@ target_link_libraries(embedding_cache_test
                       $<$<BOOL:${USE_NPU}>:hccl>
                       $<$<BOOL:${USE_NPU}>:c_sec>
                       $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+cc_test(
+  NAME dflash_async_input_builder_test
+  SRCS dflash_async_input_builder_test.cpp
+       "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dflash_async_input_builder.cpp"
+       "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/speculative_cache_utils.cpp"
+  DEPS torch glog::glog GTest::gtest_main
+)
+if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+  target_link_options(dflash_async_input_builder_test PRIVATE
+    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+endif()

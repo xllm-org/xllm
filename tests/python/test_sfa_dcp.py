@@ -150,6 +150,7 @@ def test_mla_index_context_uses_expanded_table_and_preserves_cp_context() -> Non
 @pytest.mark.parametrize("with_scale", [False, True])
 def test_mla_index_materialization_keeps_cache_scale_and_table_together(with_scale: bool) -> None:
     backend = object.__new__(NpuPagedAttentionBackend)
+    backend._mla_cp_block_tables = {}
     index_cache = torch.empty(1)
     index_cache_scale = torch.empty(1) if with_scale else None
     materialized_cache = torch.empty(2)
@@ -178,6 +179,7 @@ def test_mla_index_materialization_keeps_cache_scale_and_table_together(with_sca
 
 def test_cp_block_table_segmentation_reuses_forward_cache() -> None:
     backend = object.__new__(NpuPagedAttentionBackend)
+    backend._mla_cp_block_tables = {}
     block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     cp_context = SimpleNamespace(segment_seq_indices=torch.tensor([1, 0]))
 

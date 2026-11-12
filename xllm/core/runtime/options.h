@@ -91,6 +91,10 @@ struct Options {
 
   PROPERTY(bool, is_draft_engine) = false;
 
+  // DFlash2 proposal attention (XFIA). Set only by the owner that evaluated
+  // the prelaunch gate; the draft engine and Python executor read it back.
+  PROPERTY(bool, enable_dflash_xfia) = false;
+
   PROPERTY(int32_t, world_size) = 1;
 
   // task type, support 'generate' and 'embed' currently

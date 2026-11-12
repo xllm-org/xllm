@@ -67,6 +67,8 @@ std::vector<Sequence*> Batch::get_sequences() const {
   return state_.group_sequences();
 }
 
+void Batch::retain_cache_blocks() { state_.retain_cache_blocks(); }
+
 LlmForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                                              uint32_t min_decoding_batch_size,
                                              const ModelArgs& args,

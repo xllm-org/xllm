@@ -475,6 +475,15 @@ class DecodeAclGraphRunner(AclGraphRunner):
     def _logical_page_size(self) -> int:
         return int(getattr(self.attention_backend, "logical_page_size", self.attention_backend.page_size))
 
+    def _requires_host_kv_lengths(self) -> bool:
+        return bool(
+            getattr(
+                self.attention_backend,
+                "requires_host_kv_lengths",
+                not getattr(self.attention_backend, "is_mla", False),
+            )
+        )
+
     def _decode_metadata(
         self,
         metadata: AttentionMetadata,
@@ -495,9 +504,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
             raise RuntimeError("decode graph requires block and KV metadata")
         block_table = block_table.to(device=kv_seq_lens.device, dtype=torch.int32).contiguous()
         kv_seq_lens = kv_seq_lens.to(torch.int32)
-        if getattr(self.attention_backend, "is_mla", False) and not getattr(
-            self.attention_backend, "requires_host_kv_lengths", False
-        ):
+        if not self._requires_host_kv_lengths():
             # The C++ engine sizes kv_seq_lens_host_values by the global DP
             # batch, while block_table holds only this rank's local rows. When
             # the backend does not consume host KV lengths (e.g. sparse MLA),
@@ -714,6 +721,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
             mtp_topk_indices,
             kpool_query_lens=kpool_query_lens,
             expanded_query_lens=expanded_query_lens,
+            is_dflash_proposal=bool(getattr(metadata, "is_dflash_proposal", False)),
         )
         if self._device_kv_lengths:
             if not kv_capacity_pages:
@@ -1122,6 +1130,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
         *,
         kpool_query_lens: tuple[int, ...] = (),
         expanded_query_lens: tuple[int, ...] = (),
+        is_dflash_proposal: bool = False,
     ) -> _GraphKey:
         """Return the key for a shape- and metadata-specific graph."""
         topk_signature = (None, None, None)
@@ -1143,6 +1152,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
             *topk_signature,
             kpool_query_lens,
             expanded_query_lens,
+            is_dflash_proposal,
         )
 
     def _padded_kpool_query_lens(
@@ -1296,6 +1306,9 @@ class DecodeAclGraphRunner(AclGraphRunner):
             dp_is_decode=tuple([1] * self.dp_size) if self.dp_size > 1 else (),
             is_dummy=bool(getattr(metadata, "is_dummy", False)),
             is_spec_verify=bool(getattr(metadata, "is_spec_verify", False) or is_expanded),
+            # Proposal marking is a property of the captured block shape, not
+            # of the expanded verify replay.
+            is_dflash_proposal=bool(getattr(metadata, "is_dflash_proposal", False)),
             kpool_query_lens=kpool_query_lens,
             kpool_query_lens_device=(
                 torch.tensor(kpool_query_lens, dtype=torch.int32, device=device) if kpool_query_lens else None
@@ -1330,14 +1343,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
                 paged_attention_tiling_data=None,
                 kv_seq_lens_host=None,
                 kv_seq_lens_host_values=(
-                    entry.static_metadata.kv_seq_lens_host_values
-                    if getattr(
-                        self.attention_backend,
-                        "requires_host_kv_lengths",
-                        False,
-                    )
-                    or not getattr(self.attention_backend, "is_mla", False)
-                    else None
+                    entry.static_metadata.kv_seq_lens_host_values if self._requires_host_kv_lengths() else None
                 ),
             )
         entry.static_metadata.multi_block_tables = self.attention_backend.create_graph_block_tables(
@@ -1674,11 +1680,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
         kv_seq_lens: list[int] | None,
         batch_size: int,
     ) -> None:
-        if getattr(self.attention_backend, "is_mla", False) and not getattr(
-            self.attention_backend,
-            "requires_host_kv_lengths",
-            False,
-        ):
+        if not self._requires_host_kv_lengths():
             return
         if kv_seq_lens is None:
             raise RuntimeError("decode ACL graph requires scheduler-provided host KV lengths")

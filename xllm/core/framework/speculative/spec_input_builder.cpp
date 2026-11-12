@@ -156,6 +156,30 @@ MtpTopkStatePtr select_mtp_topk_state_for_next_step(
   return state->index_select_rows(index);
 }
 
+bool has_decode_lookahead_capacity(const DecodeRowContext& ctx,
+                                   int32_t num_tokens,
+                                   int32_t block_size,
+                                   int64_t max_position_embeddings) {
+  CHECK_GT(num_tokens, 0);
+  CHECK_GT(block_size, 0);
+  for (int32_t seq = 0; seq < ctx.num_sequences; ++seq) {
+    const int64_t first_position = ctx.positions[seq];
+    const int64_t last_position = first_position + num_tokens - 1;
+    const int64_t last_block = last_position / block_size;
+    if (first_position < 0 || last_position >= max_position_embeddings ||
+        last_block >= ctx.block_table_stride) {
+      return false;
+    }
+    for (int64_t block = first_position / block_size; block <= last_block;
+         ++block) {
+      if (ctx.block_tables[seq * ctx.block_table_stride + block] < 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 int32_t calc_slot_id(int32_t position,
                      const Slice<int32_t>& block_table_slice,
                      int32_t block_size) {

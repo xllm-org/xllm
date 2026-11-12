@@ -35,6 +35,10 @@ limitations under the License.
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/draft_proposal.h"
 #include "core/framework/speculative/embedding_cache.h"
+#include "core/framework/speculative/spec_input_builder.h"
+#if defined(USE_NPU)
+#include "core/layers/common/expanded_decode_metadata_builder.h"
+#endif
 #include "core/kv_cache/layout/kv_cache_capacity.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
@@ -478,6 +482,183 @@ void DraftModelSpecWorkerImpl<TargetInput>::prepare_draft_input(
             : torch::Tensor());
   }
 }
+
+template <typename TargetInput>
+runtime::Options DraftModelSpecWorkerImpl<TargetInput>::target_options(
+    const runtime::Options& options) {
+  runtime::Options opts = options;
+  opts.enable_schedule_overlap(false)
+      .is_draft_engine(false)
+      .enable_graph_aux_hidden_states(true);
+  return opts;
+}
+
+template <typename TargetInput>
+int32_t DraftModelSpecWorkerImpl<TargetInput>::logical_block_size() const {
+  CHECK_GT(options_.block_size(), 0);
+  const int32_t kv_split_size = parallel_args_.kv_split_size_effective();
+  CHECK_GT(kv_split_size, 0);
+  return options_.block_size() * kv_split_size;
+}
+
+template <typename TargetInput>
+void DraftModelSpecWorkerImpl<TargetInput>::update_decode_step_input(
+    TargetInput& input,
+    const std::vector<EmbeddingCache::DecodeState>& last_states,
+    bool positions_decoupled,
+    bool normalize_kv_context) const {
+  const int32_t num_sequences = input.input_params.meta.num_sequences;
+  CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
+      << "decode context state count mismatch";
+  const bool enable_cache_correction = enable_schedule_overlap();
+  const int32_t block_size = normalize_kv_context ? logical_block_size() : 0;
+
+  std::vector<int32_t> token_ids_vec;
+  std::vector<int32_t> kv_seq_lens_vec;
+  token_ids_vec.reserve(num_sequences);
+  kv_seq_lens_vec.reserve(num_sequences);
+
+  const torch::Tensor& token_ids_cpu = input.token_ids_host;
+  const torch::Tensor& positions_cpu = input.positions_host;
+  Slice<int32_t> input_token_ids = tensor_slice(token_ids_cpu);
+  Slice<int32_t> input_positions = tensor_slice(positions_cpu);
+  std::vector<int32_t> positions_vec;
+  positions_vec.reserve(num_sequences);
+
+  CHECK_GE(input_token_ids.size(), static_cast<size_t>(num_sequences));
+  CHECK_GE(input_positions.size(), static_cast<size_t>(num_sequences));
+  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+    const EmbeddingCache::DecodeState& state = last_states[seq_id];
+    const int32_t input_token_id = input_token_ids[seq_id];
+    const bool input_is_fake_token = input_token_id < 0;
+    const bool rewrite_fake_token =
+        enable_cache_correction && input_is_fake_token;
+    const bool use_cache_correction = rewrite_fake_token && state.valid;
+    const int32_t position_offset =
+        use_cache_correction ? state.position_offset : 0;
+    int32_t current_position = input_positions[seq_id] + position_offset;
+    int32_t current_kv_len = specBuilder::calc_kv_len(
+        input.input_params.attention.host.kv_seq_lens, seq_id, position_offset);
+    int32_t expected_kv_len =
+        positions_decoupled ? current_kv_len : current_position + 1;
+    if (normalize_kv_context) {
+      const torch::Tensor& block_tables =
+          input.input_params.attention.host.block_tables;
+      if (block_tables.defined() && block_tables.dim() == 2 &&
+          seq_id < block_tables.size(0)) {
+        const int32_t allocated_kv_len =
+            static_cast<int32_t>(block_tables.size(1)) * block_size;
+        const int32_t validate_width = options_.num_speculative_tokens() + 1;
+        const int32_t max_valid_position = allocated_kv_len - validate_width;
+        if (current_position > max_valid_position) {
+          CHECK_GT(allocated_kv_len, 0)
+              << "decode context has empty block table, seq_id=" << seq_id;
+          CHECK_GE(max_valid_position, 0)
+              << "decode context block table is too small for validation, "
+              << "seq_id=" << seq_id
+              << ", allocated_kv_len=" << allocated_kv_len
+              << ", validate_width=" << validate_width;
+          CHECK_LE(current_position - max_valid_position,
+                   options_.num_speculative_tokens() + 1)
+              << "decode context position exceeds allocated blocks, seq_id="
+              << seq_id << ", current_position=" << current_position
+              << ", current_kv_len=" << current_kv_len
+              << ", allocated_kv_len=" << allocated_kv_len;
+          current_position = max_valid_position;
+          expected_kv_len = current_position + 1;
+          current_kv_len = std::min(current_kv_len, expected_kv_len);
+        }
+      }
+    }
+    if (normalize_kv_context && current_kv_len < expected_kv_len) {
+      // Only the current speculative step can explain a scheduler KV lag.
+      CHECK_LE(expected_kv_len - current_kv_len,
+               options_.num_speculative_tokens() + 1)
+          << "decode context kv_len lag is too large, seq_id=" << seq_id
+          << ", current_position=" << current_position
+          << ", current_kv_len=" << current_kv_len;
+      current_kv_len = expected_kv_len;
+    }
+    if (normalize_kv_context && current_kv_len > expected_kv_len) {
+      // The first decode position can still be zero after prompt prefill.
+      current_position = current_kv_len - 1;
+      expected_kv_len = current_kv_len;
+    }
+
+    CHECK_EQ(expected_kv_len, current_kv_len)
+        << "decode context position/kv_len mismatch, seq_id=" << seq_id
+        << ", current_position=" << current_position
+        << ", current_kv_len=" << current_kv_len;
+
+    token_ids_vec.emplace_back(rewrite_fake_token ? state.token_id
+                                                  : input_token_id);
+    positions_vec.emplace_back(current_position);
+    kv_seq_lens_vec.emplace_back(current_kv_len);
+  }
+
+  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
+  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
+  input.runtime.input_host_buffer_has_layout = false;
+  input.runtime.device_tensors_ready = false;
+}
+
+#if defined(USE_NPU)
+template <typename TargetInput>
+void DraftModelSpecWorkerImpl<TargetInput>::
+    clear_expanded_spec_verify_graph_input(ModelParamsView input_params) {
+  input_params.graph.use_expanded_decode_for_spec_verify_attention = false;
+  input_params.graph.expanded_kv_seq_lens = torch::Tensor();
+  input_params.graph.expanded_block_tables = torch::Tensor();
+  input_params.graph.expanded_paged_kv_indptr = torch::Tensor();
+  input_params.graph.expanded_paged_kv_indices = torch::Tensor();
+  input_params.graph.expanded_paged_kv_last_page_len = torch::Tensor();
+  input_params.graph.expanded_tiling_data = torch::Tensor();
+  input_params.graph.expanded_kv_seq_lens_vec.clear();
+}
+
+template <typename TargetInput>
+void DraftModelSpecWorkerImpl<TargetInput>::
+    build_expanded_spec_verify_graph_host_input(ModelParamsView input_params) {
+  clear_expanded_spec_verify_graph_input(input_params);
+  if (!input_params.is_spec_verify ||
+      !input_params.meta.batch_forward_type.is_chunked_prefill()) {
+    return;
+  }
+  const auto& q_seq_lens = input_params.attention.host.q_seq_lens;
+  const auto& kv_seq_lens = input_params.attention.host.kv_seq_lens;
+  if (q_seq_lens.empty() || kv_seq_lens.empty()) {
+    return;
+  }
+  auto expanded_kv_seq_lens =
+      layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
+          q_seq_lens, kv_seq_lens);
+  input_params.graph.use_expanded_decode_for_spec_verify_attention = true;
+  input_params.graph.expanded_kv_seq_lens_vec = std::move(expanded_kv_seq_lens);
+}
+
+template <typename TargetInput>
+void DraftModelSpecWorkerImpl<TargetInput>::
+    build_expanded_spec_verify_graph_input(ModelParamsView input_params,
+                                           int32_t block_size) const {
+  build_expanded_spec_verify_graph_host_input(input_params);
+  if (!input_params.graph.use_expanded_decode_for_spec_verify_attention) {
+    return;
+  }
+  input_params.graph.expanded_kv_seq_lens =
+      async_h2d_tensor(input_params.graph.expanded_kv_seq_lens_vec, device_);
+  auto expanded_block_tables =
+      layer::ExpandedDecodeMetadataBuilder::build_tokenwise_block_tables(
+          input_params.attention.device.block_tables,
+          input_params.attention.host.q_seq_lens);
+  layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+      input_params,
+      input_params.graph.expanded_kv_seq_lens,
+      expanded_block_tables,
+      std::move(input_params.graph.expanded_kv_seq_lens_vec),
+      block_size);
+}
+#endif
 
 template class DraftModelSpecWorkerImpl<LlmForwardInput>;
 template class DraftModelSpecWorkerImpl<VlmForwardInput>;

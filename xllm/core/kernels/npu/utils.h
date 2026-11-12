@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "acl/acl.h"
+#include "aclnn/acl_meta.h"
 #include "core/util/tensor_helper.h"
 
 namespace xllm::kernel::npu {

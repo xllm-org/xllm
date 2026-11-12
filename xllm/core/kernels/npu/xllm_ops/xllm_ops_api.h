@@ -465,6 +465,16 @@ void npu_inplace_partial_rotary_mul(torch::Tensor& x,
                                     c10::string_view rotary_mode,
                                     at::IntArrayRef partial_slice);
 
+torch::Tensor x_flash_attention_decode_out(const torch::Tensor& query,
+                                           const torch::Tensor& key,
+                                           const torch::Tensor& value,
+                                           const torch::Tensor& block_table,
+                                           const torch::Tensor& query_ends,
+                                           const torch::Tensor& kv_lengths,
+                                           const torch::Tensor& kv_starts,
+                                           double scale,
+                                           torch::Tensor& output);
+
 void scatter_nd_update(torch::Tensor& var,
                        const torch::Tensor& indices,
                        const torch::Tensor& updates);

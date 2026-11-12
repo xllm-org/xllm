@@ -864,29 +864,25 @@ bool WorkerImpl::can_prepare_npu_graph_decode_input(
   return can_prepare_npu_graph_decode_input_impl(input_params);
 }
 
-template <typename Params>
-bool WorkerImpl::can_prepare_without_compute_stream_wait_impl(
-    const Params& input_params) const {
+bool WorkerImpl::can_prepare_without_compute_stream_wait_impl() const {
 #if defined(USE_NPU)
-  (void)input_params;
   return !options_.enable_speculative_decode() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph_double_buffer() &&
          (options_.backend() == "llm" || options_.backend() == "vlm");
 #else
-  (void)input_params;
   return false;
 #endif
 }
 
 bool WorkerImpl::can_prepare_without_compute_stream_wait(
-    const LlmModelParams& input_params) const {
-  return can_prepare_without_compute_stream_wait_impl(input_params);
+    const LlmForwardInput& /*input*/) const {
+  return can_prepare_without_compute_stream_wait_impl();
 }
 
 bool WorkerImpl::can_prepare_without_compute_stream_wait(
-    const VlmModelParams& input_params) const {
-  return can_prepare_without_compute_stream_wait_impl(input_params);
+    const VlmForwardInput& /*input*/) const {
+  return can_prepare_without_compute_stream_wait_impl();
 }
 
 template <typename Params>
@@ -1281,10 +1277,10 @@ void WorkerImpl::prepare_work_before_execute_on_stream_impl(
 #endif
   c10::StreamGuard stream_guard = prepare_stream.set_stream_guard();
   if (enable_schedule_overlap() && wait_for_compute_stream &&
-      !can_prepare_without_compute_stream_wait(input.input_params) &&
-      compute_stream_) {
+      !can_prepare_without_compute_stream_wait(input) && compute_stream_) {
     // MTP updates reuse shared prepare/compute streams and need this ordering;
-    // only graph double-buffer decode can prepare the next slot independently.
+    // graph double buffering or an explicitly enabled speculative prelaunch
+    // path must provide independent input buffers before skipping this wait.
     prepare_stream.wait_stream(*compute_stream_);
   }
   CHECK(prepare_stream.wait_event(input.runtime.metadata_ready_event))
@@ -1367,8 +1363,17 @@ void WorkerImpl::prepare_work_before_execute_on_stream_impl(
                             prepare_stream);
 
 #if defined(USE_NPU)
+    // Python spec-verify uses paged MLA directly. The ATB prefix-cache
+    // history/ring scratch is neither exported to Python nor read by its
+    // attention backend. Building it forces scalar/length D2H reads and
+    // prevents metadata preparation from overlapping the pending draft.
+    const bool python_spec_verify =
+        input_params.is_spec_verify &&
+        ModelConfig::is_python_model_impl(
+            ModelConfig::get_instance().model_impl());
     if (context_.get_model_args().enable_mla() &&
-        input_params.meta.batch_forward_type.is_chunked_prefill()) {
+        input_params.meta.batch_forward_type.is_chunked_prefill() &&
+        !python_spec_verify) {
       prepare_mla_prefixcache_inputs(input_params);
     }
 
@@ -1864,6 +1869,9 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
         configure_deepseek_v4_dspark_args(args, options_);
       }
     } else {
+      if (options_.enable_speculative_decode()) {
+        args.num_speculative_tokens(options_.num_speculative_tokens());
+      }
       CHECK(options_.draft_model_path().has_value())
           << "block-diffusion speculative decoding requires --draft_model.";
       args.layers_to_capture(
@@ -1950,6 +1958,7 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   flash_comm1_options.enable_mmrs_fusion = options_.enable_mmrs_fusion();
   flash_comm1_options.mmrs_comm_mode = options_.mmrs_comm_mode();
   context_.set_flash_comm1_options(flash_comm1_options);
+  context_.set_dflash_xfia_enabled(options_.enable_dflash_xfia());
 
   // init model, create model executor
   bool status = this->init_model(context_);
@@ -2382,12 +2391,14 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     LlmForwardInput& processed_input,
     Stream& prepare_stream,
     bool record_ready_event,
-    bool restore_linear_state) {
+    bool restore_linear_state,
+    bool wait_for_compute_stream) {
   prepare_work_before_execute_on_stream_impl(input,
                                              processed_input,
                                              prepare_stream,
                                              record_ready_event,
-                                             restore_linear_state);
+                                             restore_linear_state,
+                                             wait_for_compute_stream);
 }
 
 void WorkerImpl::prepare_work_before_execute_on_stream(

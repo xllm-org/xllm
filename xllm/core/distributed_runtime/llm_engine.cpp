@@ -48,6 +48,7 @@ limitations under the License.
 #include "core/framework/eplb/eplb_controller.h"
 #include "core/framework/model/model_type.h"
 #include "core/framework/model_loader/model_loader.h"
+#include "core/framework/speculative/dflash_prelaunch_policy.h"
 #include "core/framework/speculative/draft_config.h"
 #include "core/kv_cache/block/block_utils.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
@@ -187,6 +188,7 @@ bool LLMEngine::init(
 bool LLMEngine::init_model(MasterStatus master_status,
                            const ModelInitCallback& prepare_model) {
   const std::string& model_path = options_.model_path();
+  const auto& model_config = ModelConfig::get_instance();
   auto model_loader = ModelLoader::create(model_path);
   LOG(INFO) << "Initializing model from: " << model_path;
 
@@ -195,11 +197,13 @@ bool LLMEngine::init_model(MasterStatus master_status,
       args_,
       options_.speculative_algorithm(),
       options_.is_draft_engine(),
-      ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl()));
+      ModelConfig::is_python_model_impl(model_config.model_impl()));
   if (!options_.is_draft_engine() &&
       SpeculativeConfig::is_block_diffusion_algorithm(
           options_.speculative_algorithm())) {
+    if (options_.enable_speculative_decode()) {
+      args_.num_speculative_tokens(options_.num_speculative_tokens());
+    }
     CHECK(options_.draft_model_path().has_value())
         << "Block-diffusion Target requires a draft checkpoint.";
     // Scheduler warmup must use the same auxiliary-state width as the workers.
@@ -294,6 +298,18 @@ bool LLMEngine::init_model(MasterStatus master_status,
     }
   }
 
+  retain_cache_blocks_ =
+      supports_dflash2_prelaunch(
+          options_.speculative_algorithm(),
+          options_,
+          options_.dp_size(),
+          options_.cp_size(),
+          Platform::is_ascend_a3(),
+          ModelConfig::is_python_model_impl(model_config.model_impl())) &&
+      supports_dflash2_xfia(options_.draft_model_path().value_or(""),
+                            model_config.backend(),
+                            options_.block_size(),
+                            options_.kv_cache_dtype());
   return true;
 }
 
@@ -568,6 +584,15 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
       << "Split DP batch failed with dp_size as " << dp_size_
       << " and actual batch size as " << batch.size() << ".";
 
+  // The scheduler can collect EOS from the previous batch after dispatching
+  // this one. Keep its pages allocated until this batch's real output is
+  // collected; DFlash2 fences its prelaunch KV writes before that output is
+  // published. Together these protect the extra in-flight overlap step.
+  if (retain_cache_blocks_) {
+    for (auto& dp_batch : batch) {
+      dp_batch.retain_cache_blocks();
+    }
+  }
   std::vector<LlmForwardInput> forward_inputs;
   bool is_graph_warmup = false;
   forward_input_factory_->create_inputs(

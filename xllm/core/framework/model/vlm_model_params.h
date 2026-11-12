@@ -42,6 +42,7 @@ class VlmModelParams final {
     out.mtp_shifted_token_ids = mtp_shifted_token_ids;
     out.linear_state_validity_mask = linear_state_validity_mask;
     out.is_spec_verify = is_spec_verify;
+    out.is_dflash_proposal = is_dflash_proposal;
     out.prefill_without_cache = prefill_without_cache;
     out.num_accepted_tokens = num_accepted_tokens;
     out.mtp_topk_state = mtp_topk_state;
@@ -62,6 +63,7 @@ class VlmModelParams final {
     params.graph = graph.to(device);
     params.linear_state_validity_mask = linear_state_validity_mask;
     params.is_spec_verify = is_spec_verify;
+    params.is_dflash_proposal = is_dflash_proposal;
     params.prefill_without_cache = prefill_without_cache;
     params.num_accepted_tokens = safe_to(num_accepted_tokens, device, true);
     params.num_accepted_tokens_host = num_accepted_tokens_host;
@@ -133,6 +135,7 @@ class VlmModelParams final {
   torch::Tensor mtp_shifted_token_ids;
   std::vector<int64_t> linear_state_validity_mask;
   bool is_spec_verify = false;
+  bool is_dflash_proposal = false;
   bool prefill_without_cache = false;
   torch::Tensor num_accepted_tokens;
   MtpTopkStatePtr mtp_topk_state;

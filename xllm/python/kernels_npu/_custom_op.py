@@ -1307,6 +1307,21 @@ def _shared_full_indices_out_fake(
     return None
 
 
+def _x_flash_attention_decode_out_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_table: torch.Tensor,
+    query_ends: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    kv_starts: torch.Tensor,
+    scale: float,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    del query, key, value, block_table, query_ends, kv_lengths, kv_starts, scale
+    return output
+
+
 def _npu_all_reduce_fake(x: torch.Tensor, comm: int) -> None:
     return None
 
@@ -1389,3 +1404,5 @@ register_fake("xllm_ops::sparse_attn_sharedkv_metadata", _sparse_attn_sharedkv_m
 register_fake("xllm_ops::sparse_flash_attention_lse", _sparse_flash_attention_lse_fake)
 register_fake("xllm_ops::sparse_flash_attention_lse_out", _sparse_flash_attention_lse_out_fake)
 register_fake("xllm_ops::sfa_dcp_remap_out", _sfa_dcp_remap_out_fake)
+
+register_fake("xllm_ops::x_flash_attention_decode_out", _x_flash_attention_decode_out_fake)

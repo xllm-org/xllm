@@ -1472,7 +1472,7 @@ std::optional<Params> GraphPersistentParam::update(
           expanded_kv_seq_lens_.slice(
               /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens),
           expanded_block_tables_for_graph(),
-          expanded_kv_seq_lens_vec,
+          std::move(expanded_kv_seq_lens_vec),
           options_.block_size());
       graph_params->graph.expanded_tiling_data =
           uses_paged_attention_tiling() ? tiling_data() : torch::Tensor();

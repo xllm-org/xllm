@@ -84,6 +84,17 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
       TargetInput>::estimate_kv_cache_capacity_with_draft;
   using DraftModelSpecWorkerImpl<TargetInput>::get_optimization_config;
   using DraftModelSpecWorkerImpl<TargetInput>::prepare_draft_input;
+  using DraftModelSpecWorkerImpl<TargetInput>::logical_block_size;
+  using DraftModelSpecWorkerImpl<TargetInput>::run_worker_no_sync;
+  using DraftModelSpecWorkerImpl<TargetInput>::target_options;
+#if defined(USE_NPU)
+  using DraftModelSpecWorkerImpl<
+      TargetInput>::clear_expanded_spec_verify_graph_input;
+  using DraftModelSpecWorkerImpl<
+      TargetInput>::build_expanded_spec_verify_graph_host_input;
+  using DraftModelSpecWorkerImpl<
+      TargetInput>::build_expanded_spec_verify_graph_input;
+#endif
 
   // MTP composite: leaves own model-specific NPU input preparation.
   bool owns_npu_parallel_input_prepare() const override;
@@ -133,10 +144,6 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
   bool supports_expanded_spec_verify() const;
   bool should_use_explicit_spec_verify_replay_update(
       const TargetInput& input) const;
-  // A DCP block-table entry covers one logical KV page per KV split. All
-  // speculative cache-slot and expanded-attention metadata must use this
-  // logical size rather than the per-rank physical allocator block size.
-  int32_t logical_block_size() const;
   int64_t spec_verify_block_table_width(
       const torch::Tensor& block_tables) const;
   void ensure_spec_verify_control_block_table(TargetModelParams& input_params,

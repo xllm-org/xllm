@@ -81,6 +81,11 @@ class ModelContext {
     flash_comm1_options_ = options;
   }
 
+  // DFlash2 proposal attention (XFIA) decided by the worker's prelaunch gate.
+  bool dflash_xfia_enabled() const { return dflash_xfia_enabled_; }
+
+  void set_dflash_xfia_enabled(bool enabled) { dflash_xfia_enabled_ = enabled; }
+
   ModelContext with_parallel_args(const ParallelArgs& parallel_args) const;
 
   ModelContext with_quant_args(const QuantArgs& quant_args) const;
@@ -117,6 +122,7 @@ class ModelContext {
   torch::TensorOptions tensor_options_;
   OptimizationConfig optimization_config_;
   FlashComm1Options flash_comm1_options_;
+  bool dflash_xfia_enabled_ = false;
   std::shared_ptr<ModelStreamRegistry> stream_registry_;
 };
 

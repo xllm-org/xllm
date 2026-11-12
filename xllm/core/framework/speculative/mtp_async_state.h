@@ -112,8 +112,4 @@ torch::Tensor make_kv_seq_lens(const AcceptedState& state,
 // overwrite valid draft KV state.
 torch::Tensor make_repair_cache_positions(const AcceptedState& state);
 
-torch::Tensor map_positions_to_cache_slots(const torch::Tensor& block_tables,
-                                           const torch::Tensor& positions,
-                                           int32_t block_size);
-
 }  // namespace xllm::mtp_async

@@ -1220,7 +1220,7 @@ def test_live_device_attention_excludes_rejected_kv_tail(graph: bool) -> None:
     backend.prepare(metadata)
 
     def decode() -> torch.Tensor:
-        return backend._decode(query, key, value, metadata, 2)
+        return backend._decode(query, key, value, metadata, 2, layer_id=0)
 
     captured = None
     graph_output = None
@@ -1330,7 +1330,7 @@ def test_refreshed_attention_hidden_matches_reexecuted_first_body(draft_width: i
 
     def refresh() -> torch.Tensor:
         torch.ops.xllm_ops.reshape_paged_cache(slots, key_rows, value_rows, key, value)
-        output = refresh_backend._decode(query, key, value, refresh_backend._metadata, rows)
+        output = refresh_backend._decode(query, key, value, refresh_backend._metadata, rows, layer_id=0)
         selected.copy_(row_starts + accepted.to(torch.int64) - 1)
         owned.copy_(output.view(rows, hidden_size).index_select(0, selected))
         return output
@@ -1402,7 +1402,9 @@ def test_refreshed_attention_hidden_matches_reexecuted_first_body(draft_width: i
             value,
         )
         repeated = (
-            first_backend._decode(query.index_select(0, gather), key, value, first_backend._metadata, 2 * batch)
+            first_backend._decode(
+                query.index_select(0, gather), key, value, first_backend._metadata, 2 * batch, layer_id=0
+            )
             .view(batch, 2, hidden_size)[:, 1]
             .contiguous()
         )

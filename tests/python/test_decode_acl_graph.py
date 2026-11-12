@@ -1986,3 +1986,15 @@ def test_mla_admission_retains_index_history_capacity_check() -> None:
     metadata.linear_state_indices = torch.tensor([-1], dtype=torch.int32)
 
     assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)
+
+
+def test_xfia_graph_accepts_device_only_lengths() -> None:
+    runner = _runner()
+    runner.attention_backend.requires_host_kv_lengths = False
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata.kv_seq_lens_host_values = None
+    assert runner._has_compatible_decode_metadata(torch.arange(4), metadata)
+    resolved = runner._decode_metadata(metadata)
+    assert resolved.block_table is metadata.block_table
+    assert resolved.kv_seq_lens is metadata.kv_seq_lens
+    assert resolved.kv_seq_lens_host_values is None

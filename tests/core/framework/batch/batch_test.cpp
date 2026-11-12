@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/kv_cache/block/block.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/block/block_utils.h"
@@ -572,6 +573,108 @@ TEST(BatchStateTest, PendingVmmInputKeepsKvBlocksUntilBatchRetires) {
     }
     EXPECT_EQ(kv_manager.num_free_blocks(), initial_kv_free);
   }
+}
+
+TEST(BatchTest, OverlapBatchRetainsFinishedRowsUntilTheInFlightBatchRetires) {
+  for (const auto type :
+       {BlockType::KV, BlockType::EMBEDDING, BlockType::LINEAR}) {
+    SCOPED_TRACE(static_cast<int>(type));
+    BlockManager::Options options;
+    options.num_blocks(4).block_size(128);
+    BlockManagerImpl manager(options);
+    Sequence ending = make_basic_sequence({1});
+    Sequence continuing = make_basic_sequence({2});
+    ending.add_blocks(type, manager.allocate(1));
+    continuing.add_blocks(type, manager.allocate(1));
+    const int32_t ending_id = ending.kv_state().blocks(type)[0].id();
+    const size_t free_before = manager.num_free_blocks();
+    Batch last_batch(std::vector<Sequence*>{&ending, &continuing});
+    last_batch.retain_cache_blocks();
+    // The overlap scheduler dispatches this batch before it receives the last
+    // batch's EOS. Both batches refer to the same pages.
+    Batch in_flight(std::vector<Sequence*>{&ending, &continuing});
+    in_flight.retain_cache_blocks();
+    ending.finish();
+    EXPECT_TRUE(ending.finished());
+    EXPECT_FALSE(continuing.finished());
+    manager.deallocate(ending.kv_state().blocks(type));
+    ending.kv_state().reset();
+    EXPECT_EQ(manager.num_free_blocks(), free_before);
+    last_batch = Batch();
+    EXPECT_EQ(manager.num_free_blocks(), free_before);
+    auto other_request = manager.allocate(1);
+    EXPECT_NE(other_request[0].id(), ending_id);
+    // Real output (including completion of prelaunch writes) is now collected.
+    in_flight = Batch();
+    EXPECT_EQ(manager.num_free_blocks(), free_before);
+    auto replacement = manager.allocate(1);
+    EXPECT_EQ(replacement[0].id(), ending_id);
+    EXPECT_EQ(continuing.kv_state().num_blocks(type), 1u);
+  }
+}
+
+TEST(BatchStateTest, ExplicitRetentionSurvivesVmmInputPreparation) {
+  auto& config = KVCacheConfig::get_instance();
+  const bool previous_vmm = config.enable_vmm_kvcache();
+  ScopeGuard restore_config([&] { config.enable_vmm_kvcache(previous_vmm); });
+  config.enable_vmm_kvcache(true);
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(128);
+  BlockManagerImpl manager(options);
+  const auto initial_free = manager.num_free_blocks();
+  Sequence sequence = make_basic_sequence({1});
+  for (const auto type : {BlockType::KV,
+                          BlockType::SWA,
+                          BlockType::C4,
+                          BlockType::C128,
+                          BlockType::EMBEDDING,
+                          BlockType::LINEAR}) {
+    sequence.add_blocks(type, manager.allocate(1));
+  }
+  const auto retained_free = manager.num_free_blocks();
+  {
+    BatchState state;
+    state.add(&sequence, 1);
+    state.retain_cache_blocks();
+    state.prepare_sequence_input_data();
+    sequence.reset();
+    EXPECT_EQ(manager.num_free_blocks(), retained_free);
+  }
+  EXPECT_EQ(manager.num_free_blocks(), initial_free);
+}
+
+TEST(ForwardInputBuilderTest, DFlash2BlockTablePaddingDoesNotAliasBlockZero) {
+  auto& config = SpeculativeConfig::get_instance();
+  const std::string previous_algorithm = config.speculative_algorithm();
+  ScopeGuard restore_config(
+      [&] { config.speculative_algorithm(previous_algorithm); });
+  config.speculative_algorithm("dflash2");
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(128);
+  BlockManagerImpl manager(options);
+  Sequence first = make_basic_sequence({1});
+  Sequence second = make_basic_sequence({2});
+  first.add_blocks(BlockType::KV, manager.allocate(1));
+  second.add_blocks(BlockType::KV, manager.allocate(2));
+  std::vector<Sequence*> sequences = {&first, &second};
+  std::vector<uint32_t> budgets = {1, 1};
+  std::vector<torch::Tensor> embeddings;
+  std::vector<MMData> mm_data;
+  ForwardInputBuilder builder(sequences,
+                              budgets,
+                              embeddings,
+                              mm_data,
+                              /*batch_id=*/0,
+                              /*args=*/nullptr,
+                              BatchForwardType::PREFILL);
+  const LlmForwardInput input = builder.build_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
+  const auto& table = input.input_params.attention.host.block_tables;
+  ASSERT_EQ(table.size(0), 2);
+  ASSERT_EQ(table.size(1), 2);
+  EXPECT_GE(table[0][0].item<int32_t>(), 0);
+  EXPECT_EQ(table[0][1].item<int32_t>(), -1);
+  EXPECT_GE(table[1][1].item<int32_t>(), 0);
 }
 
 TEST(ForwardInputBuilderTest, LaterChunkUsesLogicalOffset) {

@@ -9,8 +9,11 @@ cc_library(
     draft_vocab_mapping.h
     rejection_sampler.h
     spec_input_builder.h
+    speculative_cache_utils.h
     mtp_async_input_builder.h
     mtp_async_state.h
+    dflash_async_input_builder.h
+    dflash_prelaunch_policy.h
     mtp_json_object_state.h
     mtp_utils.h
     draft_extend_input.h
@@ -24,9 +27,11 @@ cc_library(
     draft_vocab_mapping.cpp
     rejection_sampler.cpp
     spec_input_builder.cpp
+    speculative_cache_utils.cpp
     mtp_async_input_builder.cpp
     mtp_async_state.cpp
     draft_extend_input.cpp
+    dflash_async_input_builder.cpp
     embedding_cache.cpp
     metrics.cpp
     verify_layout.cpp

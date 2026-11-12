@@ -20,7 +20,9 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <array>
 #include <numeric>
+#include <span>
 #include <utility>
 
 #include "core/framework/batch/forward_input_builder.h"
@@ -29,6 +31,27 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 
 namespace xllm {
+namespace {
+std::vector<Block> collect_cache_blocks(
+    const std::vector<Sequence*>& sequences,
+    std::span<const BlockType> block_types) {
+  size_t block_count = 0;
+  for (auto* sequence : sequences) {
+    for (const auto type : block_types) {
+      block_count += sequence->kv_state().num_blocks(type);
+    }
+  }
+  std::vector<Block> retained;
+  retained.reserve(block_count);
+  for (auto* sequence : sequences) {
+    for (const auto type : block_types) {
+      const auto blocks = sequence->kv_state().blocks(type);
+      retained.insert(retained.end(), blocks.begin(), blocks.end());
+    }
+  }
+  return retained;
+}
+}  // namespace
 
 void BatchState::add(Sequence* sequence, uint32_t allowed_max_token) {
   CHECK(sequence != nullptr);
@@ -142,20 +165,29 @@ Sequence* BatchState::group_sequence(size_t index) const {
   return nullptr;
 }
 
+void BatchState::retain_cache_blocks() {
+  constexpr std::array block_types = {BlockType::KV,
+                                      BlockType::SWA,
+                                      BlockType::C4,
+                                      BlockType::C128,
+                                      BlockType::EMBEDDING,
+                                      BlockType::LINEAR};
+  if (sequence_plan_.empty()) {
+    retained_cache_blocks_ =
+        collect_cache_blocks(group_sequences(), block_types);
+  } else {
+    retained_cache_blocks_ =
+        collect_cache_blocks(sequence_plan_.sequences(), block_types);
+  }
+  all_cache_blocks_retained_ = true;
+}
+
 BatchInputData BatchState::input_data(const BatchSequencePlan& plan) {
-  if (KVCacheConfig::get_instance().enable_vmm_kvcache()) {
-    std::vector<Block> retained_blocks;
-    size_t block_count = 0;
-    for (auto* sequence : plan.sequences()) {
-      block_count += sequence->kv_state().num_blocks(BlockType::KV);
-    }
-    retained_blocks.reserve(block_count);
-    for (auto* sequence : plan.sequences()) {
-      const auto blocks = sequence->kv_state().blocks(BlockType::KV);
-      retained_blocks.insert(
-          retained_blocks.end(), blocks.begin(), blocks.end());
-    }
-    vmm_kv_blocks_ = std::move(retained_blocks);
+  if (KVCacheConfig::get_instance().enable_vmm_kvcache() &&
+      !all_cache_blocks_retained_) {
+    constexpr std::array block_types = {BlockType::KV};
+    retained_cache_blocks_ =
+        collect_cache_blocks(plan.sequences(), block_types);
   }
   return {plan.sequences(),
           sequence_groups_,

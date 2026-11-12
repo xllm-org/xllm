@@ -128,11 +128,13 @@ class WorkerImpl {
   virtual void prepare_work_before_execute(const VlmForwardInput& inputs,
                                            VlmForwardInput& processed_inputs);
   virtual void restore_json_object_states(VlmForwardInput& input);
-  void prepare_work_before_execute_on_stream(const LlmForwardInput& input,
-                                             LlmForwardInput& processed_input,
-                                             Stream& prepare_stream,
-                                             bool record_ready_event = true,
-                                             bool restore_linear_state = true);
+  void prepare_work_before_execute_on_stream(
+      const LlmForwardInput& input,
+      LlmForwardInput& processed_input,
+      Stream& prepare_stream,
+      bool record_ready_event = true,
+      bool restore_linear_state = true,
+      bool wait_for_compute_stream = true);
   void prepare_work_before_execute_on_stream(const VlmForwardInput& input,
                                              VlmForwardInput& processed_input,
                                              Stream& prepare_stream,
@@ -387,14 +389,18 @@ class WorkerImpl {
 
   bool can_prepare_npu_graph_decode_input(
       const LlmModelParams& input_params) const;
-  bool can_prepare_without_compute_stream_wait(
-      const LlmModelParams& input_params) const;
   bool can_skip_npu_graph_decode_sync(const LlmModelParams& input_params) const;
   bool can_prepare_npu_graph_decode_input(
       const VlmModelParams& input_params) const;
-  bool can_prepare_without_compute_stream_wait(
-      const VlmModelParams& input_params) const;
   bool can_skip_npu_graph_decode_sync(const VlmModelParams& input_params) const;
+  // Speculative workers may opt in only when their own prelaunch path owns
+  // independent input buffers. Leaf workers keep the default ordering; the
+  // input-level hook exists because staging eligibility depends on batch
+  // metadata that the parameter view does not carry.
+  virtual bool can_prepare_without_compute_stream_wait(
+      const LlmForwardInput& input) const;
+  bool can_prepare_without_compute_stream_wait(
+      const VlmForwardInput& input) const;
 
   bool allocate_kv_cache_storage(
       const KVCacheShape& kv_cache_shape,
@@ -450,9 +456,7 @@ class WorkerImpl {
   template <typename Params>
   bool can_prepare_npu_graph_decode_input_impl(
       const Params& input_params) const;
-  template <typename Params>
-  bool can_prepare_without_compute_stream_wait_impl(
-      const Params& input_params) const;
+  bool can_prepare_without_compute_stream_wait_impl() const;
   template <typename Params>
   bool can_skip_npu_graph_decode_sync_impl(const Params& input_params) const;
   template <typename Params>

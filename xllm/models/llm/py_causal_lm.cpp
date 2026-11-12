@@ -379,6 +379,9 @@ py::dict PyCausalLM::build_config_dict(const ModelContext& context) const {
         model_args_.model_type() == "glm_moe_dsa_mtp")
       << "--enable_attn_dp_weight_sharding only supports Python GLM MLA models";
   d["enable_attn_dp_weight_sharding"] = enable_attn_dp_weight_sharding;
+  // XFIA is a DFlash2 proposal-block feature; the C++ gate already ruled out
+  // every non-A3 / non-prelaunch deployment.
+  d["dflash_xfia_enabled"] = context.dflash_xfia_enabled();
   const bool requires_eager_execution =
       model_args_.model_type() == "DFlashDraftModel" ||
       is_dflash2_draft_model_type(model_args_.model_type());

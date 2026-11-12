@@ -251,6 +251,7 @@ AttentionMetadata build_common_attention_metadata(
       params.graph.use_dense_flash_attention;
 #endif
   attn_metadata.is_spec_verify = params.is_spec_verify;
+  attn_metadata.is_dflash_proposal = params.is_dflash_proposal;
 
   // for flashinfer
   attn_metadata.paged_kv_indptr = params.attention.device.paged_kv_indptr;

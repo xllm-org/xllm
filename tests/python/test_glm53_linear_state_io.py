@@ -28,7 +28,16 @@ def _backend_for_linear_cache(
 ) -> Any:
     from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
 
-    backend = object.__new__(NpuPagedAttentionBackend)
+    backend = NpuPagedAttentionBackend(
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=2,
+        scale=2**-0.5,
+        sliding_window=0,
+        is_mla=False,
+        device=conv_cache.device,
+        dtype=conv_cache.dtype,
+    )
     backend._kv_caches = [SimpleNamespace(conv=conv_cache, ssm=ssm_cache)]
     backend._metadata = None
     backend._kda_checkpoint_stride = ssm_cache.shape[0] // conv_cache.shape[0] if conv_cache.shape[0] else None

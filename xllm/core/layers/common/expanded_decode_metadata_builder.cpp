@@ -96,6 +96,7 @@ void ExpandedDecodeMetadataBuilder::populate_expanded_layout(
   CHECK(expanded_kv_seq_lens.defined());
   CHECK(expanded_block_tables.defined());
   CHECK_EQ(expanded_kv_seq_lens.dim(), 1);
+  CHECK_GT(expanded_kv_seq_lens.numel(), 0);
   CHECK_EQ(expanded_block_tables.dim(), 2);
   CHECK_EQ(expanded_block_tables.size(0), expanded_kv_seq_lens.numel());
   CHECK_EQ(expanded_host_kv_seq_lens.size(),
@@ -108,6 +109,7 @@ void ExpandedDecodeMetadataBuilder::populate_expanded_layout(
   last_page_lens.reserve(expanded_host_kv_seq_lens.size());
   indptr.reserve(expanded_host_kv_seq_lens.size() + 1);
   for (const int32_t kv_seq_len : expanded_host_kv_seq_lens) {
+    CHECK_GE(kv_seq_len, 0);
     page_counts.emplace_back(
         util::append_paged_kv_indptr(kv_seq_len,
                                      expanded_block_tables.size(1),
@@ -135,11 +137,6 @@ void ExpandedDecodeMetadataBuilder::populate_expanded_layout(
   target.graph.expanded_block_tables = expanded_block_tables;
   target.graph.expanded_tiling_data = torch::Tensor();
   target.graph.expanded_kv_seq_lens_vec = std::move(expanded_host_kv_seq_lens);
-
-  ExpandedDecodeMetadataBuilder::validate(
-      ExpandedDecodeMetadataBuilder::build(target),
-      expanded_kv_seq_lens.numel(),
-      block_size);
 }
 
 std::vector<int32_t> ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
@@ -158,6 +155,32 @@ std::vector<int32_t> ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
     }
   }
   return expanded_kv_seq_lens;
+}
+
+torch::Tensor ExpandedDecodeMetadataBuilder::build_tokenwise_block_tables(
+    const torch::Tensor& block_tables,
+    const std::vector<int32_t>& q_seq_lens) {
+  CHECK(block_tables.defined());
+  CHECK_EQ(block_tables.dim(), 2);
+  CHECK_GE(block_tables.size(0), static_cast<int64_t>(q_seq_lens.size()));
+  int64_t num_tokens = 0;
+  for (int32_t q_len : q_seq_lens) {
+    CHECK_GT(q_len, 0);
+    num_tokens += q_len;
+  }
+  CHECK_GT(num_tokens, 0);
+  std::vector<torch::Tensor> expanded_block_rows;
+  expanded_block_rows.reserve(num_tokens);
+  for (int64_t seq_idx = 0; seq_idx < static_cast<int64_t>(q_seq_lens.size());
+       ++seq_idx) {
+    for (int32_t token_idx = 0;
+         token_idx < q_seq_lens[static_cast<size_t>(seq_idx)];
+         ++token_idx) {
+      expanded_block_rows.emplace_back(block_tables.select(/*dim=*/0, seq_idx));
+    }
+  }
+  // ATB rejects zero-stride expand views; materialize the repeated rows.
+  return torch::stack(expanded_block_rows, /*dim=*/0).contiguous();
 }
 
 ExpandedDecodeMetadata ExpandedDecodeMetadataBuilder::build(

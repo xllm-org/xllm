@@ -117,6 +117,7 @@ class PyAttentionMetadataView final {
   bool is_chunked_prefill() const;
   bool is_mixed() const;
   bool is_spec_verify() const;
+  bool is_dflash_proposal() const;
   bool is_dummy() const;
 
  private:

@@ -100,7 +100,7 @@ def _assert_fia_capacity_graphs(rows: int, graph_owners: list[object], *, padded
             if padded:
                 layer = SimpleNamespace(causal=False, fia_use_attention_mask=False, fia_sparse_mode=0)
                 return backend._prefill(query, query, query, key, value, metadata, tokens.numel(), layer)
-            return backend._decode(query, key, value, metadata, tokens.numel())
+            return backend._decode(query, key, value, metadata, tokens.numel(), layer_id=0)
 
     tokens = torch.zeros(rows, device=device, dtype=torch.int32)
     positions = torch.zeros_like(tokens)

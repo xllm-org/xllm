@@ -31,6 +31,7 @@ cc_library(
     reshape_and_cache_a5.cpp
     moe_gating_top_k_hash.cpp
     sparse_attn_sharedkv.cpp
+    x_flash_attention.cpp
     sparse_flash_attention_lse.cpp
     mla_preprocess.cpp
     ../utils.cpp

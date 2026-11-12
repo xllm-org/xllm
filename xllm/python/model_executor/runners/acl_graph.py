@@ -88,6 +88,7 @@ class StaticGraphAttentionMetadata:
     is_mixed: bool = False
     is_dummy: bool = False
     is_spec_verify: bool = False
+    is_dflash_proposal: bool = False
     local_slot_mapping: torch.Tensor | None = None
     kv_split_size: int = 1
     kv_split_rank: int = 0

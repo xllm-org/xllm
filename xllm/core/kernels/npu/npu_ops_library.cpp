@@ -912,6 +912,11 @@ TORCH_LIBRARY(xllm_ops, m) {
       "scatter_nd_update(Tensor(a!) var, Tensor indices, Tensor updates) -> "
       "()");
   m.def(
+      "x_flash_attention_decode_out(Tensor query, Tensor key, Tensor value, "
+      "Tensor block_table, Tensor query_ends, Tensor kv_lengths, Tensor "
+      "kv_starts, "
+      "float scale, Tensor(a!) output) -> Tensor(a!)");
+  m.def(
       "sparse_flash_attention_lse(Tensor query, Tensor key, Tensor value, "
       "Tensor sparse_indices, Tensor? block_table, Tensor? "
       "actual_seq_lengths_query, Tensor? actual_seq_lengths_kv, Tensor? "
@@ -1092,6 +1097,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("compressor", TORCH_FN(xllm::kernel::npu::compressor));
   m.impl("sparse_attn_sharedkv",
          TORCH_FN(xllm::kernel::npu::sparse_attn_sharedkv));
+  m.impl("x_flash_attention_decode_out",
+         TORCH_FN(xllm::kernel::npu::x_flash_attention_decode_out));
   m.impl("sparse_flash_attention_lse",
          TORCH_FN(xllm::kernel::npu::sparse_flash_attention_lse));
   m.impl("sparse_flash_attention_lse_out",

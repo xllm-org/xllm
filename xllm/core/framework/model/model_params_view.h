@@ -245,6 +245,7 @@ class ModelParamsView final {
   std::vector<torch::Tensor>& multi_block_tables;
   torch::Tensor& mtp_shifted_token_ids;
   bool& is_spec_verify;
+  bool& is_dflash_proposal;
   bool& prefill_without_cache;
   torch::Tensor& num_accepted_tokens;
   MtpTopkStatePtr& mtp_topk_state;
@@ -268,6 +269,7 @@ class ModelParamsView final {
         multi_block_tables(spec.multi_block_tables),
         mtp_shifted_token_ids(spec.mtp_shifted_token_ids),
         is_spec_verify(spec.is_spec_verify),
+        is_dflash_proposal(spec.is_dflash_proposal),
         prefill_without_cache(spec.prefill_without_cache),
         num_accepted_tokens(spec.num_accepted_tokens),
         mtp_topk_state(spec.mtp_topk_state),

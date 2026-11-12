@@ -220,24 +220,4 @@ torch::Tensor make_repair_cache_positions(const AcceptedState& state) {
                       state.base_positions + 1);
 }
 
-torch::Tensor map_positions_to_cache_slots(const torch::Tensor& block_tables,
-                                           const torch::Tensor& positions,
-                                           int32_t block_size) {
-  CHECK_EQ(positions.dim(), 2);
-  CHECK(block_tables.defined());
-  CHECK_GT(block_size, 0);
-  const int64_t batch_size = positions.size(0);
-  torch::Tensor position_long =
-      positions.to(torch::dtype(torch::kLong).device(positions.device()));
-  torch::Tensor block_indices =
-      torch::floor_divide(position_long, block_size)
-          .to(torch::dtype(torch::kLong).device(position_long.device()));
-  torch::Tensor block_ids = block_tables.slice(/*dim=*/0, 0, batch_size)
-                                .to(torch::kLong)
-                                .gather(/*dim=*/1, block_indices);
-  return (block_ids * block_size + position_long.remainder(block_size))
-      .to(torch::kInt)
-      .flatten();
-}
-
 }  // namespace xllm::mtp_async

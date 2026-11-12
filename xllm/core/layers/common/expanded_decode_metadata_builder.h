@@ -46,6 +46,12 @@ class ExpandedDecodeMetadataBuilder final {
       const std::vector<int32_t>& q_seq_lens,
       const std::vector<int32_t>& kv_seq_lens);
 
+  // Repeat each sequence's physical block-table row for its query tokens.
+  // The returned tensor is dense and contiguous for attention backends.
+  static torch::Tensor build_tokenwise_block_tables(
+      const torch::Tensor& block_tables,
+      const std::vector<int32_t>& q_seq_lens);
+
   static ExpandedDecodeMetadata build(const ModelParamsView& params);
 
   static void validate(const ExpandedDecodeMetadata& metadata,

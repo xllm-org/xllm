@@ -18,17 +18,20 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include "core/framework/speculative/draft_proposal.h"
 #include "core/framework/speculative/draft_vocab_mapping.h"
+#include "core/framework/speculative/embedding_cache.h"
 #include "runtime/speculative_worker_impl.h"
 
 namespace xllm {
 
-class EmbeddingCache;
 class LLMWorkerImpl;
+class ModelParamsView;
 
 // Base for draft-model speculative workers (MTP, DFlash/DSpark); Suffix has no
 // draft model and derives from SpeculativeWorkerImpl directly.
@@ -61,6 +64,7 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
   using SpeculativeWorkerImpl<TargetInput>::compute_stream_;
   using SpeculativeWorkerImpl<TargetInput>::context_;
   using SpeculativeWorkerImpl<TargetInput>::device_;
+  using SpeculativeWorkerImpl<TargetInput>::enable_schedule_overlap;
   using SpeculativeWorkerImpl<TargetInput>::dtype_;
   using SpeculativeWorkerImpl<TargetInput>::hierarchy_kv_cache_transfer_;
   using SpeculativeWorkerImpl<TargetInput>::impl_;
@@ -104,6 +108,57 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
   std::tuple<int64_t, int64_t> estimate_kv_cache_capacity_with_draft(
       const runtime::Options& target_options,
       const runtime::Options& draft_options);
+
+  static runtime::Options target_options(const runtime::Options& options);
+
+  template <typename Input>
+  static std::optional<ForwardOutput> run_worker_no_sync(
+      WorkerImpl& worker,
+      const Input& input,
+      Stream& prepare_stream,
+      Stream& compute_stream,
+      Input& processed_input) {
+    worker.prepare_work_before_execute_on_stream(
+        input,
+        processed_input,
+        prepare_stream,
+        /*record_ready_event=*/&prepare_stream != &compute_stream);
+    return worker.execute_no_sync_on_stream(
+        processed_input,
+        compute_stream,
+        WorkerImpl::ForwardCompletion::CALLER_MANAGED);
+  }
+
+  template <typename Input>
+  static std::optional<ForwardOutput> run_worker_no_sync(
+      WorkerImpl& worker,
+      const Input& input,
+      Stream& prepare_stream,
+      Stream& compute_stream) {
+    Input processed_input;
+    return run_worker_no_sync(
+        worker, input, prepare_stream, compute_stream, processed_input);
+  }
+
+  void update_decode_step_input(
+      TargetInput& input,
+      const std::vector<EmbeddingCache::DecodeState>& last_states,
+      bool positions_decoupled = false,
+      bool normalize_kv_context = false) const;
+
+  // A DCP block-table entry covers one logical KV page per KV split. All
+  // speculative cache-slot and expanded-attention metadata must use this
+  // logical size rather than the per-rank physical allocator block size.
+  int32_t logical_block_size() const;
+
+#if defined(USE_NPU)
+  static void clear_expanded_spec_verify_graph_input(
+      ModelParamsView input_params);
+  static void build_expanded_spec_verify_graph_host_input(
+      ModelParamsView input_params);
+  void build_expanded_spec_verify_graph_input(ModelParamsView input_params,
+                                              int32_t block_size) const;
+#endif
 
   void prepare_draft_input(const TargetInput& input);
 

@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_params_view.h"
 #include "core/framework/multimodal/mm_visitor.h"
@@ -1206,7 +1207,14 @@ Input ForwardInputBuilder::state_to_forward_input() {
   }
 
   // Setup block tables
-  util::pad_2d_vector(state_.block_tables_vec, /*pad_value=*/0);
+  // DFlash2 checks future capacity before prelaunch. Keep a missing page
+  // distinct from the valid physical block 0.
+  const int32_t block_table_padding =
+      SpeculativeConfig::is_dflash2_algorithm(
+          SpeculativeConfig::get_instance().speculative_algorithm())
+          ? -1
+          : 0;
+  util::pad_2d_vector(state_.block_tables_vec, block_table_padding);
   input_params.attention.device.block_tables =
       create_2d_tensor(state_.block_tables_vec, torch::kInt);
   input_params.attention.host.block_tables =

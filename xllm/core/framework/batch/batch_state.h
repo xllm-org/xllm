@@ -67,6 +67,7 @@ class BatchState final {
   std::vector<Sequence*> group_sequences() const;
   size_t num_group_sequences() const;
   Sequence* group_sequence(size_t index) const;
+  void retain_cache_blocks();
   BatchInputData input_data(const BatchSequencePlan& plan);
   // Prepare the final sequence view before domain output handlers capture
   // their targets. Build methods may then advance KV state.
@@ -102,9 +103,10 @@ class BatchState final {
   // A cancelled sequence may release its own aliases before its pending
   // worker result. Pin H2D sources and destinations until this batch retires.
   std::vector<std::shared_ptr<KVCacheBlockLease>> host_restore_leases_;
-  // Sequence reset can precede the result of an overlapped forward. Keep its
-  // VMM pages mapped until the submitted batch retires.
-  std::vector<Block> vmm_kv_blocks_;
+  // Keep submitted cache pages and state slots alive when sequence reset
+  // precedes completion of an overlapped forward.
+  std::vector<Block> retained_cache_blocks_;
+  bool all_cache_blocks_retained_ = false;
   BatchForwardType batch_forward_type_;
   uint64_t batch_id_ = UNINITIALIZED_BATCH_ID;
   bool requires_host_restore_ = false;

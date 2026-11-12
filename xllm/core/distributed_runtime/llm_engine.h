@@ -124,6 +124,7 @@ class LLMEngine : public Engine {
   uint32_t dp_local_tp_size_;
   uint32_t dp_local_size_;
   std::unique_ptr<ForwardInputFactory> forward_input_factory_;
+  bool retain_cache_blocks_ = false;
 
   // For multi-node serving
   // engine brpc server, all workers connect to engine_server_,

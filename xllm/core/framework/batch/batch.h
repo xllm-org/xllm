@@ -74,9 +74,6 @@ class Batch final {
   // Logical execution rows.
   size_t size() const;
   bool empty() const { return state_.empty(); }
-  size_t num_scheduled_sequences() const {
-    return state_.sequence_plan().size();
-  }
   size_t num_groups() const { return state_.sequence_groups().size(); }
   const BatchSequencePlan& sequence_plan() const {
     return state_.sequence_plan();
@@ -103,6 +100,9 @@ class Batch final {
   VlmForwardInput prepare_vlm_forward_input(const ModelArgs& args,
                                             ThreadPool* thread_pool,
                                             int32_t cp_size = 1);
+
+  // Keep request cache blocks alive until this batch retires.
+  void retain_cache_blocks();
 
   // Apply sampled tokens or reserve/commit a pending overlap result.
   void process_sample_output(const SampleOutput& sample_output,

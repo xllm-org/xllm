@@ -24,6 +24,7 @@ limitations under the License.
 #endif
 
 #include "core/framework/speculative/mtp_async_state.h"
+#include "core/framework/speculative/speculative_cache_utils.h"
 #include "core/runtime/vlm_forward_params.h"
 #include "layers/common/expanded_decode_metadata_builder.h"
 
@@ -39,7 +40,7 @@ torch::Tensor build_device_cache_slots(const Input& input,
     return torch::zeros_like(positions, positions.options().dtype(torch::kInt))
         .flatten();
   }
-  return map_positions_to_cache_slots(
+  return speculative::map_positions_to_cache_slots(
       input.input_params.attention.device.block_tables, positions, block_size);
 }
 template <typename Source>
@@ -168,8 +169,8 @@ void prepare_draft_prefix_from_target(LlmForwardInput& draft_input,
       attention.block_tables
           .view({batch_size, width, attention.block_tables.size(1)})
           .select(1, 0);
-  attention.new_cache_slots =
-      map_positions_to_cache_slots(sequence_tables, kv_lengths - 1, block_size);
+  attention.new_cache_slots = speculative::map_positions_to_cache_slots(
+      sequence_tables, kv_lengths - 1, block_size);
   attention.kv_seq_lens =
       kv_lengths.flatten().to(attention.kv_seq_lens.options());
   draft_input.positions =

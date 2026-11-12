@@ -14,6 +14,7 @@
 
 """Tests for the NPU paged-attention backend."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -28,6 +29,7 @@ from xllm.python.attention.npu_paged_attention import (  # noqa: E402
     PagedAttentionGraphState,
 )
 from xllm.python.kernels_npu import _custom_op, sparse_attention  # noqa: E402
+from xllm.python.layers.attention import Attention
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context  # noqa: E402
 
 
@@ -319,9 +321,9 @@ def test_prepared_device_decode_masks_newly_rejected_tail(monkeypatch: pytest.Mo
     monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score", attention, raising=False)
     cache = backend._kv_caches[0].key
     query = torch.zeros(2, 8, 64)
-    backend._decode(query, cache, cache, metadata, 2)
+    backend._decode(query, cache, cache, metadata, 2, layer_id=0)
     metadata.kv_seq_lens.copy_(torch.tensor([2, 9], dtype=torch.int32))
-    backend._decode(query, cache, cache, metadata, 2)
+    backend._decode(query, cache, cache, metadata, 2, layer_id=0)
     expected_first = torch.arange(128).view(1, 1, 1, -1) >= torch.tensor([6, 4]).view(2, 1, 1, 1)
     expected_second = torch.arange(128).view(1, 1, 1, -1) >= torch.tensor([2, 9]).view(2, 1, 1, 1)
     torch.testing.assert_close(seen[0], expected_first)
@@ -1614,3 +1616,203 @@ def test_kda_verify_uses_framework_native_conv(
         )
         assert torch.isfinite(output).all()
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("sliding_window", "expected_starts"),
+    [(0, [0] * 8), (2048, [0, 0, 256, 257, 258, 0, 0, 0])],
+)
+def test_xfia_prepare_preserves_live_device_metadata(
+    monkeypatch: pytest.MonkeyPatch, sliding_window: int, expected_starts: list[int]
+) -> None:
+    from xllm.python.model_executor.forward_context import AclGraphExecutionState
+
+    backend = NpuPagedAttentionBackend(
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        scale=128**-0.5,
+        sliding_window=sliding_window,
+        is_mla=False,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        use_xfia_decode=True,
+    )
+    cache = torch.empty(20, 128, 1, 128, dtype=torch.bfloat16)
+    backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
+    lengths = torch.tensor([128, 129, 2303, 2304, 2305, 1, 1, 1], dtype=torch.int32)
+    table = torch.zeros(8, 20, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        is_prefill=False, is_chunked_prefill=False, block_table=table, kv_seq_lens=lengths, slot_mapping=torch.arange(8)
+    )
+
+    def forbid_host_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("XFIA decode metadata must not be read on host")
+
+    execution = AclGraphExecutionState({}, {})
+    context = ForwardContext(backend, torch.device("cpu"), metadata, [], execution_state=execution)
+    with forward_context(context), monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "cpu", forbid_host_read)
+        patch.setattr(torch.Tensor, "tolist", forbid_host_read)
+        patch.setattr(torch.Tensor, "item", forbid_host_read)
+        backend.prepare(metadata, graph_mode=True)
+        row_ends = backend._xfia_query_ends
+        graph_lengths = backend._xfia_kv_lengths
+        graph_starts = backend._xfia_kv_starts
+        lengths.add_(1)
+        backend.prepare(metadata, graph_mode=True)
+    assert backend._xfia_query_ends is row_ends
+    assert backend._xfia_kv_lengths is graph_lengths
+    assert backend._xfia_kv_starts is graph_starts
+    torch.testing.assert_close(graph_lengths, lengths)
+    torch.testing.assert_close(backend._block_table_i32, table)
+    assert row_ends.tolist() == list(range(1, 9))
+    assert graph_starts.tolist() == expected_starts
+    assert backend._mla_graph_workspaces == {}
+    assert backend._actual_seq_kv == []
+
+
+def test_xfia_dflash2_chunked_query_keeps_band_window() -> None:
+    backend = NpuPagedAttentionBackend(
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        scale=128**-0.5,
+        sliding_window=2048,
+        is_mla=False,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        use_xfia_decode=True,
+        xfia_query_width=8,
+    )
+    cache = torch.empty(40, 128, 1, 128, dtype=torch.bfloat16)
+    backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
+    table = torch.arange(40, dtype=torch.int32).reshape(2, 20)
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=True,
+        is_spec_verify=True,
+        is_dflash_proposal=True,
+        block_table=table,
+        kv_seq_lens=torch.tensor([2055, 2305], dtype=torch.int32),
+        slot_mapping=torch.arange(16),
+    )
+    backend.prepare(metadata)
+    assert backend._xfia_query_ends.tolist() == list(range(1, 17))
+    assert backend._xfia_kv_lengths.tolist() == [2055] * 8 + [2305] * 8
+    assert backend._xfia_kv_starts.tolist() == list(range(8)) + list(range(250, 258))
+    torch.testing.assert_close(backend._block_table_i32, table.repeat_interleave(8, dim=0))
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("is_spec_verify", [None, True])
+def test_xfia_matching_prompt_chunk_keeps_causal_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    is_spec_verify: bool | None,
+) -> None:
+    width = 8
+    backend = NpuPagedAttentionBackend(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        scale=0.5,
+        sliding_window=2048,
+        is_mla=False,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        use_xfia_decode=True,
+        xfia_query_width=width,
+    )
+    cache = torch.empty(batch_size * 2, 128, 1, 4)
+    backend.bind_kv_caches([LayerCache(key=cache, value=torch.empty_like(cache))])
+    table = torch.arange(batch_size * 2, dtype=torch.int32).reshape(batch_size, 2)
+    query_ends = torch.arange(batch_size + 1, dtype=torch.int32) * width
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=True,
+        block_table=table,
+        kv_seq_lens=torch.full((batch_size,), 128 + width, dtype=torch.int32),
+        kv_seq_lens_host_values=[128 + width] * batch_size,
+        q_cu_seq_lens=query_ends,
+        slot_mapping=torch.arange(batch_size * width),
+    )
+    if is_spec_verify is not None:
+        metadata.is_spec_verify = is_spec_verify
+
+    def forbid_xfia(*args: object, **kwargs: object) -> None:
+        raise AssertionError("ordinary prompt chunks must not use XFIA decode")
+
+    monkeypatch.setattr(backend, "_prepare_xfia_decode", forbid_xfia)
+    monkeypatch.setattr(backend, "_xfia_decode", forbid_xfia)
+    backend.prepare(metadata)
+    torch.testing.assert_close(backend._block_table_i32, table)
+
+    module = sys.modules["xllm.python.attention.npu_paged_attention"]
+    monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(cp_context=None))
+    monkeypatch.setattr(module.kernels, "reshape_paged_cache", lambda *args: None, raising=False)
+
+    def causal_prefill(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, None]:
+        # Preserve grouped prompt queries and the right-aligned causal mask,
+        # including the existing 128-token KV prefix.
+        assert kwargs["actual_seq_lengths"] == query_ends[1:].tolist()
+        assert kwargs["actual_seq_lengths_kv"] == [128 + width] * batch_size
+        assert kwargs["sparse_mode"] == 3
+        assert kwargs["atten_mask"] is backend._causal_mask
+        torch.testing.assert_close(kwargs["block_table"], table)
+        return query.clone(), None
+
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score", causal_prefill, raising=False)
+    query = torch.randn(batch_size * width, 2, 4)
+    key = torch.randn(batch_size * width, 1, 4)
+    layer = Attention(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        scale=0.5,
+        sliding_window=2048,
+        layer_id=0,
+    )
+    output = backend.execute(query, key, key, layer)
+    torch.testing.assert_close(output, query.flatten(1))
+
+
+@pytest.mark.parametrize("bad_field", ["kv_seq_lens", "slot_mapping"])
+def test_xfia_rejected_metadata_preserves_active_slot(bad_field: str) -> None:
+    backend = NpuPagedAttentionBackend(
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        scale=128**-0.5,
+        sliding_window=2048,
+        is_mla=False,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        use_xfia_decode=True,
+        xfia_query_width=8,
+    )
+    cache = torch.empty(2, 128, 1, 128, dtype=torch.bfloat16)
+    backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=False,
+        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([8], dtype=torch.int32),
+        slot_mapping=torch.tensor([0], dtype=torch.int32),
+    )
+    backend.prepare(metadata)
+    active_table = backend._block_table_i32
+    active_lengths = backend._xfia_kv_lengths
+    rejected = SimpleNamespace(**vars(metadata))
+    rejected.block_table = metadata.block_table.clone()
+    setattr(rejected, bad_field, torch.empty(0, dtype=torch.int32))
+    with pytest.raises(RuntimeError, match="XFIA requires"):
+        backend.prepare(rejected)
+    assert backend._metadata is metadata
+    assert backend._block_table_i32 is active_table
+    assert backend._xfia_kv_lengths is active_lengths

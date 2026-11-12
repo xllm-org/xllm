@@ -71,6 +71,30 @@ LlmForwardInput make_multiblock_forward_input(
   return input;
 }
 
+TEST(SpecDecodeInputBuilderTest,
+     LookaheadAcceptsBlockZeroAndRejectsMissingPages) {
+  auto input = make_forward_input(torch::tensor({11, 22}, torch::kInt),
+                                  torch::tensor({120, 120}, torch::kInt),
+                                  torch::tensor({{5, 0}, {6, 7}}, torch::kInt),
+                                  {121, 121});
+  auto has_capacity = [&input]() {
+    return has_decode_lookahead_capacity(make_decode_row_context(input),
+                                         /*num_tokens=*/16,
+                                         /*block_size=*/128,
+                                         /*max_position_embeddings=*/4096);
+  };
+  EXPECT_TRUE(has_capacity());
+  // Same geometry, but the second row has only one allocated page. Padding
+  // must not alias the first row's valid physical page zero.
+  input.input_params.attention.host.block_tables[1][1] = -1;
+  EXPECT_FALSE(has_capacity());
+  input.input_params.attention.host.block_tables[1][1] = 7;
+  input.positions_host[0] = 250;
+  EXPECT_FALSE(has_capacity());
+  input.positions_host[0] = 4090;
+  EXPECT_FALSE(has_capacity());
+}
+
 TEST(SpecDecodeInputBuilderTest, DraftInputsSingleRowPerSeq) {
   ModelParamsView params = ModelInputSnapshot(LlmModelParams()).view();
   params.meta.num_sequences = 2;

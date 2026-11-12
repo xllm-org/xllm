@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/distributed_runtime/model_residency_coordinator.h"
 #include "core/framework/batch/batch_factory.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
@@ -41,6 +42,8 @@ limitations under the License.
 #include "core/framework/request/priority_comparator.h"
 #include "core/framework/request/request.h"
 #include "core/framework/request/sequence.h"
+#include "core/framework/speculative/dflash_prelaunch_policy.h"
+#include "core/platform/platform.h"
 #include "core/scheduler/request_priority_queue.h"
 #include "core/scheduler/scheduler_policy.h"
 #include "core/util/timer.h"
@@ -164,17 +167,32 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
 
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
   if (options_.enable_schedule_overlap()) {
+    const auto& speculative_config = SpeculativeConfig::get_instance();
+    const auto& model_config = ModelConfig::get_instance();
+    const auto& kv_cache_config = KVCacheConfig::get_instance();
+    const auto& algorithm = speculative_config.speculative_algorithm();
     const bool reserve_bonus_token =
         num_speculative_tokens > 0 &&
-        SpeculativeConfig::is_mtp_algorithm(
-            SpeculativeConfig::get_instance().speculative_algorithm());
-    if (reserve_bonus_token) {
-      CHECK_LE(num_speculative_tokens,
-               (std::numeric_limits<int32_t>::max() - 1) / 2);
-    }
-    // MTP needs N pending tokens and N+1 next-draft tokens for the bonus.
-    min_speculative_tokens_required_ =
-        num_speculative_tokens * 2 + static_cast<int32_t>(reserve_bonus_token);
+        SpeculativeConfig::is_mtp_algorithm(algorithm);
+    const bool dflash2_prelaunch =
+        supports_dflash2_prelaunch(
+            algorithm,
+            options_,
+            options_.dp_size(),
+            options_.cp_size(),
+            Platform::is_ascend_a3(),
+            ModelConfig::is_python_model_impl(model_config.model_impl())) &&
+        supports_dflash2_xfia(speculative_config.draft_model(),
+                              model_config.backend(),
+                              kv_cache_config.block_size(),
+                              kv_cache_config.kv_cache_dtype());
+    // Keep MTP's bonus slot and reserve the next DFlash2 proposal only when
+    // the corresponding prelaunch configuration is enabled.
+    const int64_t required_tokens =
+        int64_t{num_speculative_tokens} * 2 + reserve_bonus_token +
+        (dflash2_prelaunch ? int64_t{num_speculative_tokens} + 1 : 0);
+    CHECK_LE(required_tokens, std::numeric_limits<int32_t>::max());
+    min_speculative_tokens_required_ = static_cast<int32_t>(required_tokens);
   } else {
     min_speculative_tokens_required_ = num_speculative_tokens;
   }

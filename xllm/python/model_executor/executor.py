@@ -213,6 +213,7 @@ def _create_attention_backend(
             NpuPagedAttentionBackend,
         )
 
+        dflash2_block_size = int(config.get("dflash2_block_size", 0))
         return NpuPagedAttentionBackend(
             num_heads=first_attention.num_heads,
             num_kv_heads=first_attention.num_kv_heads,
@@ -225,6 +226,8 @@ def _create_attention_backend(
             # Only the GLM5 DSpark draft carries the dense MLA block-draft
             # attention shape.
             mla_block_draft=model_type == "glm5_dspark",
+            xfia_query_width=max(dflash2_block_size, 1),
+            use_xfia_decode=bool(config.get("dflash_xfia_enabled", False)),
         )
     if current_platform.is_cuda():
         from xllm.python.attention.flashinfer import FlashInferBackend
