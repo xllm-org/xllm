@@ -26,14 +26,13 @@ def _runner(
     dp_rank: int,
     *,
     dp_size: int = 2,
-    cap: int = 32768,
     page_size: int = 128,
     is_spec_draft: bool = False,
     num_decoding_tokens: int = 1,
 ) -> DecodeAclGraphRunner:
     runner = DecodeAclGraphRunner(
         nn.Identity(),
-        SimpleNamespace(page_size=page_size, is_mla=False, graph_index_history_max_kv=cap),
+        SimpleNamespace(page_size=page_size, is_mla=False),
         torch.device("cpu"),
         max_batch=4,
         max_model_len=65536,
@@ -82,109 +81,28 @@ def _metadata(
 
 
 @pytest.mark.parametrize("active_dp", [0, 1])
-@pytest.mark.parametrize("page_size,cap", [(128, 32768), (128, 256), (64, 256)])
-@pytest.mark.parametrize("offset,expected", [(-1, True), (0, True), (1, False)])
-def test_history_admission_is_shared(active_dp: int, page_size: int, cap: int, offset: int, expected: bool) -> None:
-    lengths = [0, 0]
-    lengths[active_dp] = cap + offset
-    input_ids = torch.tensor([1], dtype=torch.int32)
-    decisions = []
-    for rank in range(2):
-        is_dummy = rank != active_dp
-        metadata = _metadata(
-            1 if is_dummy else cap + offset,
-            tuple(lengths),
-            page_size=page_size,
-            is_dummy=is_dummy,
-        )
-        decisions.append(_runner(rank, cap=cap, page_size=page_size).can_execute(input_ids, metadata))
-    assert decisions == [expected, expected]
-
-
-@pytest.mark.parametrize("long_dp", [0, 1])
-@pytest.mark.parametrize(
-    "short_length,long_length,expected",
-    [
-        (1024, 32767, True),
-        (1024, 32768, True),
-        (1024, 32769, False),
-        (32769, 32896, False),
-    ],
-    ids=["below-cap", "at-cap", "cross-cap", "both-above-cap"],
-)
-def test_nonempty_dp_histories_share_admission(
-    long_dp: int, short_length: int, long_length: int, expected: bool
-) -> None:
-    lengths = [short_length, short_length]
-    lengths[long_dp] = long_length
-    input_ids = torch.tensor([1], dtype=torch.int32)
-    decisions = []
-    for rank, local_length in enumerate(lengths):
-        metadata = _metadata(local_length, tuple(lengths), is_dummy=False)
-        decisions.append(_runner(rank).can_execute(input_ids, metadata))
-    assert decisions == [expected, expected]
-
-
-@pytest.mark.parametrize("active_dp", [0, 1])
-def test_history_ignores_unused_reserved_pages(active_dp: int) -> None:
-    lengths = [0, 0]
-    lengths[active_dp] = 128
-    input_ids = torch.tensor([1], dtype=torch.int32)
-    decisions = []
-    for rank in range(2):
-        metadata = _metadata(
-            128 if rank == active_dp else 1,
-            tuple(lengths),
-            table_columns=3 if rank == active_dp else 1,
-            is_dummy=rank != active_dp,
-        )
-        decisions.append(_runner(rank, cap=128).can_execute(input_ids, metadata))
-    assert decisions == [True, True]
-
-
-def test_history_uses_full_global_length_with_short_local_tables() -> None:
-    input_ids = torch.tensor([1], dtype=torch.int32)
-    decisions = []
-    for rank in range(2):
-        metadata = _metadata(129 if rank == 0 else 1, (257, 0), page_size=64)
-        decisions.append(_runner(rank, cap=256, page_size=64).can_execute(input_ids, metadata))
-    assert decisions == [False, False]
-
-
-@pytest.mark.parametrize("global_length,expected", [(253, True), (254, False)])
-def test_verify_rows_count_against_the_shared_cap(global_length: int, expected: bool) -> None:
-    input_ids = torch.tensor([1], dtype=torch.int32)
-    runner = _runner(0, cap=256, num_decoding_tokens=4)
-    assert runner.can_execute(input_ids, _metadata(1, (global_length, 0))) is expected
-
-
-@pytest.mark.parametrize("legacy_value", [None, (), []])
-def test_missing_global_history_uses_eager(legacy_value: object) -> None:
+@pytest.mark.parametrize("length", [32767, 32768, 32769, 65536])
+@pytest.mark.parametrize("is_spec_draft", [False, True])
+def test_long_index_history_keeps_both_dp_ranks_graphable(active_dp: int, length: int, is_spec_draft: bool) -> None:
     input_ids = torch.tensor([1], dtype=torch.int32)
     for rank in range(2):
-        metadata = _metadata(1, (1, 0))
-        if legacy_value is None:
-            del metadata.dp_global_kv_max_seq_lens
-        else:
-            metadata.dp_global_kv_max_seq_lens = legacy_value
-        assert not _runner(rank).can_execute(input_ids, metadata)
+        metadata = _metadata(length if rank == active_dp else 1, (), is_dummy=rank != active_dp)
+        del metadata.dp_global_kv_max_seq_lens
+        assert _runner(rank, is_spec_draft=is_spec_draft).can_execute(input_ids, metadata)
 
 
-@pytest.mark.parametrize("lengths", [(1,), (-1, 0), (True, 0), (1.0, 0), torch.tensor([1, 0])])
-def test_invalid_shared_host_history_is_rejected(lengths: object) -> None:
+@pytest.mark.parametrize("lengths", [(1024, 32769), (32769, 65536)])
+def test_nonempty_dp_histories_above_old_limit_remain_graphable(lengths: tuple[int, int]) -> None:
     input_ids = torch.tensor([1], dtype=torch.int32)
-    for rank in range(2):
-        metadata = _metadata(1, (1, 0))
-        metadata.dp_global_kv_max_seq_lens = lengths
-        with pytest.raises(RuntimeError, match="DP index-history lengths"):
-            _runner(rank).can_execute(input_ids, metadata)
+    for rank, length in enumerate(lengths):
+        metadata = _metadata(length, lengths)
+        assert _runner(rank).can_execute(input_ids, metadata)
 
 
-@pytest.mark.parametrize("cap", [0, 127, 129])
-def test_unsupported_page_capacity_uses_eager(cap: int) -> None:
-    input_ids = torch.tensor([1], dtype=torch.int32)
-    for rank in range(2):
-        assert not _runner(rank, cap=cap).can_execute(input_ids, _metadata(1, (1, 0)))
+@pytest.mark.parametrize("is_spec_draft", [False, True])
+def test_tp_only_history_above_old_limit_remains_graphable(is_spec_draft: bool) -> None:
+    runner = _runner(0, dp_size=1, is_spec_draft=is_spec_draft)
+    assert runner.can_execute(torch.tensor([1], dtype=torch.int32), _metadata(65536, (65536,)))
 
 
 def test_non_index_dp_does_not_require_global_history() -> None:
@@ -195,39 +113,6 @@ def test_non_index_dp_does_not_require_global_history() -> None:
         metadata = _metadata(1, (1, 0))
         del metadata.dp_global_kv_max_seq_lens
         assert runner.can_execute(input_ids, metadata)
-
-
-@pytest.mark.parametrize("table_columns,expected", [(1, True), (2, False)])
-def test_tp_only_preserves_local_table_rule(table_columns: int, expected: bool) -> None:
-    runner = _runner(0, dp_size=1, cap=128)
-    metadata = _metadata(1, (65536,), table_columns=table_columns)
-    assert runner.can_execute(torch.tensor([1], dtype=torch.int32), metadata) is expected
-
-
-def test_mtp_target_without_global_history_uses_eager() -> None:
-    for rank in range(2):
-        runner = _runner(rank, num_decoding_tokens=4)
-        metadata = _metadata(1, ())
-        del metadata.dp_global_kv_max_seq_lens
-        assert not runner.can_execute(torch.tensor([1], dtype=torch.int32), metadata)
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-def test_dp_index_draft_does_not_read_stale_history(rank: int) -> None:
-    class DraftMetadata(SimpleNamespace):
-        @property
-        def dp_global_kv_max_seq_lens(self) -> object:
-            raise AssertionError("draft global history is not fresh")
-
-    values = vars(_metadata(32769 if rank == 0 else 1, (1, 0))).copy()
-    del values["dp_global_kv_max_seq_lens"]
-    metadata = DraftMetadata(**values)
-    assert not _runner(rank, is_spec_draft=True).can_execute(torch.tensor([1], dtype=torch.int32), metadata)
-
-
-def test_tp_only_index_draft_remains_graphable() -> None:
-    runner = _runner(0, dp_size=1, is_spec_draft=True)
-    assert runner.can_execute(torch.tensor([1], dtype=torch.int32), _metadata(1, ()))
 
 
 def test_dp_non_index_draft_remains_graphable() -> None:
