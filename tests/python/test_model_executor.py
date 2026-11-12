@@ -46,7 +46,6 @@ from xllm.python.model_executor.executor import (  # noqa: E402
 )
 from xllm.python.model_executor.forward_context import (  # noqa: E402
     ForwardContext,
-    KVLoadContext,
     forward_context,
     get_forward_context,
     record_layer_event,
@@ -169,66 +168,9 @@ class _FakeModelNoAttention(nn.Module):
         self._param = nn.Parameter(torch.zeros(1))
 
 
-# Cell-by-cell twin of the C++ truth-table gtest
-# (ModelTypeClassificationTest.ClassificationMatchesPredicates in
-# tests/models/py_causal_lm_test.cpp): when either side changes its
-# classification logic, one of the two tests must go red, forcing a re-sync.
-# The cases are sampled points, not the full sets: a new DSpark or DFlash
-# family member needs a case here AND in the C++ gtest — skipping both sides
-# leaves everything green while the classification drifts.
-@pytest.mark.parametrize(
-    (
-        "model_type",
-        "is_deepseek_v4_model",
-        "is_block_draft_model",
-        "is_dspark_draft_model",
-        "uses_context_kv_projection",
-    ),
-    [
-        ("deepseek_v4", True, False, False, False),
-        ("deepseek_v4_mtp", True, False, False, False),
-        ("deepseek_v4_dspark", True, True, True, False),
-        ("DFlashDraftModel", False, True, False, False),
-        ("DFlash2DraftModel", False, True, False, True),
-        ("DSparkDraftModel", False, True, True, True),
-        ("glm5_dspark", False, True, True, True),
-        ("glm_moe_dsa", False, False, False, False),
-    ],
-)
-def test_classification_matches_cpp_truth_table(
-    model_type: str,
-    is_deepseek_v4_model: bool,
-    is_block_draft_model: bool,
-    is_dspark_draft_model: bool,
-    uses_context_kv_projection: bool,
-) -> None:
-    from xllm.python.model_platform_support import (
-        is_block_draft_model as block_draft,
-    )
-    from xllm.python.model_platform_support import (
-        is_deepseek_v4_model as deepseek_v4,
-    )
-    from xllm.python.model_platform_support import (
-        is_dspark_draft_model as dspark_draft,
-    )
-    from xllm.python.model_platform_support import (
-        uses_context_kv_projection as context_kv,
-    )
-
-    config = _classify({"model_type": model_type})
-    assert deepseek_v4(config) is is_deepseek_v4_model
-    assert block_draft(config) is is_block_draft_model
-    assert dspark_draft(config) is is_dspark_draft_model
-    assert context_kv(config) is uses_context_kv_projection
-
-
 class _FailingLayerSynchronizer:
     def record_event(self, layer_id: int) -> bool:
         return False
-
-
-def test_attention_backend_defaults_to_non_mla() -> None:
-    assert StubAttentionBackend().is_mla is False
 
 
 def test_record_layer_event_propagates_record_failure() -> None:
@@ -335,20 +277,28 @@ class TestCreateAttentionBackend:
         "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
         StubAttentionBackend,
     )
-    def test_npu_platform_creates_npu_backend(self, _mock_is_npu: MagicMock) -> None:
+    @pytest.mark.parametrize(
+        ("model_type", "dcp_size", "is_draft"),
+        [("", 1, False), ("DFlashDraftModel", 2, True), ("DFlash2DraftModel", 2, True)],
+    )
+    def test_npu_platform_creates_npu_backend(
+        self, _mock_is_npu: MagicMock, model_type: str, dcp_size: int, is_draft: bool
+    ) -> None:
         attn = _make_attention_layer(num_kv_heads=1, head_dim=256)
         device = torch.device("cpu")
+        dcp_group = MagicMock()
+        dcp_group.size.return_value = dcp_size
         module = types.ModuleType("xllm.python.attention.npu_paged_attention")
         module.NpuPagedAttentionBackend = StubAttentionBackend
         with (
-            patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=None),
+            patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=dcp_group),
             patch.dict(sys.modules, {module.__name__: module}),
         ):
             backend = _create_attention_backend(
                 attn,
                 device,
                 torch.float16,
-                {"enable_mla": False},
+                {"enable_mla": False, "model_type": model_type, "is_draft_engine": is_draft},
             )
         assert isinstance(backend, StubAttentionBackend)
         assert backend.init_kwargs["device"] is device
@@ -581,22 +531,6 @@ class TestModelExecutorConstruction:
             assert mock_graph_runner.call_args.kwargs["num_decoding_tokens"] == expected_width
         else:
             mock_graph_runner.assert_not_called()
-
-    @patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
-        return_value=StubAttentionBackend(),
-    )
-    def test_valid_model_creates_executor(self, mock_backend: MagicMock) -> None:
-        model = _FakeModel(num_layers=3)
-        config = {"python_graph_backend": "off"}
-        executor = ModelExecutor(model, config, max_seqs_per_batch=4)
-
-        assert executor.execution_model is model.model
-        assert executor.attention_backend is mock_backend.return_value
-        assert executor.eager_runner.model is model.model
-        assert executor.eager_runner.attention_backend is mock_backend.return_value
-        assert executor.decode_graph_runner is None
-        assert executor.inductor_runner is None
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",

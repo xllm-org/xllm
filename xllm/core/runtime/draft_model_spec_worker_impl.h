@@ -97,6 +97,8 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
   // accepted span when allocating their embedding cache.
   virtual bool requires_full_target_replay() const { return false; }
 
+  virtual int64_t draft_replicated_block_pages() const { return 1; }
+
   void prepare_hierarchy_kv_cache_transfers();
   void finalize_hierarchy_kv_cache_transfers();
   void init_embedding_cache(int64_t num_blocks);
@@ -110,9 +112,6 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
       const runtime::Options& target_options,
       const runtime::Options& draft_options);
 
-  // A DCP block-table entry covers one logical KV page per KV split; slot and
-  // expanded-attention metadata use this size, not the physical block size.
-  int32_t logical_block_size() const;
   bool uses_chunked_verify() const {
     return target_verify_mode_ != mtp_async::TargetSpecVerifyMode::GENERIC;
   }

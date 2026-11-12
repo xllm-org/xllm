@@ -145,6 +145,11 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   void prepare_validate_inputs(const TargetInput& inputs,
                                TargetInput& validate_inputs);
 
+  int32_t logical_block_size() const {
+    return static_cast<int32_t>(options_.block_size()) *
+           parallel_args_.kv_split_size_effective();
+  }
+
   bool should_broadcast_spec_tokens(bool enable_spec_token_broadcast,
                                     bool all_greedy_sample) const {
     const bool use_orthogonal_cp_consensus =
